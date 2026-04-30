@@ -285,7 +285,8 @@ def print_youtube_fix_hint(logger) -> None:
         "NOTE: This looks like a YouTube/yt-dlp extraction issue, not just a bad URL.\n"
         "Try updating yt-dlp first. If you are using a virtual environment:\n"
         "  python -m pip install -U yt-dlp yt-dlp-ejs\n"
-        "If you still get PO Token or bot-check errors after that, try a different browser cookie source or disable cookies for public videos."
+        "This build now avoids forcing the old audio-only <=192 kbps format selector and lets yt-dlp fetch YouTube webpage data.\n"
+        "If one video still fails, try disabling browser cookies for public videos, or use a different logged-in browser profile."
     )
 
 
@@ -294,6 +295,10 @@ def looks_like_youtube_extraction_breakage(message: str) -> bool:
     markers = (
         "requested format is not available",
         "only images are available",
+        "no video formats",
+        "no formats",
+        "po token",
+        "missing required visitor data",
         "n challenge",
         "signature solving failed",
         "sign in to confirm you're not a bot",
@@ -301,6 +306,20 @@ def looks_like_youtube_extraction_breakage(message: str) -> bool:
         "http error 403",
     )
     return any(marker in lowered for marker in markers)
+
+
+def build_youtube_extractor_args(logger) -> dict:
+    """Return conservative YouTube extractor args.
+
+    Do not skip YouTube webpage/config requests here. Recent YouTube extractor
+    behavior can need visitor data/PO-token-related context, and skipping the
+    webpage can make yt-dlp see fewer usable formats.
+    """
+    logger(
+        "> YouTube extractor: using yt-dlp defaults; not skipping webpage/config requests "
+        "so visitor data can be discovered when available."
+    )
+    return {}
 
 
 class GuiLogger:
@@ -349,8 +368,9 @@ def maybe_get_playlist_length(url: str, extractor_args: dict, cookiesfrombrowser
             "ignoreerrors": True,
             "extract_flat": "in_playlist",
             "windowsfilenames": True,
-            "extractor_args": extractor_args,
         }
+        if extractor_args:
+            info_opts["extractor_args"] = extractor_args
         if cookiesfrombrowser is not None:
             info_opts["cookiesfrombrowser"] = cookiesfrombrowser
 
@@ -1509,28 +1529,33 @@ class DownloaderGUI:
             if media_type == "video":
                 format_str = "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
             elif media_type == "audio":
-                format_str = "bestaudio[abr<=192]/bestaudio"
+                # Prefer normal audio-only formats, but fall back to any playable
+                # format that contains audio. FFmpegExtractAudio below still
+                # converts the result to MP3 ~192 kbps. This avoids failures like:
+                #   Requested format is not available
+                # when YouTube exposes only limited/muxed/HLS formats for an item.
+                format_str = "bestaudio/best*[acodec!=none]/best"
             else:
                 format_str = None
 
-            extractor_args = {
-                "youtube": {"player_skip": ["webpage"]},
-                "youtubetab": {"skip": ["webpage"]},
-            }
+            extractor_args = build_youtube_extractor_args(logger)
 
             before_files = snapshot_all_files(config["output_dir"])
 
             ytdlp_logger = GuiLogger(logger)
             common_opts: dict = {
                 "continuedl": True,
+                "retries": 10,
+                "fragment_retries": 10,
                 "concurrent_fragment_downloads": 4,
                 "progress_hooks": [self.make_progress_hook()],
                 "windowsfilenames": True,
-                "extractor_args": extractor_args,
                 "logger": ytdlp_logger,
                 "paths": {"home": config["output_dir"]},
                 "keepvideo": False,
             }
+            if extractor_args:
+                common_opts["extractor_args"] = extractor_args
             if format_str:
                 common_opts["format"] = format_str
 
