@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """
-macOS GUI OCR chunker.
+macOS GUI book utilities.
 
-UI flow:
-1. App opens a normal window.
-2. User clicks "Select Folder".
-3. User clicks "JPG to TXT".
-4. Text is extracted from images and written as token-safe .txt chunks
-   into the same selected folder.
+Features:
+1. JPG to TXT OCR Chunker
+   - Select a folder containing images.
+   - Extract text with Apple's built-in Vision OCR.
+   - Write token-safe .txt chunks into the same selected folder.
 
-OCR engine:
-- Uses Apple's built-in Vision OCR through PyObjC.
-- Best run from a virtual environment created by your Automator launcher.
+2. PDF to TXT Chunker
+   - Select a folder containing PDFs.
+   - Handles all PDFs in alphabetical/natural filename order.
+   - Extracts copyable PDF text directly, and falls back to OCR for scanned pages.
+   - Writes token-safe .txt output files into the same selected folder.
+   - Keeps each source PDF separate; output text files never mix multiple PDFs.
+
+3. PDF Splitter
+   - Select one PDF file from any local/cloud-mounted location, including Drive.
+   - Add as many page ranges as needed with the + button.
+   - Each part is saved into the same folder as the selected PDF.
 
 Dependency handling:
 - Checks missing modules.
-- Installs missing Python packages idempotently.
+- Installs missing Python packages idempotently and automatically.
 """
 
 from __future__ import annotations
@@ -26,16 +33,21 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
 
-DEFAULT_MODEL_TOKEN_CAPACITY = 196_000
+DEFAULT_MODEL_TOKEN_CAPACITY = 25_000
 OUTPUT_PREFIX = "chatgpt_ocr_chunk"
 ERRORS_FILENAME = "chatgpt_ocr_errors.txt"
 MANIFEST_FILENAME = "chatgpt_ocr_manifest.json"
+PDF_OUTPUT_SUFFIX = "part"
+PDF_TEXT_OUTPUT_PREFIX = "chatgpt_pdf"
+PDF_TEXT_ERRORS_FILENAME = "chatgpt_pdf_errors.txt"
+PDF_TEXT_MANIFEST_FILENAME = "chatgpt_pdf_manifest.json"
 
 IMAGE_EXTENSIONS = {
     ".jpg",
@@ -54,10 +66,13 @@ REQUIRED_MODULES = {
     "Vision": "pyobjc-framework-Vision",
     "Foundation": "pyobjc-framework-Cocoa",
     "tiktoken": "tiktoken",
+    "pypdf": "pypdf",
+    "fitz": "PyMuPDF",
 }
 
 SENTENCE_END_RE = re.compile(r"[.!?؟。！？…]['\")\]]*$")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?؟。！？…])\s+")
+SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 @dataclass(frozen=True)
@@ -78,14 +93,85 @@ class ProcessingResult:
     errors: list[str]
 
 
-class OCRChunkerError(RuntimeError):
+@dataclass(frozen=True)
+class PDFPartRange:
+    start_page: int
+    end_page: int
+
+
+@dataclass(frozen=True)
+class PDFSplitResult:
+    output_files: list[Path]
+    source_pdf: Path
+    total_pages: int
+
+
+@dataclass(frozen=True)
+class PDFTextResult:
+    output_files: list[Path]
+    processed_pdfs: int
+    skipped_pdfs: int
+    processed_pages: int
+    direct_text_pages: int
+    ocr_pages: int
+    token_budget: int
+    errors: list[str]
+
+
+class BookUtilsError(RuntimeError):
+    """Raised for user-facing failures."""
+
+
+class OCRChunkerError(BookUtilsError):
     """Raised for user-facing OCR chunker failures."""
+
+
+class PDFSplitterError(BookUtilsError):
+    """Raised for user-facing PDF splitter failures."""
+
+
+class PDFTextExtractionError(BookUtilsError):
+    """Raised for user-facing PDF text extraction failures."""
+
+
+def in_virtualenv() -> bool:
+    """Return True when running inside a virtual environment."""
+    return (
+        getattr(sys, "base_prefix", sys.prefix) != sys.prefix
+        or getattr(sys, "real_prefix", None) is not None
+    )
+
+
+def install_package(package_name: str) -> None:
+    """Install one package into the active interpreter.
+
+    Important: do not use --user inside a virtualenv. macOS/Automator launchers
+    often run this script from .ocr_venv, where --user installs are disabled.
+    """
+    base_cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
+
+    if in_virtualenv():
+        cmd = [*base_cmd, package_name]
+    else:
+        cmd = [*base_cmd, "--user", package_name]
+
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError:
+        # Fallback for Homebrew/externally-managed Python setups. If --user failed,
+        # try the active interpreter environment without --user before giving up.
+        if "--user" in cmd:
+            subprocess.check_call([*base_cmd, package_name])
+        else:
+            raise
 
 
 def ensure_dependencies() -> None:
     """Install missing dependencies only when needed."""
     if platform.system() != "Darwin":
-        raise OCRChunkerError("This script is macOS-only because it uses Apple Vision OCR.")
+        raise BookUtilsError(
+            "This script is macOS-only because the OCR feature uses Apple Vision OCR."
+        )
 
     missing_packages: list[str] = []
 
@@ -99,9 +185,7 @@ def ensure_dependencies() -> None:
     ensure_pip()
 
     for package_name in sorted(set(missing_packages)):
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--user", package_name]
-        )
+        install_package(package_name)
 
     importlib.invalidate_caches()
 
@@ -129,6 +213,18 @@ def find_images(folder: Path) -> list[Path]:
             path
             for path in folder.iterdir()
             if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ],
+        key=natural_sort_key,
+    )
+
+
+def find_pdfs(folder: Path) -> list[Path]:
+    """Return PDF files in alphabetical/natural filename order."""
+    return sorted(
+        [
+            path
+            for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() == ".pdf"
         ],
         key=natural_sort_key,
     )
@@ -502,7 +598,565 @@ def process_folder(
     )
 
 
-class OCRChunkerApp:
+def has_useful_text(text: str) -> bool:
+    """Return True when extracted PDF text looks worth using."""
+    compact = re.sub(r"\s+", "", text or "")
+    if len(compact) < 20:
+        return False
+
+    alnum_count = sum(character.isalnum() for character in compact)
+    return alnum_count >= 10
+
+
+def normalize_pdf_text(text: str) -> str:
+    """
+    Convert direct PDF text extraction into cleaner paragraph-like blocks.
+
+    Many PDFs expose one visual line per newline. This joins nearby lines and
+    prefers paragraph breaks after sentence-ending punctuation.
+    """
+    raw_lines = [line.strip() for line in text.replace("\r", "\n").split("\n")]
+
+    paragraphs: list[str] = []
+    current: list[str] = []
+
+    for line in raw_lines:
+        if not line:
+            if current:
+                paragraphs.append(" ".join(current).strip())
+                current = []
+            continue
+
+        current.append(line)
+
+        if ends_at_safe_boundary(line):
+            paragraphs.append(" ".join(current).strip())
+            current = []
+
+    if current:
+        paragraphs.append(" ".join(current).strip())
+
+    cleaned = [paragraph for paragraph in paragraphs if paragraph]
+    return "\n\n".join(cleaned).strip()
+
+
+def render_pdf_page_to_image(
+    pdf_document,
+    page_index: int,
+    temp_dir: Path,
+    pdf_path: Path,
+    dpi: int = 220,
+) -> Path:
+    """Render one PDF page to a temporary PNG for Apple Vision OCR."""
+    zoom = dpi / 72
+
+    # Import inside the function so dependency installation remains centralized.
+    import fitz
+
+    page = pdf_document.load_page(page_index)
+    pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    image_path = temp_dir / f"{sanitize_stem(pdf_path.stem)}_page_{page_index + 1:04d}.png"
+    pixmap.save(str(image_path))
+    return image_path
+
+
+def extract_text_from_pdf_file(
+    pdf_path: Path,
+    progress_callback: Callable[[str, int, int], None] | None,
+    progress_state: dict[str, int],
+) -> tuple[str, int, int, int, list[str]]:
+    """
+    Extract text from one PDF.
+
+    Uses direct embedded-text extraction first. If a page has no useful text,
+    renders that page and OCRs it with Apple Vision.
+    """
+    from pypdf import PdfReader
+    import fitz
+
+    errors: list[str] = []
+    page_texts: list[str] = []
+    direct_text_pages = 0
+    ocr_pages = 0
+
+    try:
+        reader = PdfReader(str(pdf_path))
+    except Exception as exc:
+        raise PDFTextExtractionError(f"Could not read {pdf_path.name}: {exc}") from exc
+
+    if getattr(reader, "is_encrypted", False):
+        try:
+            decrypt_result = reader.decrypt("")
+        except Exception as exc:
+            raise PDFTextExtractionError(
+                f"{pdf_path.name}: encrypted PDF could not be opened."
+            ) from exc
+
+        if decrypt_result == 0:
+            raise PDFTextExtractionError(
+                f"{pdf_path.name}: password-protected PDF. Please use an unlocked PDF."
+            )
+
+    total_pages = len(reader.pages)
+
+    try:
+        fitz_document = fitz.open(str(pdf_path))
+    except Exception as exc:
+        raise PDFTextExtractionError(
+            f"Could not open {pdf_path.name} for scanned-page OCR: {exc}"
+        ) from exc
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="book_utils_pdf_ocr_") as temp_name:
+            temp_dir = Path(temp_name)
+
+            for page_index, page in enumerate(reader.pages):
+                progress_state["current"] += 1
+
+                if progress_callback:
+                    progress_callback(
+                        f"PDF to TXT: {pdf_path.name} page {page_index + 1}/{total_pages}",
+                        progress_state["current"] - 1,
+                        progress_state["total"],
+                    )
+
+                page_text = ""
+
+                try:
+                    direct_text = normalize_pdf_text(page.extract_text() or "")
+                except Exception as exc:
+                    direct_text = ""
+                    errors.append(
+                        f"{pdf_path.name} page {page_index + 1}: direct text failed: {exc}"
+                    )
+
+                if has_useful_text(direct_text):
+                    page_text = direct_text
+                    direct_text_pages += 1
+                else:
+                    try:
+                        image_path = render_pdf_page_to_image(
+                            fitz_document,
+                            page_index,
+                            temp_dir,
+                            pdf_path,
+                        )
+                        page_text = recognize_text_from_image(image_path)
+                        if page_text:
+                            ocr_pages += 1
+                    except Exception as exc:
+                        errors.append(
+                            f"{pdf_path.name} page {page_index + 1}: OCR failed: {exc}"
+                        )
+                        page_text = ""
+
+                if page_text.strip():
+                    page_texts.append(
+                        f"### Page {page_index + 1}\n\n{page_text.strip()}"
+                    )
+                else:
+                    errors.append(
+                        f"{pdf_path.name} page {page_index + 1}: no readable text detected"
+                    )
+    finally:
+        fitz_document.close()
+
+    if not page_texts:
+        return "", total_pages, direct_text_pages, ocr_pages, errors
+
+    return (
+        f"### Source PDF: {pdf_path.name}\n\n" + "\n\n".join(page_texts),
+        total_pages,
+        direct_text_pages,
+        ocr_pages,
+        errors,
+    )
+
+
+def remove_old_pdf_text_outputs(folder: Path) -> None:
+    """Remove previous generated PDF text files from the selected folder."""
+    # New per-PDF output names use chatgpt_pdf_<pdf-stem>.txt or
+    # chatgpt_pdf_<pdf-stem>_chunk_001.txt. Also remove the older combined
+    # output style chatgpt_pdf_chunk_001.txt from previous versions.
+    for pattern in (f"{PDF_TEXT_OUTPUT_PREFIX}_*.txt", "chatgpt_pdf_chunk_*.txt"):
+        for old_file in folder.glob(pattern):
+            old_file.unlink()
+
+    for filename in (PDF_TEXT_ERRORS_FILENAME, PDF_TEXT_MANIFEST_FILENAME):
+        old_file = folder / filename
+        if old_file.exists():
+            old_file.unlink()
+
+
+def unique_text_output_path(
+    folder: Path,
+    output_name: str,
+    reserved_paths: set[Path],
+) -> Path:
+    """Return a safe text output path without overwriting non-generated files."""
+    path = folder / output_name
+
+    if path not in reserved_paths and not path.exists():
+        reserved_paths.add(path)
+        return path
+
+    for counter in range(2, 10_000):
+        candidate = path.with_name(f"{path.stem}_{counter}{path.suffix}")
+        if candidate not in reserved_paths and not candidate.exists():
+            reserved_paths.add(candidate)
+            return candidate
+
+    raise PDFTextExtractionError(
+        f"Could not create a unique output name for {output_name}."
+    )
+
+
+def write_pdf_text_outputs(
+    folder: Path,
+    per_pdf_chunks: list[tuple[str, list[str]]],
+    errors: list[str],
+    processed_pdfs: int,
+    skipped_pdfs: int,
+    processed_pages: int,
+    direct_text_pages: int,
+    ocr_pages: int,
+    token_budget: int,
+    count_tokens: Callable[[str], int],
+    source_pdfs: list[str],
+) -> list[Path]:
+    """Write one separate group of text chunk files per source PDF.
+
+    Unlike image OCR, PDF extraction must not combine multiple PDFs into one
+    text chunk. Each PDF is chunked independently against the token budget.
+    """
+    remove_old_pdf_text_outputs(folder)
+
+    output_files: list[Path] = []
+    manifest_pdfs: list[dict[str, object]] = []
+    reserved_paths: set[Path] = set()
+
+    for pdf_name, chunks in per_pdf_chunks:
+        safe_stem = sanitize_stem(Path(pdf_name).stem)
+        pdf_output_entries: list[dict[str, object]] = []
+
+        for index, chunk in enumerate(chunks, start=1):
+            if len(chunks) == 1:
+                output_name = f"{PDF_TEXT_OUTPUT_PREFIX}_{safe_stem}.txt"
+            else:
+                output_name = (
+                    f"{PDF_TEXT_OUTPUT_PREFIX}_{safe_stem}_chunk_{index:03d}.txt"
+                )
+
+            output_path = unique_text_output_path(
+                folder=folder,
+                output_name=output_name,
+                reserved_paths=reserved_paths,
+            )
+            output_path.write_text(chunk.strip() + "\n", encoding="utf-8")
+            output_files.append(output_path)
+            pdf_output_entries.append(
+                {
+                    "file": output_path.name,
+                    "tokens": count_tokens(chunk),
+                }
+            )
+
+        manifest_pdfs.append(
+            {
+                "source_pdf": pdf_name,
+                "chunk_count": len(chunks),
+                "outputs": pdf_output_entries,
+            }
+        )
+
+    if errors:
+        (folder / PDF_TEXT_ERRORS_FILENAME).write_text(
+            "\n".join(errors) + "\n",
+            encoding="utf-8",
+        )
+
+    manifest = {
+        "source_pdfs_in_order": source_pdfs,
+        "processed_pdfs": processed_pdfs,
+        "skipped_pdfs": skipped_pdfs,
+        "processed_pages": processed_pages,
+        "direct_text_pages": direct_text_pages,
+        "ocr_pages": ocr_pages,
+        "output_file_count": len(output_files),
+        "token_budget_per_chunk": token_budget,
+        "pdfs": manifest_pdfs,
+        "errors_file": PDF_TEXT_ERRORS_FILENAME if errors else None,
+    }
+
+    (folder / PDF_TEXT_MANIFEST_FILENAME).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    return output_files
+
+
+def process_pdf_folder_to_text(
+    folder: Path,
+    model_token_capacity: int,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> PDFTextResult:
+    """
+    Extract text from all PDFs in a folder and write token-safe text files.
+
+    PDFs are processed in alphabetical/natural filename order. Each PDF is
+    chunked independently, so one output .txt file never mixes text from
+    multiple source PDFs.
+    """
+    pdfs = find_pdfs(folder)
+
+    if not pdfs:
+        raise PDFTextExtractionError("No PDF files were found in the selected folder.")
+
+    count_tokens = token_counter()
+    token_budget = model_token_capacity // 2
+
+    # Read page counts first so the progress bar reflects all PDFs/pages.
+    pdf_page_counts: dict[Path, int] = {}
+    errors: list[str] = []
+
+    for pdf_path in pdfs:
+        try:
+            pdf_page_counts[pdf_path] = read_pdf_total_pages(pdf_path)
+        except Exception as exc:
+            errors.append(f"{pdf_path.name}: skipped: {exc}")
+
+    processable_pdfs = [pdf_path for pdf_path in pdfs if pdf_path in pdf_page_counts]
+
+    if not processable_pdfs:
+        raise PDFTextExtractionError(
+            "No readable PDFs were found in the selected folder."
+        )
+
+    total_pages = sum(pdf_page_counts.values())
+    progress_state = {"current": 0, "total": max(total_pages, 1)}
+
+    per_pdf_chunks: list[tuple[str, list[str]]] = []
+    source_pdfs: list[str] = []
+    processed_pdfs = 0
+    processed_pages = 0
+    direct_text_pages = 0
+    ocr_pages = 0
+
+    for pdf_path in processable_pdfs:
+        try:
+            pdf_text, page_count, direct_pages, ocr_page_count, pdf_errors = extract_text_from_pdf_file(
+                pdf_path=pdf_path,
+                progress_callback=progress_callback,
+                progress_state=progress_state,
+            )
+        except Exception as exc:
+            errors.append(f"{pdf_path.name}: skipped: {exc}")
+            continue
+
+        errors.extend(pdf_errors)
+        processed_pages += page_count
+        direct_text_pages += direct_pages
+        ocr_pages += ocr_page_count
+
+        if pdf_text.strip():
+            if progress_callback:
+                progress_callback(
+                    f"Chunking PDF text: {pdf_path.name}",
+                    progress_state["current"],
+                    progress_state["total"],
+                )
+
+            # Important: chunk each PDF independently so no output .txt file
+            # ever contains text from two different PDFs.
+            chunks = chunk_text(pdf_text, token_budget, count_tokens)
+            per_pdf_chunks.append((pdf_path.name, chunks))
+            source_pdfs.append(pdf_path.name)
+            processed_pdfs += 1
+        else:
+            errors.append(f"{pdf_path.name}: skipped: no readable text detected")
+
+    if progress_callback:
+        progress_callback("Writing PDF text files...", total_pages, total_pages)
+
+    if not per_pdf_chunks:
+        raise PDFTextExtractionError(
+            "PDF text extraction finished, but no readable text was detected."
+        )
+
+    output_files = write_pdf_text_outputs(
+        folder=folder,
+        per_pdf_chunks=per_pdf_chunks,
+        errors=errors,
+        processed_pdfs=processed_pdfs,
+        skipped_pdfs=len(pdfs) - processed_pdfs,
+        processed_pages=processed_pages,
+        direct_text_pages=direct_text_pages,
+        ocr_pages=ocr_pages,
+        token_budget=token_budget,
+        count_tokens=count_tokens,
+        source_pdfs=source_pdfs,
+    )
+
+    return PDFTextResult(
+        output_files=output_files,
+        processed_pdfs=processed_pdfs,
+        skipped_pdfs=len(pdfs) - processed_pdfs,
+        processed_pages=processed_pages,
+        direct_text_pages=direct_text_pages,
+        ocr_pages=ocr_pages,
+        token_budget=token_budget,
+        errors=errors,
+    )
+
+
+def sanitize_stem(stem: str) -> str:
+    """Make a readable, safe output filename stem."""
+    cleaned = SAFE_FILENAME_RE.sub("_", stem.strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or "split_pdf"
+
+
+def unique_output_path(path: Path) -> Path:
+    """Return a non-existing path by appending a counter when needed."""
+    if not path.exists():
+        return path
+
+    for counter in range(2, 10_000):
+        candidate = path.with_name(f"{path.stem}_{counter}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+
+    raise PDFSplitterError(f"Could not create a unique output name for {path.name}.")
+
+
+def read_pdf_total_pages(pdf_path: Path) -> int:
+    """Return page count for a PDF."""
+    from pypdf import PdfReader
+
+    try:
+        reader = PdfReader(str(pdf_path))
+    except Exception as exc:
+        raise PDFSplitterError(f"Could not read PDF: {exc}") from exc
+
+    if getattr(reader, "is_encrypted", False):
+        try:
+            decrypt_result = reader.decrypt("")
+        except Exception as exc:
+            raise PDFSplitterError(
+                "The selected PDF is encrypted and could not be opened."
+            ) from exc
+
+        if decrypt_result == 0:
+            raise PDFSplitterError(
+                "The selected PDF is password-protected. Please use an unlocked PDF."
+            )
+
+    return len(reader.pages)
+
+
+def validate_pdf_ranges(ranges: Iterable[PDFPartRange], total_pages: int) -> list[PDFPartRange]:
+    """Validate 1-based inclusive page ranges."""
+    validated = list(ranges)
+
+    if not validated:
+        raise PDFSplitterError("Add at least one PDF part range.")
+
+    for index, part in enumerate(validated, start=1):
+        if part.start_page < 1 or part.end_page < 1:
+            raise PDFSplitterError(f"Part {index}: page numbers must be 1 or higher.")
+
+        if part.start_page > part.end_page:
+            raise PDFSplitterError(
+                f"Part {index}: start page must be lower than or equal to end page."
+            )
+
+        if part.end_page > total_pages:
+            raise PDFSplitterError(
+                f"Part {index}: end page {part.end_page} is above the PDF's "
+                f"total page count ({total_pages})."
+            )
+
+    return validated
+
+
+def split_pdf(
+    pdf_path: Path,
+    ranges: Iterable[PDFPartRange],
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> PDFSplitResult:
+    """Split one PDF into multiple 1-based inclusive page ranges."""
+    from pypdf import PdfReader, PdfWriter
+
+    if not pdf_path.exists() or not pdf_path.is_file():
+        raise PDFSplitterError("Select a valid PDF file first.")
+
+    if pdf_path.suffix.lower() != ".pdf":
+        raise PDFSplitterError("The selected file must be a PDF.")
+
+    try:
+        reader = PdfReader(str(pdf_path))
+    except Exception as exc:
+        raise PDFSplitterError(f"Could not read PDF: {exc}") from exc
+
+    if getattr(reader, "is_encrypted", False):
+        try:
+            decrypt_result = reader.decrypt("")
+        except Exception as exc:
+            raise PDFSplitterError(
+                "The selected PDF is encrypted and could not be opened."
+            ) from exc
+
+        if decrypt_result == 0:
+            raise PDFSplitterError(
+                "The selected PDF is password-protected. Please use an unlocked PDF."
+            )
+
+    total_pages = len(reader.pages)
+    validated_ranges = validate_pdf_ranges(ranges, total_pages)
+    output_dir = pdf_path.parent
+    safe_stem = sanitize_stem(pdf_path.stem)
+    output_files: list[Path] = []
+
+    for index, part in enumerate(validated_ranges, start=1):
+        if progress_callback:
+            progress_callback(
+                f"Creating part {index}: pages {part.start_page}-{part.end_page}",
+                index - 1,
+                len(validated_ranges),
+            )
+
+        writer = PdfWriter()
+
+        # pypdf uses 0-based page indexes; the UI uses normal 1-based page numbers.
+        for page_number in range(part.start_page, part.end_page + 1):
+            writer.add_page(reader.pages[page_number - 1])
+
+        output_name = (
+            f"{safe_stem}_{PDF_OUTPUT_SUFFIX}_{index:03d}_"
+            f"p{part.start_page:03d}-p{part.end_page:03d}.pdf"
+        )
+        output_path = unique_output_path(output_dir / output_name)
+
+        try:
+            with output_path.open("wb") as output_file:
+                writer.write(output_file)
+        except Exception as exc:
+            raise PDFSplitterError(f"Could not write {output_path.name}: {exc}") from exc
+
+        output_files.append(output_path)
+
+    if progress_callback:
+        progress_callback("Done.", len(validated_ranges), len(validated_ranges))
+
+    return PDFSplitResult(
+        output_files=output_files,
+        source_pdf=pdf_path,
+        total_pages=total_pages,
+    )
+
+
+class BookUtilsApp:
     """Tkinter GUI application."""
 
     def __init__(self) -> None:
@@ -512,15 +1166,21 @@ class OCRChunkerApp:
         self.tk = tk
         self.ttk = ttk
         self.selected_folder: Path | None = None
+        self.selected_pdf_text_folder: Path | None = None
+        self.selected_pdf: Path | None = None
+        self.pdf_part_rows: list[tuple[object, object, object]] = []
         self.is_running = False
 
         self.root = tk.Tk()
-        self.root.title("JPG to TXT OCR Chunker")
-        self.root.geometry("620x300")
-        self.root.minsize(620, 300)
+        self.root.title("Book Utils: OCR + PDF Tools")
+        self.root.geometry("800x650")
+        self.root.minsize(760, 600)
 
-        self.status_var = tk.StringVar(value="Select a folder, then click JPG to TXT.")
-        self.folder_var = tk.StringVar(value="No folder selected")
+        self.status_var = tk.StringVar(value="Choose an action.")
+        self.folder_var = tk.StringVar(value="No image folder selected")
+        self.pdf_text_folder_var = tk.StringVar(value="No PDF folder selected")
+        self.pdf_var = tk.StringVar(value="No PDF selected")
+        self.pdf_pages_var = tk.StringVar(value="")
         self.capacity_var = tk.StringVar(value=str(DEFAULT_MODEL_TOKEN_CAPACITY))
 
         self._build_ui()
@@ -531,39 +1191,77 @@ class OCRChunkerApp:
 
         title = self.ttk.Label(
             frame,
-            text="JPG to TXT OCR Chunker",
+            text="Book Utils",
             font=("Helvetica", 18, "bold"),
         )
-        title.pack(anchor="w", pady=(0, 8))
+        title.pack(anchor="w", pady=(0, 4))
 
         description = self.ttk.Label(
             frame,
             text=(
-                "Choose a folder containing images. The app extracts text and writes "
-                "consecutive .txt chunks into the same folder."
+                "Convert JPG images or PDFs to ChatGPT-safe text chunks, or split a "
+                "selected PDF into page ranges saved beside the original file."
             ),
-            wraplength=560,
+            wraplength=700,
+        )
+        description.pack(anchor="w", pady=(0, 12))
+
+        notebook = self.ttk.Notebook(frame)
+        notebook.pack(fill="both", expand=True, pady=(0, 12))
+
+        ocr_tab = self.ttk.Frame(notebook, padding=12)
+        pdf_text_tab = self.ttk.Frame(notebook, padding=12)
+        pdf_tab = self.ttk.Frame(notebook, padding=12)
+        notebook.add(ocr_tab, text="JPG to TXT")
+        notebook.add(pdf_text_tab, text="PDF to TXT")
+        notebook.add(pdf_tab, text="Split PDF")
+
+        self._build_ocr_tab(ocr_tab)
+        self._build_pdf_text_tab(pdf_text_tab)
+        self._build_pdf_tab(pdf_tab)
+
+        self.progress_bar = self.ttk.Progressbar(
+            frame,
+            mode="determinate",
+        )
+        self.progress_bar.pack(fill="x", pady=(0, 8))
+
+        status_label = self.ttk.Label(
+            frame,
+            textvariable=self.status_var,
+            wraplength=700,
+        )
+        status_label.pack(anchor="w")
+
+    def _build_ocr_tab(self, parent) -> None:
+        description = self.ttk.Label(
+            parent,
+            text=(
+                "Choose a folder containing images. The app extracts text and writes "
+                "consecutive .txt chunks into that same folder."
+            ),
+            wraplength=660,
         )
         description.pack(anchor="w", pady=(0, 14))
 
-        folder_row = self.ttk.Frame(frame)
+        folder_row = self.ttk.Frame(parent)
         folder_row.pack(fill="x", pady=(0, 10))
 
-        self.select_button = self.ttk.Button(
+        self.select_folder_button = self.ttk.Button(
             folder_row,
             text="Select Folder",
             command=self.select_folder,
         )
-        self.select_button.pack(side="left")
+        self.select_folder_button.pack(side="left")
 
         folder_label = self.ttk.Label(
             folder_row,
             textvariable=self.folder_var,
-            wraplength=420,
+            wraplength=500,
         )
         folder_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
 
-        capacity_row = self.ttk.Frame(frame)
+        capacity_row = self.ttk.Frame(parent)
         capacity_row.pack(fill="x", pady=(0, 12))
 
         capacity_label = self.ttk.Label(
@@ -585,28 +1283,134 @@ class OCRChunkerApp:
         )
         hint.pack(side="left")
 
-        action_row = self.ttk.Frame(frame)
-        action_row.pack(fill="x", pady=(0, 14))
-
         self.convert_button = self.ttk.Button(
-            action_row,
+            parent,
             text="JPG to TXT",
             command=self.start_conversion,
         )
-        self.convert_button.pack(side="left")
+        self.convert_button.pack(anchor="w")
 
-        self.progress_bar = self.ttk.Progressbar(
-            frame,
-            mode="determinate",
+    def _build_pdf_text_tab(self, parent) -> None:
+        description = self.ttk.Label(
+            parent,
+            text=(
+                "Choose a folder containing PDFs. The app handles all PDFs in "
+                "alphabetical order, extracts copyable text directly, OCRs scanned "
+                "pages when needed, and writes separate .txt output files per PDF "
+                "into that same folder."
+            ),
+            wraplength=700,
         )
-        self.progress_bar.pack(fill="x", pady=(0, 10))
+        description.pack(anchor="w", pady=(0, 14))
 
-        status_label = self.ttk.Label(
-            frame,
-            textvariable=self.status_var,
-            wraplength=560,
+        folder_row = self.ttk.Frame(parent)
+        folder_row.pack(fill="x", pady=(0, 10))
+
+        self.select_pdf_text_folder_button = self.ttk.Button(
+            folder_row,
+            text="Select Folder",
+            command=self.select_pdf_text_folder,
         )
-        status_label.pack(anchor="w")
+        self.select_pdf_text_folder_button.pack(side="left")
+
+        folder_label = self.ttk.Label(
+            folder_row,
+            textvariable=self.pdf_text_folder_var,
+            wraplength=540,
+        )
+        folder_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
+
+        capacity_row = self.ttk.Frame(parent)
+        capacity_row.pack(fill="x", pady=(0, 12))
+
+        capacity_label = self.ttk.Label(
+            capacity_row,
+            text="Model token capacity:",
+        )
+        capacity_label.pack(side="left")
+
+        capacity_entry = self.ttk.Entry(
+            capacity_row,
+            textvariable=self.capacity_var,
+            width=12,
+        )
+        capacity_entry.pack(side="left", padx=(8, 8))
+
+        hint = self.ttk.Label(
+            capacity_row,
+            text="Each output chunk is <= half this value.",
+        )
+        hint.pack(side="left")
+
+        self.pdf_text_button = self.ttk.Button(
+            parent,
+            text="PDF to TXT",
+            command=self.start_pdf_text_extraction,
+        )
+        self.pdf_text_button.pack(anchor="w")
+
+
+    def _build_pdf_tab(self, parent) -> None:
+        description = self.ttk.Label(
+            parent,
+            text=(
+                "Select a PDF, add one or more start/end page ranges, then split. "
+                "Pages are 1-based and inclusive. Output files are saved in the "
+                "same folder as the selected PDF."
+            ),
+            wraplength=660,
+        )
+        description.pack(anchor="w", pady=(0, 14))
+
+        pdf_row = self.ttk.Frame(parent)
+        pdf_row.pack(fill="x", pady=(0, 6))
+
+        self.select_pdf_button = self.ttk.Button(
+            pdf_row,
+            text="Select PDF",
+            command=self.select_pdf,
+        )
+        self.select_pdf_button.pack(side="left")
+
+        pdf_label = self.ttk.Label(
+            pdf_row,
+            textvariable=self.pdf_var,
+            wraplength=500,
+        )
+        pdf_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
+
+        pages_label = self.ttk.Label(
+            parent,
+            textvariable=self.pdf_pages_var,
+        )
+        pages_label.pack(anchor="w", pady=(0, 12))
+
+        header_row = self.ttk.Frame(parent)
+        header_row.pack(fill="x", pady=(0, 4))
+        self.ttk.Label(header_row, text="Start page", width=14).pack(side="left")
+        self.ttk.Label(header_row, text="End page", width=14).pack(side="left", padx=(8, 0))
+
+        self.parts_frame = self.ttk.Frame(parent)
+        self.parts_frame.pack(fill="x", pady=(0, 10))
+
+        action_row = self.ttk.Frame(parent)
+        action_row.pack(fill="x")
+
+        self.add_part_button = self.ttk.Button(
+            action_row,
+            text="+ Add Part",
+            command=self.add_pdf_part_row,
+        )
+        self.add_part_button.pack(side="left")
+
+        self.split_pdf_button = self.ttk.Button(
+            action_row,
+            text="Split PDF",
+            command=self.start_pdf_split,
+        )
+        self.split_pdf_button.pack(side="left", padx=(10, 0))
+
+        self.add_pdf_part_row(default_start="1", default_end="")
 
     def select_folder(self) -> None:
         from tkinter import filedialog
@@ -622,6 +1426,124 @@ class OCRChunkerApp:
         self.selected_folder = Path(folder_name)
         self.folder_var.set(str(self.selected_folder))
         self.status_var.set("Folder selected. Click JPG to TXT to start.")
+
+    def select_pdf_text_folder(self) -> None:
+        from tkinter import filedialog
+
+        folder_name = filedialog.askdirectory(
+            parent=self.root,
+            title="Select folder containing PDFs",
+        )
+
+        if not folder_name:
+            return
+
+        self.selected_pdf_text_folder = Path(folder_name)
+        self.pdf_text_folder_var.set(str(self.selected_pdf_text_folder))
+        self.status_var.set("PDF folder selected. Click PDF to TXT to start.")
+
+
+    def select_pdf(self) -> None:
+        from tkinter import filedialog, messagebox
+
+        file_name = filedialog.askopenfilename(
+            parent=self.root,
+            title="Select PDF to split",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+        )
+
+        if not file_name:
+            return
+
+        pdf_path = Path(file_name)
+        self.selected_pdf = pdf_path
+        self.pdf_var.set(str(pdf_path))
+
+        try:
+            total_pages = read_pdf_total_pages(pdf_path)
+        except Exception as exc:
+            self.pdf_pages_var.set("")
+            messagebox.showerror(
+                title="Could not read PDF",
+                message=str(exc),
+                parent=self.root,
+            )
+            return
+
+        self.pdf_pages_var.set(f"Total pages: {total_pages}")
+        self.status_var.set("PDF selected. Add page ranges, then click Split PDF.")
+
+        if len(self.pdf_part_rows) == 1:
+            _, start_var, end_var = self.pdf_part_rows[0]
+            if hasattr(start_var, "set") and hasattr(end_var, "set"):
+                start_var.set("1")
+                end_var.set(str(total_pages))
+
+    def add_pdf_part_row(self, default_start: str = "", default_end: str = "") -> None:
+        row_frame = self.ttk.Frame(self.parts_frame)
+        row_frame.pack(fill="x", pady=(0, 6))
+
+        start_var = self.tk.StringVar(value=default_start)
+        end_var = self.tk.StringVar(value=default_end)
+
+        start_entry = self.ttk.Entry(row_frame, textvariable=start_var, width=14)
+        start_entry.pack(side="left")
+
+        end_entry = self.ttk.Entry(row_frame, textvariable=end_var, width=14)
+        end_entry.pack(side="left", padx=(8, 0))
+
+        remove_button = self.ttk.Button(
+            row_frame,
+            text="Remove",
+            command=lambda: self.remove_pdf_part_row(row_frame),
+        )
+        remove_button.pack(side="left", padx=(8, 0))
+
+        self.pdf_part_rows.append((row_frame, start_var, end_var))
+        self._refresh_remove_buttons()
+
+    def remove_pdf_part_row(self, row_frame) -> None:
+        if len(self.pdf_part_rows) <= 1:
+            return
+
+        for index, (frame, _start_var, _end_var) in enumerate(self.pdf_part_rows):
+            if frame is row_frame:
+                frame.destroy()
+                del self.pdf_part_rows[index]
+                break
+
+        self._refresh_remove_buttons()
+
+    def _refresh_remove_buttons(self) -> None:
+        # Keep at least one row. Disable the only row's Remove button.
+        single_row = len(self.pdf_part_rows) <= 1
+
+        for frame, _start_var, _end_var in self.pdf_part_rows:
+            for child in frame.winfo_children():
+                if isinstance(child, self.ttk.Button) and child.cget("text") == "Remove":
+                    child.configure(state="disabled" if single_row else "normal")
+
+    def collect_pdf_ranges(self) -> list[PDFPartRange]:
+        ranges: list[PDFPartRange] = []
+
+        for index, (_frame, start_var, end_var) in enumerate(self.pdf_part_rows, start=1):
+            start_raw = start_var.get().strip()
+            end_raw = end_var.get().strip()
+
+            if not start_raw or not end_raw:
+                raise PDFSplitterError(f"Part {index}: start and end pages are required.")
+
+            try:
+                start_page = int(start_raw)
+                end_page = int(end_raw)
+            except ValueError as exc:
+                raise PDFSplitterError(
+                    f"Part {index}: start and end pages must be whole numbers."
+                ) from exc
+
+            ranges.append(PDFPartRange(start_page=start_page, end_page=end_page))
+
+        return ranges
 
     def start_conversion(self) -> None:
         from tkinter import messagebox
@@ -655,7 +1577,7 @@ class OCRChunkerApp:
             )
             return
 
-        self._set_running_state(True)
+        self._set_running_state(True, "Starting OCR...")
 
         worker = threading.Thread(
             target=self._run_conversion_worker,
@@ -679,7 +1601,116 @@ class OCRChunkerApp:
             self.root.after(0, self._show_error, exc)
             return
 
-        self.root.after(0, self._show_success, result)
+        self.root.after(0, self._show_ocr_success, result)
+
+    def start_pdf_text_extraction(self) -> None:
+        from tkinter import messagebox
+
+        if self.is_running:
+            return
+
+        if self.selected_pdf_text_folder is None:
+            messagebox.showwarning(
+                title="No PDF folder selected",
+                message="Please click Select Folder first.",
+                parent=self.root,
+            )
+            return
+
+        try:
+            model_token_capacity = int(self.capacity_var.get().strip())
+        except ValueError:
+            messagebox.showerror(
+                title="Invalid token capacity",
+                message="Model token capacity must be a number.",
+                parent=self.root,
+            )
+            return
+
+        if model_token_capacity < 1_000:
+            messagebox.showerror(
+                title="Invalid token capacity",
+                message="Model token capacity must be at least 1000.",
+                parent=self.root,
+            )
+            return
+
+        self._set_running_state(True, "Starting PDF text extraction...")
+
+        worker = threading.Thread(
+            target=self._run_pdf_text_worker,
+            args=(self.selected_pdf_text_folder, model_token_capacity),
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_pdf_text_worker(
+        self,
+        folder: Path,
+        model_token_capacity: int,
+    ) -> None:
+        try:
+            result = process_pdf_folder_to_text(
+                folder=folder,
+                model_token_capacity=model_token_capacity,
+                progress_callback=self._thread_safe_progress,
+            )
+        except Exception as exc:
+            self.root.after(0, self._show_error, exc)
+            return
+
+        self.root.after(0, self._show_pdf_text_success, result)
+
+
+    def start_pdf_split(self) -> None:
+        from tkinter import messagebox
+
+        if self.is_running:
+            return
+
+        if self.selected_pdf is None:
+            messagebox.showwarning(
+                title="No PDF selected",
+                message="Please click Select PDF first.",
+                parent=self.root,
+            )
+            return
+
+        try:
+            ranges = self.collect_pdf_ranges()
+        except Exception as exc:
+            messagebox.showerror(
+                title="Invalid page ranges",
+                message=str(exc),
+                parent=self.root,
+            )
+            return
+
+        self._set_running_state(True, "Starting PDF split...")
+
+        worker = threading.Thread(
+            target=self._run_pdf_split_worker,
+            args=(self.selected_pdf, ranges),
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_pdf_split_worker(
+        self,
+        pdf_path: Path,
+        ranges: list[PDFPartRange],
+    ) -> None:
+        try:
+            result = split_pdf(
+                pdf_path=pdf_path,
+                ranges=ranges,
+                progress_callback=self._thread_safe_progress,
+            )
+        except Exception as exc:
+            self.root.after(0, self._show_error, exc)
+            return
+
+        self.root.after(0, self._show_pdf_success, result)
 
     def _thread_safe_progress(self, message: str, value: int, maximum: int) -> None:
         self.root.after(0, self._update_progress, message, value, maximum)
@@ -689,7 +1720,7 @@ class OCRChunkerApp:
         self.progress_bar["maximum"] = max(maximum, 1)
         self.progress_bar["value"] = value
 
-    def _show_success(self, result: ProcessingResult) -> None:
+    def _show_ocr_success(self, result: ProcessingResult) -> None:
         from tkinter import messagebox
 
         self._update_progress("Done.", 1, 1)
@@ -707,6 +1738,49 @@ class OCRChunkerApp:
             parent=self.root,
         )
 
+    def _show_pdf_text_success(self, result: PDFTextResult) -> None:
+        from tkinter import messagebox
+
+        self._update_progress("Done.", 1, 1)
+        self._set_running_state(False)
+
+        messagebox.showinfo(
+            title="Done",
+            message=(
+                f"Created {len(result.output_files)} text chunk file(s).\n"
+                f"Token budget per chunk: {result.token_budget}\n"
+                f"Processed PDFs: {result.processed_pdfs}\n"
+                f"Skipped PDFs: {result.skipped_pdfs}\n"
+                f"Processed pages: {result.processed_pages}\n"
+                f"Direct text pages: {result.direct_text_pages}\n"
+                f"OCR pages: {result.ocr_pages}\n\n"
+                f"Files were saved in:\n{self.selected_pdf_text_folder}"
+            ),
+            parent=self.root,
+        )
+
+
+    def _show_pdf_success(self, result: PDFSplitResult) -> None:
+        from tkinter import messagebox
+
+        self._update_progress("Done.", 1, 1)
+        self._set_running_state(False)
+
+        files_preview = "\n".join(path.name for path in result.output_files[:8])
+        if len(result.output_files) > 8:
+            files_preview += f"\n...and {len(result.output_files) - 8} more"
+
+        messagebox.showinfo(
+            title="Done",
+            message=(
+                f"Created {len(result.output_files)} PDF part(s).\n"
+                f"Source pages: {result.total_pages}\n\n"
+                f"Saved in:\n{result.source_pdf.parent}\n\n"
+                f"Files:\n{files_preview}"
+            ),
+            parent=self.root,
+        )
+
     def _show_error(self, error: Exception) -> None:
         from tkinter import messagebox
 
@@ -718,21 +1792,38 @@ class OCRChunkerApp:
             parent=self.root,
         )
 
-    def _set_running_state(self, is_running: bool) -> None:
+    def _set_running_state(self, is_running: bool, message: str | None = None) -> None:
         self.is_running = is_running
         state = "disabled" if is_running else "normal"
 
-        self.select_button.configure(state=state)
+        self.select_folder_button.configure(state=state)
         self.convert_button.configure(state=state)
+        self.select_pdf_text_folder_button.configure(state=state)
+        self.pdf_text_button.configure(state=state)
+        self.select_pdf_button.configure(state=state)
+        self.add_part_button.configure(state=state)
+        self.split_pdf_button.configure(state=state)
+
+        for frame, _start_var, _end_var in self.pdf_part_rows:
+            for child in frame.winfo_children():
+                try:
+                    child.configure(state=state)
+                except Exception:
+                    pass
+
+        if not is_running:
+            self._refresh_remove_buttons()
+
+        if message is not None:
+            self.status_var.set(message)
 
         if is_running:
-            self.status_var.set("Starting OCR...")
             self.progress_bar["value"] = 0
 
 
 def run_gui() -> None:
     """Start the GUI without opening prompts at startup."""
-    app = OCRChunkerApp()
+    app = BookUtilsApp()
     app.root.mainloop()
 
 
