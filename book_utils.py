@@ -20,6 +20,11 @@ Features:
    - Add as many page ranges as needed with the + button.
    - Each part is saved into the same folder as the selected PDF.
 
+4. TXT Cleaner
+   - Select a folder containing TXT files.
+   - Removes metadata lines containing configured markers.
+   - Also removes one empty line immediately following each removed metadata line.
+
 Dependency handling:
 - Checks missing modules.
 - Installs missing Python packages idempotently and automatically.
@@ -48,6 +53,7 @@ PDF_OUTPUT_SUFFIX = "part"
 PDF_TEXT_OUTPUT_PREFIX = "chatgpt_pdf"
 PDF_TEXT_ERRORS_FILENAME = "chatgpt_pdf_errors.txt"
 PDF_TEXT_MANIFEST_FILENAME = "chatgpt_pdf_manifest.json"
+TXT_CLEAN_MARKERS = ("### Source", "### Page")
 
 IMAGE_EXTENSIONS = {
     ".jpg",
@@ -118,6 +124,16 @@ class PDFTextResult:
     errors: list[str]
 
 
+@dataclass(frozen=True)
+class TextCleanResult:
+    cleaned_files: list[Path]
+    scanned_files: int
+    changed_files: int
+    removed_marker_lines: int
+    removed_empty_lines: int
+    errors: list[str]
+
+
 class BookUtilsError(RuntimeError):
     """Raised for user-facing failures."""
 
@@ -132,6 +148,10 @@ class PDFSplitterError(BookUtilsError):
 
 class PDFTextExtractionError(BookUtilsError):
     """Raised for user-facing PDF text extraction failures."""
+
+
+class TextCleanerError(BookUtilsError):
+    """Raised for user-facing TXT cleaner failures."""
 
 
 def in_virtualenv() -> bool:
@@ -227,6 +247,110 @@ def find_pdfs(folder: Path) -> list[Path]:
             if path.is_file() and path.suffix.lower() == ".pdf"
         ],
         key=natural_sort_key,
+    )
+
+
+def find_txt_files(folder: Path) -> list[Path]:
+    """Return TXT files in alphabetical/natural filename order."""
+    return sorted(
+        [
+            path
+            for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() == ".txt"
+        ],
+        key=natural_sort_key,
+    )
+
+
+def line_contains_clean_marker(line: str) -> bool:
+    """Return True when a line contains one of the configured clean markers."""
+    return any(marker in line for marker in TXT_CLEAN_MARKERS)
+
+
+def clean_txt_content(text: str) -> tuple[str, int, int]:
+    """Remove marker lines and one following empty line from TXT content."""
+    lines = text.splitlines(keepends=True)
+    cleaned_lines: list[str] = []
+    removed_marker_lines = 0
+    removed_empty_lines = 0
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+
+        if line_contains_clean_marker(line):
+            removed_marker_lines += 1
+            index += 1
+
+            if index < len(lines) and not lines[index].strip():
+                removed_empty_lines += 1
+                index += 1
+
+            continue
+
+        cleaned_lines.append(line)
+        index += 1
+
+    return "".join(cleaned_lines), removed_marker_lines, removed_empty_lines
+
+
+def clean_txt_files_in_folder(
+    folder: Path,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> TextCleanResult:
+    """Clean all TXT files directly inside a selected folder."""
+    txt_files = find_txt_files(folder)
+
+    if not txt_files:
+        raise TextCleanerError("No TXT files were found in the selected folder.")
+
+    cleaned_files: list[Path] = []
+    errors: list[str] = []
+    total_removed_marker_lines = 0
+    total_removed_empty_lines = 0
+
+    for index, txt_path in enumerate(txt_files, start=1):
+        if progress_callback:
+            progress_callback(f"Cleaning TXT: {txt_path.name}", index - 1, len(txt_files))
+
+        try:
+            original_text = txt_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                original_text = txt_path.read_text(encoding="utf-8-sig")
+            except Exception as exc:
+                errors.append(f"{txt_path.name}: skipped: could not read as UTF-8: {exc}")
+                continue
+        except Exception as exc:
+            errors.append(f"{txt_path.name}: skipped: {exc}")
+            continue
+
+        cleaned_text, removed_marker_lines, removed_empty_lines = clean_txt_content(
+            original_text
+        )
+
+        total_removed_marker_lines += removed_marker_lines
+        total_removed_empty_lines += removed_empty_lines
+
+        if cleaned_text == original_text:
+            continue
+
+        try:
+            txt_path.write_text(cleaned_text, encoding="utf-8")
+            cleaned_files.append(txt_path)
+        except Exception as exc:
+            errors.append(f"{txt_path.name}: skipped: could not write cleaned text: {exc}")
+
+    if progress_callback:
+        progress_callback("Done.", len(txt_files), len(txt_files))
+
+    return TextCleanResult(
+        cleaned_files=cleaned_files,
+        scanned_files=len(txt_files),
+        changed_files=len(cleaned_files),
+        removed_marker_lines=total_removed_marker_lines,
+        removed_empty_lines=total_removed_empty_lines,
+        errors=errors,
     )
 
 
@@ -1167,18 +1291,20 @@ class BookUtilsApp:
         self.ttk = ttk
         self.selected_folder: Path | None = None
         self.selected_pdf_text_folder: Path | None = None
+        self.selected_text_clean_folder: Path | None = None
         self.selected_pdf: Path | None = None
         self.pdf_part_rows: list[tuple[object, object, object]] = []
         self.is_running = False
 
         self.root = tk.Tk()
         self.root.title("Book Utils: OCR + PDF Tools")
-        self.root.geometry("800x650")
-        self.root.minsize(760, 600)
+        self.root.geometry("820x700")
+        self.root.minsize(780, 640)
 
         self.status_var = tk.StringVar(value="Choose an action.")
         self.folder_var = tk.StringVar(value="No image folder selected")
         self.pdf_text_folder_var = tk.StringVar(value="No PDF folder selected")
+        self.text_clean_folder_var = tk.StringVar(value="No TXT folder selected")
         self.pdf_var = tk.StringVar(value="No PDF selected")
         self.pdf_pages_var = tk.StringVar(value="")
         self.capacity_var = tk.StringVar(value=str(DEFAULT_MODEL_TOKEN_CAPACITY))
@@ -1199,8 +1325,9 @@ class BookUtilsApp:
         description = self.ttk.Label(
             frame,
             text=(
-                "Convert JPG images or PDFs to ChatGPT-safe text chunks, or split a "
-                "selected PDF into page ranges saved beside the original file."
+                "Convert JPG images or PDFs to ChatGPT-safe text chunks, clean TXT "
+                "metadata markers, or split a selected PDF into page ranges saved "
+                "beside the original file."
             ),
             wraplength=700,
         )
@@ -1211,13 +1338,16 @@ class BookUtilsApp:
 
         ocr_tab = self.ttk.Frame(notebook, padding=12)
         pdf_text_tab = self.ttk.Frame(notebook, padding=12)
+        text_clean_tab = self.ttk.Frame(notebook, padding=12)
         pdf_tab = self.ttk.Frame(notebook, padding=12)
         notebook.add(ocr_tab, text="JPG to TXT")
         notebook.add(pdf_text_tab, text="PDF to TXT")
+        notebook.add(text_clean_tab, text="Clean TXT")
         notebook.add(pdf_tab, text="Split PDF")
 
         self._build_ocr_tab(ocr_tab)
         self._build_pdf_text_tab(pdf_text_tab)
+        self._build_text_clean_tab(text_clean_tab)
         self._build_pdf_tab(pdf_tab)
 
         self.progress_bar = self.ttk.Progressbar(
@@ -1349,6 +1479,42 @@ class BookUtilsApp:
         )
         self.pdf_text_button.pack(anchor="w")
 
+    def _build_text_clean_tab(self, parent) -> None:
+        description = self.ttk.Label(
+            parent,
+            text=(
+                "Choose a folder containing TXT files. The app removes every line "
+                "containing '### Source' or '### Page', plus one empty line "
+                "immediately following each removed line."
+            ),
+            wraplength=700,
+        )
+        description.pack(anchor="w", pady=(0, 14))
+
+        folder_row = self.ttk.Frame(parent)
+        folder_row.pack(fill="x", pady=(0, 10))
+
+        self.select_text_clean_folder_button = self.ttk.Button(
+            folder_row,
+            text="Select Folder",
+            command=self.select_text_clean_folder,
+        )
+        self.select_text_clean_folder_button.pack(side="left")
+
+        folder_label = self.ttk.Label(
+            folder_row,
+            textvariable=self.text_clean_folder_var,
+            wraplength=540,
+        )
+        folder_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
+
+        self.text_clean_button = self.ttk.Button(
+            parent,
+            text="Clean TXT Files",
+            command=self.start_text_cleaning,
+        )
+        self.text_clean_button.pack(anchor="w")
+
 
     def _build_pdf_tab(self, parent) -> None:
         description = self.ttk.Label(
@@ -1441,6 +1607,21 @@ class BookUtilsApp:
         self.selected_pdf_text_folder = Path(folder_name)
         self.pdf_text_folder_var.set(str(self.selected_pdf_text_folder))
         self.status_var.set("PDF folder selected. Click PDF to TXT to start.")
+
+    def select_text_clean_folder(self) -> None:
+        from tkinter import filedialog
+
+        folder_name = filedialog.askdirectory(
+            parent=self.root,
+            title="Select folder containing TXT files",
+        )
+
+        if not folder_name:
+            return
+
+        self.selected_text_clean_folder = Path(folder_name)
+        self.text_clean_folder_var.set(str(self.selected_text_clean_folder))
+        self.status_var.set("TXT folder selected. Click Clean TXT Files to start.")
 
 
     def select_pdf(self) -> None:
@@ -1661,6 +1842,41 @@ class BookUtilsApp:
 
         self.root.after(0, self._show_pdf_text_success, result)
 
+    def start_text_cleaning(self) -> None:
+        from tkinter import messagebox
+
+        if self.is_running:
+            return
+
+        if self.selected_text_clean_folder is None:
+            messagebox.showwarning(
+                title="No TXT folder selected",
+                message="Please click Select Folder first.",
+                parent=self.root,
+            )
+            return
+
+        self._set_running_state(True, "Starting TXT cleaning...")
+
+        worker = threading.Thread(
+            target=self._run_text_clean_worker,
+            args=(self.selected_text_clean_folder,),
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_text_clean_worker(self, folder: Path) -> None:
+        try:
+            result = clean_txt_files_in_folder(
+                folder=folder,
+                progress_callback=self._thread_safe_progress,
+            )
+        except Exception as exc:
+            self.root.after(0, self._show_error, exc)
+            return
+
+        self.root.after(0, self._show_text_clean_success, result)
+
 
     def start_pdf_split(self) -> None:
         from tkinter import messagebox
@@ -1759,6 +1975,29 @@ class BookUtilsApp:
             parent=self.root,
         )
 
+    def _show_text_clean_success(self, result: TextCleanResult) -> None:
+        from tkinter import messagebox
+
+        self._update_progress("Done.", 1, 1)
+        self._set_running_state(False)
+
+        warning = ""
+        if result.errors:
+            warning = f"\nWarnings: {len(result.errors)} file(s) could not be cleaned."
+
+        messagebox.showinfo(
+            title="Done",
+            message=(
+                f"Scanned TXT files: {result.scanned_files}\n"
+                f"Changed TXT files: {result.changed_files}\n"
+                f"Removed marker lines: {result.removed_marker_lines}\n"
+                f"Removed following empty lines: {result.removed_empty_lines}\n"
+                f"{warning}\n\n"
+                f"Files were cleaned in-place in:\n{self.selected_text_clean_folder}"
+            ),
+            parent=self.root,
+        )
+
 
     def _show_pdf_success(self, result: PDFSplitResult) -> None:
         from tkinter import messagebox
@@ -1800,6 +2039,8 @@ class BookUtilsApp:
         self.convert_button.configure(state=state)
         self.select_pdf_text_folder_button.configure(state=state)
         self.pdf_text_button.configure(state=state)
+        self.select_text_clean_folder_button.configure(state=state)
+        self.text_clean_button.configure(state=state)
         self.select_pdf_button.configure(state=state)
         self.add_part_button.configure(state=state)
         self.split_pdf_button.configure(state=state)
