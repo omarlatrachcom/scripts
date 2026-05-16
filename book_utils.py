@@ -53,7 +53,14 @@ PDF_OUTPUT_SUFFIX = "part"
 PDF_TEXT_OUTPUT_PREFIX = "chatgpt_pdf"
 PDF_TEXT_ERRORS_FILENAME = "chatgpt_pdf_errors.txt"
 PDF_TEXT_MANIFEST_FILENAME = "chatgpt_pdf_manifest.json"
-TXT_CLEAN_MARKERS = ("### Source", "### Page")
+TXT_CLEAN_MARKERS = (
+    "### Source",
+    "### Page",
+)
+TXT_CLEAN_PATTERNS = (
+    re.compile(r"left\s+in\s+chapter", re.IGNORECASE),
+    re.compile(r"learning\s+reading\s+speed", re.IGNORECASE),
+)
 
 IMAGE_EXTENSIONS = {
     ".jpg",
@@ -264,7 +271,11 @@ def find_txt_files(folder: Path) -> list[Path]:
 
 def line_contains_clean_marker(line: str) -> bool:
     """Return True when a line contains one of the configured clean markers."""
-    return any(marker in line for marker in TXT_CLEAN_MARKERS)
+    normalized_line = line.replace("\u00a0", " ").casefold()
+    return (
+        any(marker.casefold() in normalized_line for marker in TXT_CLEAN_MARKERS)
+        or any(pattern.search(normalized_line) for pattern in TXT_CLEAN_PATTERNS)
+    )
 
 
 def clean_txt_content(text: str) -> tuple[str, int, int]:
@@ -1484,8 +1495,9 @@ class BookUtilsApp:
             parent,
             text=(
                 "Choose a folder containing TXT files. The app removes every line "
-                "containing '### Source' or '### Page', plus one empty line "
-                "immediately following each removed line."
+                "containing '### Source', '### Page', 'left in chapter', or "
+                "'Learning reading speed' (case-insensitive, extra spaces allowed), "
+                "plus one empty line immediately following each removed line."
             ),
             wraplength=700,
         )
