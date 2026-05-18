@@ -53,13 +53,19 @@ PDF_OUTPUT_SUFFIX = "part"
 PDF_TEXT_OUTPUT_PREFIX = "chatgpt_pdf"
 PDF_TEXT_ERRORS_FILENAME = "chatgpt_pdf_errors.txt"
 PDF_TEXT_MANIFEST_FILENAME = "chatgpt_pdf_manifest.json"
-TXT_CLEAN_MARKERS = (
-    "### Source",
-    "### Page",
+TXT_CLEAN_METADATA_LINE_RE = re.compile(
+    r"^\s*###\s+(?:Source|Page)\b.*$",
+    re.IGNORECASE,
 )
-TXT_CLEAN_PATTERNS = (
-    re.compile(r"left\s+in\s+chapter", re.IGNORECASE),
-    re.compile(r"learning\s+reading\s+speed", re.IGNORECASE),
+TXT_CLEAN_FOOTER_LINE_PATTERNS = (
+    re.compile(r"^\s*\d+\s+min(?:ute)?s?\s+left\s+in\s+chapter\s*$", re.IGNORECASE),
+    re.compile(r"^\s*learning\s+reading\s+speed\b.*$", re.IGNORECASE),
+    re.compile(r"^\s*\d+\s*%\s*$", re.IGNORECASE),
+)
+TXT_CLEAN_INLINE_NOISE_PATTERNS = (
+    re.compile(r"\s*\b\d+\s+min(?:ute)?s?\s+left\s+in\s+chapter\b\s*", re.IGNORECASE),
+    re.compile(r"\s*\blearning\s+reading\s+speed\b.*$", re.IGNORECASE),
+    re.compile(r"\s+\d+\s*%\s*$", re.IGNORECASE),
 )
 
 IMAGE_EXTENSIONS = {
@@ -269,17 +275,50 @@ def find_txt_files(folder: Path) -> list[Path]:
     )
 
 
-def line_contains_clean_marker(line: str) -> bool:
-    """Return True when a line contains one of the configured clean markers."""
-    normalized_line = line.replace("\u00a0", " ").casefold()
+def line_is_standalone_clean_marker(line: str) -> bool:
+    """Return True only for standalone generated metadata/footer lines.
+
+    Important: this must not use loose substring matching. OCR can sometimes
+    merge Kindle footer text with a real paragraph, so deleting any line that
+    merely contains "left in chapter" can erase valid book text.
+    """
+    normalized_line = line.replace("\u00a0", " ").strip()
+
     return (
-        any(marker.casefold() in normalized_line for marker in TXT_CLEAN_MARKERS)
-        or any(pattern.search(normalized_line) for pattern in TXT_CLEAN_PATTERNS)
+        bool(TXT_CLEAN_METADATA_LINE_RE.match(normalized_line))
+        or any(
+            pattern.match(normalized_line)
+            for pattern in TXT_CLEAN_FOOTER_LINE_PATTERNS
+        )
     )
 
 
+def strip_embedded_clean_noise(line: str) -> tuple[str, bool]:
+    """Remove Kindle footer noise inside a line without deleting the line.
+
+    Example:
+    "real paragraph text 1 min left in chapter 6%\n"
+    becomes:
+    "real paragraph text\n"
+    """
+    line_body = line.rstrip("\r\n")
+    line_ending = line[len(line_body):]
+
+    cleaned = line_body.replace("\u00a0", " ")
+
+    for pattern in TXT_CLEAN_INLINE_NOISE_PATTERNS:
+        cleaned = pattern.sub(" ", cleaned)
+
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
+    if not cleaned:
+        return "", cleaned != line_body.strip()
+
+    return cleaned + line_ending, cleaned != line_body.strip()
+
+
 def clean_txt_content(text: str) -> tuple[str, int, int]:
-    """Remove marker lines and one following empty line from TXT content."""
+    """Remove generated metadata/footer noise without erasing real paragraphs."""
     lines = text.splitlines(keepends=True)
     cleaned_lines: list[str] = []
     removed_marker_lines = 0
@@ -289,7 +328,7 @@ def clean_txt_content(text: str) -> tuple[str, int, int]:
     while index < len(lines):
         line = lines[index]
 
-        if line_contains_clean_marker(line):
+        if line_is_standalone_clean_marker(line):
             removed_marker_lines += 1
             index += 1
 
@@ -299,7 +338,13 @@ def clean_txt_content(text: str) -> tuple[str, int, int]:
 
             continue
 
-        cleaned_lines.append(line)
+        cleaned_line, changed = strip_embedded_clean_noise(line)
+        if changed:
+            removed_marker_lines += 1
+
+        if cleaned_line:
+            cleaned_lines.append(cleaned_line)
+
         index += 1
 
     return "".join(cleaned_lines), removed_marker_lines, removed_empty_lines
@@ -1494,10 +1539,11 @@ class BookUtilsApp:
         description = self.ttk.Label(
             parent,
             text=(
-                "Choose a folder containing TXT files. The app removes every line "
-                "containing '### Source', '### Page', 'left in chapter', or "
-                "'Learning reading speed' (case-insensitive, extra spaces allowed), "
-                "plus one empty line immediately following each removed line."
+                "Choose a folder containing TXT files. The app removes standalone "
+                "generated metadata/footer lines such as '### Source', '### Page', "
+                "'1 min left in chapter', 'Learning reading speed', and page percent "
+                "lines. If Kindle footer text was merged into a real paragraph, it "
+                "strips only the footer text and keeps the paragraph."
             ),
             wraplength=700,
         )
