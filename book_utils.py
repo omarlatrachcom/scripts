@@ -40,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -779,13 +780,53 @@ def process_folder(
 
 
 def has_useful_text(text: str) -> bool:
-    """Return True when extracted PDF text looks worth using."""
-    compact = re.sub(r"\s+", "", text or "")
+    """Return True only when extracted PDF text looks genuinely readable.
+
+    Some PDFs contain a broken embedded text layer. In those files,
+    page.extract_text() can return many characters, but they are mostly glyph
+    codes/control characters instead of real Unicode text. The old check only
+    counted alphanumeric characters, so it could incorrectly accept corrupted
+    text and skip OCR. This stricter check rejects that garbage and allows the
+    page to fall back to Apple Vision OCR.
+    """
+    if not text or not text.strip():
+        return False
+
+    text = text.replace("\u00a0", " ")
+    compact = re.sub(r"\s+", "", text)
     if len(compact) < 20:
         return False
 
-    alnum_count = sum(character.isalnum() for character in compact)
-    return alnum_count >= 10
+    def is_bad_control(character: str) -> bool:
+        if character in "\n\r\t":
+            return False
+        category = unicodedata.category(character)
+        return category.startswith("C") and character not in {"\u200c", "\u200d"}
+
+    bad_control_count = sum(is_bad_control(character) for character in text)
+    bad_control_ratio = bad_control_count / max(1, len(text))
+    if bad_control_ratio > 0.02:
+        return False
+
+    printable_count = sum(
+        character.isprintable() or character.isspace()
+        for character in text
+    )
+    printable_ratio = printable_count / max(1, len(text))
+    if printable_ratio < 0.90:
+        return False
+
+    letter_count = sum(character.isalpha() for character in compact)
+    if letter_count < 10:
+        return False
+
+    # Works for Latin and most Unicode alphabetic scripts. This prevents random
+    # punctuation/digit-heavy glyph dumps from being treated as readable prose.
+    letter_ratio = letter_count / max(1, len(compact))
+    if letter_ratio < 0.25:
+        return False
+
+    return True
 
 
 def normalize_pdf_text(text: str) -> str:
