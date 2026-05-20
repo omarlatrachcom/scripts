@@ -109,6 +109,13 @@ SENTENCE_END_RE = re.compile(r"[.!?؟。！？…]['\")\]]*$")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?؟。！？…])\s+")
 SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
+# Scanned/searchable PDFs often contain a full-page image plus an invisible OCR
+# text layer. Some OCR layers are badly ordered or incomplete but still contain
+# enough letters to pass plain text-quality checks, so we treat full-page image +
+# hidden/synthetic text as image-first and re-OCR it with Apple Vision.
+PDF_LARGE_IMAGE_AREA_RATIO = 0.60
+PDF_SUSPICIOUS_TEXT_LAYER_RATIO = 0.80
+
 
 @dataclass(frozen=True)
 class OCRLine:
@@ -845,6 +852,108 @@ def has_useful_text(text: str) -> bool:
     return True
 
 
+def pdf_page_has_large_raster_image(
+    fitz_page,
+    min_area_ratio: float = PDF_LARGE_IMAGE_AREA_RATIO,
+) -> bool:
+    """Return True when a page is mainly a raster image.
+
+    This catches scanned/searchable PDFs where the visible page is an image and
+    the selectable text is only a hidden OCR layer.
+    """
+    try:
+        page_area = float(fitz_page.rect.width * fitz_page.rect.height)
+    except Exception:
+        return False
+
+    if page_area <= 0:
+        return False
+
+    try:
+        image_infos = fitz_page.get_image_info(xrefs=True)
+    except Exception:
+        return False
+
+    for image_info in image_infos:
+        bbox = image_info.get("bbox")
+        if not bbox or len(bbox) != 4:
+            continue
+
+        x0, y0, x1, y1 = (float(value) for value in bbox)
+        image_area = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+
+        if image_area / page_area >= min_area_ratio:
+            return True
+
+    return False
+
+
+def pdf_page_has_hidden_or_synthetic_text_layer(
+    fitz_page,
+    suspicious_ratio: float = PDF_SUSPICIOUS_TEXT_LAYER_RATIO,
+) -> bool:
+    """Return True for invisible/synthetic OCR layers such as GlyphLessFont.
+
+    Good born-digital PDFs usually have visible fonts. Searchable scanned PDFs
+    commonly have invisible OCR text (alpha=0 or render-mode hidden) over a
+    page image. In the attached example, that hidden layer is corrupted and
+    causes missing/reordered text unless we force OCR from the rendered image.
+    """
+    try:
+        page_dict = fitz_page.get_text("dict")
+    except Exception:
+        return False
+
+    spans: list[dict[str, object]] = []
+    for block in page_dict.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                if str(span.get("text", "")).strip():
+                    spans.append(span)
+
+    if not spans:
+        return False
+
+    invisible_spans = 0
+    synthetic_font_spans = 0
+
+    for span in spans:
+        alpha = span.get("alpha")
+        try:
+            if alpha is not None and float(alpha) <= 0.01:
+                invisible_spans += 1
+        except (TypeError, ValueError):
+            pass
+
+        font_name = str(span.get("font", "")).lower()
+        if "glyphless" in font_name or "ocr" in font_name:
+            synthetic_font_spans += 1
+
+    span_count = len(spans)
+    return (
+        invisible_spans / span_count >= suspicious_ratio
+        or synthetic_font_spans / span_count >= suspicious_ratio
+    )
+
+
+def should_ocr_pdf_page(fitz_page, direct_text: str) -> bool:
+    """Decide whether to ignore direct PDF text and OCR the rendered page.
+
+    Direct extraction is fastest and best for born-digital PDFs. OCR is safer
+    for scanned/searchable PDFs with a full-page raster image and a hidden OCR
+    layer, because that layer may be stale, incomplete, or badly ordered.
+    """
+    if not has_useful_text(direct_text):
+        return True
+
+    return (
+        pdf_page_has_large_raster_image(fitz_page)
+        and pdf_page_has_hidden_or_synthetic_text_layer(fitz_page)
+    )
+
+
 def normalize_pdf_text(text: str) -> str:
     """
     Convert direct PDF text extraction into cleaner paragraph-like blocks.
@@ -882,7 +991,7 @@ def render_pdf_page_to_image(
     page_index: int,
     temp_dir: Path,
     pdf_path: Path,
-    dpi: int = 220,
+    dpi: int = 300,
 ) -> Path:
     """Render one PDF page to a temporary PNG for Apple Vision OCR."""
     zoom = dpi / 72
@@ -967,7 +1076,11 @@ def extract_text_from_pdf_file(
                         f"{pdf_path.name} page {page_index + 1}: direct text failed: {exc}"
                     )
 
-                if has_useful_text(direct_text):
+                direct_text_is_useful = has_useful_text(direct_text)
+                fitz_page = fitz_document.load_page(page_index)
+                use_ocr = should_ocr_pdf_page(fitz_page, direct_text)
+
+                if direct_text_is_useful and not use_ocr:
                     page_text = direct_text
                     direct_text_pages += 1
                 else:
@@ -981,11 +1094,24 @@ def extract_text_from_pdf_file(
                         page_text = recognize_text_from_image(image_path)
                         if page_text:
                             ocr_pages += 1
+                        elif direct_text_is_useful:
+                            page_text = direct_text
+                            direct_text_pages += 1
+                            errors.append(
+                                f"{pdf_path.name} page {page_index + 1}: OCR returned no text; used embedded PDF text fallback"
+                            )
                     except Exception as exc:
-                        errors.append(
-                            f"{pdf_path.name} page {page_index + 1}: OCR failed: {exc}"
-                        )
-                        page_text = ""
+                        if direct_text_is_useful:
+                            page_text = direct_text
+                            direct_text_pages += 1
+                            errors.append(
+                                f"{pdf_path.name} page {page_index + 1}: OCR failed ({exc}); used embedded PDF text fallback"
+                            )
+                        else:
+                            errors.append(
+                                f"{pdf_path.name} page {page_index + 1}: OCR failed: {exc}"
+                            )
+                            page_text = ""
 
                 if page_text.strip():
                     page_texts.append(
