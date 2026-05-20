@@ -1655,8 +1655,44 @@ class BookUtilsApp:
         self.ttk.Label(header_row, text="Start page", width=14).pack(side="left")
         self.ttk.Label(header_row, text="End page", width=14).pack(side="left", padx=(8, 0))
 
-        self.parts_frame = self.ttk.Frame(parent)
-        self.parts_frame.pack(fill="x", pady=(0, 10))
+        # Keep the action buttons visible even when many PDF parts are added.
+        # Only the page-range rows scroll; the buttons stay fixed below.
+        ranges_container = self.ttk.Frame(parent)
+        ranges_container.pack(fill="both", expand=True, pady=(0, 10))
+
+        self.pdf_parts_canvas = self.tk.Canvas(
+            ranges_container,
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        self.pdf_parts_scrollbar = self.ttk.Scrollbar(
+            ranges_container,
+            orient="vertical",
+            command=self.pdf_parts_canvas.yview,
+        )
+        self.parts_frame = self.ttk.Frame(self.pdf_parts_canvas)
+        self.pdf_parts_window = self.pdf_parts_canvas.create_window(
+            (0, 0),
+            window=self.parts_frame,
+            anchor="nw",
+        )
+        self.pdf_parts_canvas.configure(yscrollcommand=self.pdf_parts_scrollbar.set)
+
+        self.pdf_parts_canvas.pack(side="left", fill="both", expand=True)
+        self.pdf_parts_scrollbar.pack(side="right", fill="y")
+
+        self.parts_frame.bind(
+            "<Configure>",
+            self._on_pdf_parts_frame_configure,
+        )
+        self.pdf_parts_canvas.bind(
+            "<Configure>",
+            self._on_pdf_parts_canvas_configure,
+        )
+        self.pdf_parts_canvas.bind("<Enter>", self._bind_pdf_parts_mousewheel)
+        self.pdf_parts_canvas.bind("<Leave>", self._unbind_pdf_parts_mousewheel)
+        self.parts_frame.bind("<Enter>", self._bind_pdf_parts_mousewheel)
+        self.parts_frame.bind("<Leave>", self._unbind_pdf_parts_mousewheel)
 
         action_row = self.ttk.Frame(parent)
         action_row.pack(fill="x")
@@ -1676,6 +1712,58 @@ class BookUtilsApp:
         self.split_pdf_button.pack(side="left", padx=(10, 0))
 
         self.add_pdf_part_row(default_start="1", default_end="")
+
+    def _on_pdf_parts_frame_configure(self, _event=None) -> None:
+        """Update the PDF parts scrollable region after rows are added/removed."""
+        if not hasattr(self, "pdf_parts_canvas"):
+            return
+
+        self.pdf_parts_canvas.configure(
+            scrollregion=self.pdf_parts_canvas.bbox("all")
+        )
+
+    def _on_pdf_parts_canvas_configure(self, event) -> None:
+        """Keep row widgets as wide as the visible canvas area."""
+        if not hasattr(self, "pdf_parts_canvas") or not hasattr(self, "pdf_parts_window"):
+            return
+
+        self.pdf_parts_canvas.itemconfigure(
+            self.pdf_parts_window,
+            width=event.width,
+        )
+
+    def _bind_pdf_parts_mousewheel(self, _event=None) -> None:
+        """Enable mouse/trackpad scrolling while the cursor is over PDF parts."""
+        if not hasattr(self, "pdf_parts_canvas"):
+            return
+
+        self.pdf_parts_canvas.bind_all("<MouseWheel>", self._on_pdf_parts_mousewheel)
+        self.pdf_parts_canvas.bind_all("<Button-4>", self._on_pdf_parts_mousewheel)
+        self.pdf_parts_canvas.bind_all("<Button-5>", self._on_pdf_parts_mousewheel)
+
+    def _unbind_pdf_parts_mousewheel(self, _event=None) -> None:
+        """Avoid stealing scroll events when the cursor leaves PDF parts."""
+        if not hasattr(self, "pdf_parts_canvas"):
+            return
+
+        self.pdf_parts_canvas.unbind_all("<MouseWheel>")
+        self.pdf_parts_canvas.unbind_all("<Button-4>")
+        self.pdf_parts_canvas.unbind_all("<Button-5>")
+
+    def _on_pdf_parts_mousewheel(self, event) -> None:
+        """Scroll the PDF parts area on macOS/Windows/Linux wheel events."""
+        if not hasattr(self, "pdf_parts_canvas"):
+            return
+
+        if getattr(event, "num", None) == 4:
+            delta = -1
+        elif getattr(event, "num", None) == 5:
+            delta = 1
+        else:
+            delta = -1 * int(event.delta / 120) if event.delta else 0
+
+        if delta:
+            self.pdf_parts_canvas.yview_scroll(delta, "units")
 
     def select_folder(self) -> None:
         from tkinter import filedialog
@@ -1781,6 +1869,11 @@ class BookUtilsApp:
 
         self.pdf_part_rows.append((row_frame, start_var, end_var))
         self._refresh_remove_buttons()
+
+        if hasattr(self, "pdf_parts_canvas"):
+            self.root.after_idle(
+                lambda: self.pdf_parts_canvas.yview_moveto(1.0)
+            )
 
     def remove_pdf_part_row(self, row_frame) -> None:
         if len(self.pdf_part_rows) <= 1:
