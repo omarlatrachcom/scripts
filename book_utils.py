@@ -58,13 +58,28 @@ TXT_CLEAN_METADATA_LINE_RE = re.compile(
     r"^\s*###\s+(?:Source|Page)\b.*$",
     re.IGNORECASE,
 )
+TXT_CLEAN_KINDLE_PROGRESS_RE = re.compile(
+    r"""
+    \s*
+    (?<!\w)
+    (?:
+        (?:(?:\d+\s*(?:h|hr|hrs|hour|hours))\s*)?
+        (?:\d+\s*(?:m|min|mins|minute|minutes))
+        |
+        (?:\d+\s*(?:h|hr|hrs|hour|hours))
+    )
+    \s+left\s+in\s+chapter
+    (?:\s+\d+\s*%?)?
+    \s*
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 TXT_CLEAN_FOOTER_LINE_PATTERNS = (
-    re.compile(r"^\s*\d+\s+min(?:ute)?s?\s+left\s+in\s+chapter\s*$", re.IGNORECASE),
     re.compile(r"^\s*learning\s+reading\s+speed\b.*$", re.IGNORECASE),
     re.compile(r"^\s*\d+\s*%\s*$", re.IGNORECASE),
 )
 TXT_CLEAN_INLINE_NOISE_PATTERNS = (
-    re.compile(r"\s*\b\d+\s+min(?:ute)?s?\s+left\s+in\s+chapter\b\s*", re.IGNORECASE),
+    TXT_CLEAN_KINDLE_PROGRESS_RE,
     re.compile(r"\s*\blearning\s+reading\s+speed\b.*$", re.IGNORECASE),
     re.compile(r"\s+\d+\s*%\s*$", re.IGNORECASE),
 )
@@ -287,6 +302,7 @@ def line_is_standalone_clean_marker(line: str) -> bool:
 
     return (
         bool(TXT_CLEAN_METADATA_LINE_RE.match(normalized_line))
+        or bool(TXT_CLEAN_KINDLE_PROGRESS_RE.fullmatch(normalized_line))
         or any(
             pattern.match(normalized_line)
             for pattern in TXT_CLEAN_FOOTER_LINE_PATTERNS
