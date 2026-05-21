@@ -62,13 +62,16 @@ TXT_CLEAN_KINDLE_PROGRESS_RE = re.compile(
     r"""
     \s*
     (?<!\w)
+    (?:\d+\s*%\s*)?
     (?:
         (?:(?:\d+\s*(?:h|hr|hrs|hour|hours))\s*)?
         (?:\d+\s*(?:m|min|mins|minute|minutes))
         |
         (?:\d+\s*(?:h|hr|hrs|hour|hours))
     )
-    \s+left\s+in\s+chapter
+    \s+
+    (?:left|lett|lelt|1eft|ieft)
+    \s+in\s+chapter
     (?:\s+\d+\s*%?)?
     \s*
     """,
@@ -1724,7 +1727,8 @@ class BookUtilsApp:
             text=(
                 "Choose a folder containing TXT files. The app removes standalone "
                 "generated metadata/footer lines such as '### Source', '### Page', "
-                "'1 min left in chapter', 'Learning reading speed', and page percent "
+                "'1 min left in chapter' including common OCR variants like "
+                "'lett in chapter', 'Learning reading speed', and page percent "
                 "lines. If Kindle footer text was merged into a real paragraph, it "
                 "strips only the footer text and keeps the paragraph."
             ),
