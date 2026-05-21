@@ -1162,20 +1162,33 @@ class HandleSubjectPage(BasePage):
 
         rf = tk.Frame(right, bg=self.theme.palette.card_bg)
         rf.pack(fill="both", expand=True, padx=18, pady=18)
+        rf.grid_columnconfigure(0, weight=1)
+        rf.grid_rowconfigure(4, weight=1)
 
-        ttk.Label(rf, text="Prompt preview", style="Section.TLabel").pack(anchor="w")
-        self.prompt_preview = AccessibleText(rf, self.theme, height=8)
-        self.prompt_preview.pack(fill="x", pady=(8, 14))
+        ttk.Label(rf, text="Prompt preview", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        self.prompt_preview = AccessibleText(rf, self.theme, height=6)
+        self.prompt_preview.grid(row=1, column=0, sticky="ew", pady=(8, 14))
         self.prompt_preview.config(state="disabled")
 
-        ttk.Label(rf, text="Final input (copy this into an LLM)", style="Section.TLabel").pack(anchor="w")
-        self.final_text = AccessibleText(rf, self.theme, height=14)
-        self.final_text.pack(fill="both", expand=True, pady=(8, 12))
+        ttk.Label(rf, text="Final input (copy this into an LLM)", style="Section.TLabel").grid(row=2, column=0, sticky="w")
 
+        # Keep these actions above the large final-input box so they remain visible
+        # even when the window is shorter and the text area needs to shrink.
         output_buttons = tk.Frame(rf, bg=self.theme.palette.card_bg)
-        output_buttons.pack(fill="x")
-        AccessibleButton(output_buttons, self.theme, text="Copy to clipboard", command=self.copy_final).pack(side="left")
-        AccessibleButton(output_buttons, self.theme, text="Clear final", command=self.clear_final, kind="neutral").pack(side="left", padx=12)
+        output_buttons.grid(row=3, column=0, sticky="w", pady=(8, 8))
+        AccessibleButton(output_buttons, self.theme, text="Copy final input", command=self.copy_final).pack(side="left")
+        AccessibleButton(output_buttons, self.theme, text="Clear final input", command=self.clear_final, kind="neutral").pack(side="left", padx=12)
+
+        final_box = tk.Frame(rf, bg=self.theme.palette.card_bg)
+        final_box.grid(row=4, column=0, sticky="nsew")
+        final_box.grid_columnconfigure(0, weight=1)
+        final_box.grid_rowconfigure(0, weight=1)
+
+        self.final_text = AccessibleText(final_box, self.theme, height=10)
+        self.final_text.grid(row=0, column=0, sticky="nsew")
+        final_scroll = ttk.Scrollbar(final_box, orient="vertical", command=self.final_text.yview)
+        final_scroll.grid(row=0, column=1, sticky="ns")
+        self.final_text.configure(yscrollcommand=final_scroll.set)
 
         self.refresh()
 
@@ -1241,6 +1254,8 @@ class HandleSubjectPage(BasePage):
 
     def clear_final(self) -> None:
         self.final_text.delete("1.0", tk.END)
+        self.hint.config(text="Final input cleared.")
+        self.final_text.focus_set()
 
     def generate(self) -> None:
         subject = self.subject_text.get("1.0", tk.END).rstrip()
