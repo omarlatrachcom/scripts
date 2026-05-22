@@ -23,6 +23,7 @@ Features:
 4. TXT Cleaner
    - Select a folder containing TXT files.
    - Removes metadata lines containing configured markers.
+   - Optionally removes a user-provided literal string of any length.
    - Also removes one empty line immediately following each removed metadata line.
 
 Dependency handling:
@@ -320,8 +321,73 @@ def line_is_standalone_clean_marker(line: str) -> bool:
     )
 
 
-def strip_embedded_clean_noise(line: str) -> tuple[str, bool]:
-    """Remove Kindle footer noise inside a line without deleting the line.
+def custom_clean_string_has_linebreak(custom_clean_string: str) -> bool:
+    """Return True when a custom literal cleanup string spans multiple lines."""
+    return "\n" in custom_clean_string or "\r" in custom_clean_string
+
+
+def normalize_custom_clean_string_for_line_match(custom_clean_string: str) -> str:
+    """Normalize a single-line custom cleanup string for standalone line checks."""
+    return custom_clean_string.replace("\u00a0", " ").strip()
+
+
+def line_is_standalone_custom_clean_string(
+    line: str,
+    custom_clean_string: str,
+) -> bool:
+    """Return True when a line is exactly the custom literal cleanup string.
+
+    The custom value is treated as plain text, never as a regex, so characters
+    such as ., *, [, ], ?, $, or backslashes are matched literally.
+    """
+    if not custom_clean_string or custom_clean_string_has_linebreak(custom_clean_string):
+        return False
+
+    normalized_custom = normalize_custom_clean_string_for_line_match(
+        custom_clean_string
+    )
+    if not normalized_custom:
+        return False
+
+    normalized_line = line.replace("\u00a0", " ").strip()
+    return normalized_line == normalized_custom
+
+
+def remove_multiline_custom_clean_string(
+    text: str,
+    custom_clean_string: str,
+) -> tuple[str, int]:
+    """Remove a multi-line custom cleanup string as a literal text block."""
+    if not custom_clean_string or not custom_clean_string_has_linebreak(custom_clean_string):
+        return text, 0
+
+    custom_variants = [custom_clean_string]
+
+    # Tkinter Text widgets use "\n" for newlines. Add common file-line-ending
+    # variants so a pasted multi-line marker still matches CRLF/CR text files.
+    if "\r" not in custom_clean_string:
+        custom_variants.append(custom_clean_string.replace("\n", "\r\n"))
+        custom_variants.append(custom_clean_string.replace("\n", "\r"))
+
+    cleaned = text
+    removed_count = 0
+
+    for custom_variant in dict.fromkeys(custom_variants):
+        if not custom_variant:
+            continue
+        count = cleaned.count(custom_variant)
+        if count:
+            cleaned = cleaned.replace(custom_variant, "")
+            removed_count += count
+
+    return cleaned, removed_count
+
+
+def strip_embedded_clean_noise(
+    line: str,
+    custom_clean_string: str = "",
+) -> tuple[str, bool]:
+    """Remove footer/custom noise inside a line without deleting real text.
 
     Example:
     "real paragraph text 1 min left in chapter 6%\n"
@@ -336,6 +402,11 @@ def strip_embedded_clean_noise(line: str) -> tuple[str, bool]:
     for pattern in TXT_CLEAN_INLINE_NOISE_PATTERNS:
         cleaned = pattern.sub(" ", cleaned)
 
+    if custom_clean_string and not custom_clean_string_has_linebreak(custom_clean_string):
+        normalized_custom = custom_clean_string.replace("\u00a0", " ")
+        if normalized_custom:
+            cleaned = cleaned.replace(normalized_custom, " ")
+
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
 
     if not cleaned:
@@ -344,18 +415,34 @@ def strip_embedded_clean_noise(line: str) -> tuple[str, bool]:
     return cleaned + line_ending, cleaned != line_body.strip()
 
 
-def clean_txt_content(text: str) -> tuple[str, int, int]:
-    """Remove generated metadata/footer noise without erasing real paragraphs."""
+def clean_txt_content(
+    text: str,
+    custom_clean_string: str = "",
+) -> tuple[str, int, int]:
+    """Remove generated metadata/footer noise without erasing real paragraphs.
+
+    custom_clean_string is treated as a literal plain-text value, not a regex.
+    Single-line values are removed as standalone lines and inline occurrences.
+    Multi-line values are removed as exact literal blocks before line cleanup.
+    """
+    text, removed_custom_blocks = remove_multiline_custom_clean_string(
+        text,
+        custom_clean_string,
+    )
+
     lines = text.splitlines(keepends=True)
     cleaned_lines: list[str] = []
-    removed_marker_lines = 0
+    removed_marker_lines = removed_custom_blocks
     removed_empty_lines = 0
     index = 0
 
     while index < len(lines):
         line = lines[index]
 
-        if line_is_standalone_clean_marker(line):
+        if line_is_standalone_clean_marker(line) or line_is_standalone_custom_clean_string(
+            line,
+            custom_clean_string,
+        ):
             removed_marker_lines += 1
             index += 1
 
@@ -365,7 +452,10 @@ def clean_txt_content(text: str) -> tuple[str, int, int]:
 
             continue
 
-        cleaned_line, changed = strip_embedded_clean_noise(line)
+        cleaned_line, changed = strip_embedded_clean_noise(
+            line,
+            custom_clean_string=custom_clean_string,
+        )
         if changed:
             removed_marker_lines += 1
 
@@ -379,6 +469,7 @@ def clean_txt_content(text: str) -> tuple[str, int, int]:
 
 def clean_txt_files_in_folder(
     folder: Path,
+    custom_clean_string: str = "",
     progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> TextCleanResult:
     """Clean all TXT files directly inside a selected folder."""
@@ -409,7 +500,8 @@ def clean_txt_files_in_folder(
             continue
 
         cleaned_text, removed_marker_lines, removed_empty_lines = clean_txt_content(
-            original_text
+            original_text,
+            custom_clean_string=custom_clean_string,
         )
 
         total_removed_marker_lines += removed_marker_lines
@@ -1535,6 +1627,7 @@ class BookUtilsApp:
         self.selected_pdf_text_folder: Path | None = None
         self.selected_text_clean_folder: Path | None = None
         self.selected_pdf: Path | None = None
+        self.custom_clean_text = None
         self.pdf_part_rows: list[tuple[object, object, object]] = []
         self.is_running = False
 
@@ -1730,7 +1823,8 @@ class BookUtilsApp:
                 "'1 min left in chapter' including common OCR variants like "
                 "'lett in chapter', 'Learning reading speed', and page percent "
                 "lines. If Kindle footer text was merged into a real paragraph, it "
-                "strips only the footer text and keeps the paragraph."
+                "strips only the footer text and keeps the paragraph. You can also "
+                "paste a custom literal string to remove from the TXT files."
             ),
             wraplength=700,
         )
@@ -1752,6 +1846,41 @@ class BookUtilsApp:
             wraplength=540,
         )
         folder_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
+
+        custom_label = self.ttk.Label(
+            parent,
+            text="Optional custom literal string to remove:",
+        )
+        custom_label.pack(anchor="w", pady=(6, 4))
+
+        custom_text_frame = self.ttk.Frame(parent)
+        custom_text_frame.pack(fill="both", expand=True, pady=(0, 6))
+
+        self.custom_clean_text = self.tk.Text(
+            custom_text_frame,
+            height=6,
+            wrap="word",
+            undo=True,
+        )
+        custom_scrollbar = self.ttk.Scrollbar(
+            custom_text_frame,
+            orient="vertical",
+            command=self.custom_clean_text.yview,
+        )
+        self.custom_clean_text.configure(yscrollcommand=custom_scrollbar.set)
+        self.custom_clean_text.pack(side="left", fill="both", expand=True)
+        custom_scrollbar.pack(side="right", fill="y")
+
+        custom_hint = self.ttk.Label(
+            parent,
+            text=(
+                "Matched as plain text, not regex. Leave empty to use only the "
+                "built-in cleaners. Single-line text is removed as a standalone "
+                "line or inline occurrence; multi-line text is removed as an exact block."
+            ),
+            wraplength=700,
+        )
+        custom_hint.pack(anchor="w", pady=(0, 12))
 
         self.text_clean_button = self.ttk.Button(
             parent,
@@ -2194,19 +2323,28 @@ class BookUtilsApp:
             )
             return
 
+        custom_clean_string = ""
+        if self.custom_clean_text is not None:
+            custom_clean_string = self.custom_clean_text.get("1.0", "end-1c")
+
         self._set_running_state(True, "Starting TXT cleaning...")
 
         worker = threading.Thread(
             target=self._run_text_clean_worker,
-            args=(self.selected_text_clean_folder,),
+            args=(self.selected_text_clean_folder, custom_clean_string),
             daemon=True,
         )
         worker.start()
 
-    def _run_text_clean_worker(self, folder: Path) -> None:
+    def _run_text_clean_worker(
+        self,
+        folder: Path,
+        custom_clean_string: str,
+    ) -> None:
         try:
             result = clean_txt_files_in_folder(
                 folder=folder,
+                custom_clean_string=custom_clean_string,
                 progress_callback=self._thread_safe_progress,
             )
         except Exception as exc:
@@ -2328,7 +2466,7 @@ class BookUtilsApp:
             message=(
                 f"Scanned TXT files: {result.scanned_files}\n"
                 f"Changed TXT files: {result.changed_files}\n"
-                f"Removed marker lines: {result.removed_marker_lines}\n"
+                f"Removed marker/custom items: {result.removed_marker_lines}\n"
                 f"Removed following empty lines: {result.removed_empty_lines}\n"
                 f"{warning}\n\n"
                 f"Files were cleaned in-place in:\n{self.selected_text_clean_folder}"
@@ -2379,6 +2517,8 @@ class BookUtilsApp:
         self.pdf_text_button.configure(state=state)
         self.select_text_clean_folder_button.configure(state=state)
         self.text_clean_button.configure(state=state)
+        if self.custom_clean_text is not None:
+            self.custom_clean_text.configure(state=state)
         self.select_pdf_button.configure(state=state)
         self.add_part_button.configure(state=state)
         self.split_pdf_button.configure(state=state)
