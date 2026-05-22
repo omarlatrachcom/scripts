@@ -1591,8 +1591,8 @@ def split_pdf(
             writer.add_page(reader.pages[page_number - 1])
 
         output_name = (
-            f"{safe_stem}_{PDF_OUTPUT_SUFFIX}_{index:03d}_"
-            f"p{part.start_page:03d}-p{part.end_page:03d}.pdf"
+            f"{safe_stem}_"
+            f"p{part.start_page:04d}-p{part.end_page:04d}.pdf"
         )
         output_path = unique_output_path(output_dir / output_name)
 
