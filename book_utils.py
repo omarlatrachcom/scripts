@@ -23,6 +23,8 @@ Features:
 4. TXT Cleaner
    - Select a folder containing TXT files.
    - Removes metadata lines containing configured markers.
+   - Removes printed page numbers around generated page markers.
+   - Joins paragraphs that were split only by generated page markers.
    - Optionally removes a user-provided literal string of any length.
    - Also removes one empty line immediately following each removed metadata line.
 
@@ -58,6 +60,14 @@ PDF_TEXT_MANIFEST_FILENAME = "chatgpt_pdf_manifest.json"
 TXT_CLEAN_METADATA_LINE_RE = re.compile(
     r"^\s*###\s+(?:Source|Page)\b.*$",
     re.IGNORECASE,
+)
+TXT_CLEAN_PAGE_MARKER_RE = re.compile(
+    r"^\s*###\s+Page\b.*$",
+    re.IGNORECASE,
+)
+TXT_CLEAN_STANDALONE_PAGE_NUMBER_RE = re.compile(r"^\s*\d{1,5}\s*$")
+TXT_CLEAN_TRAILING_PAGE_NUMBER_RE = re.compile(
+    r"^(?P<body>.*\S)\s+(?P<page_number>\d{1,5})\s*$"
 )
 TXT_CLEAN_KINDLE_PROGRESS_RE = re.compile(
     r"""
@@ -321,6 +331,164 @@ def line_is_standalone_clean_marker(line: str) -> bool:
     )
 
 
+def line_is_generated_page_marker(line: str) -> bool:
+    """Return True for generated page headers such as '### Page 2'."""
+    normalized_line = line.replace("\u00a0", " ").strip()
+    return bool(TXT_CLEAN_PAGE_MARKER_RE.match(normalized_line))
+
+
+def line_is_standalone_page_number(line: str) -> bool:
+    """Return True for a printed page number on its own line."""
+    normalized_line = line.replace("\u00a0", " ").strip()
+    return bool(TXT_CLEAN_STANDALONE_PAGE_NUMBER_RE.fullmatch(normalized_line))
+
+
+def remove_trailing_page_number(line: str) -> tuple[str, bool]:
+    """Remove a printed page number appended to the end of a text line.
+
+    This is only called when a generated '### Page ...' marker immediately
+    follows, so the trailing number is treated as page-boundary noise rather
+    than ordinary text.
+    """
+    line_body = line.rstrip("\r\n")
+    line_ending = line[len(line_body):]
+    normalized_body = line_body.replace("\u00a0", " ")
+    match = TXT_CLEAN_TRAILING_PAGE_NUMBER_RE.match(normalized_body)
+
+    if not match:
+        return line, False
+
+    body_without_page_number = match.group("body").rstrip()
+
+    # Avoid stripping short legitimate headings such as "Chapter 5" when they
+    # happen to appear before a generated page marker.
+    if len(body_without_page_number) < 40 and not re.search(
+        r"[,;:]|\b(?:and|or|but|then|when|while|with|to|in|on|at|for|from)\b\s*$",
+        body_without_page_number,
+        re.IGNORECASE,
+    ):
+        return line, False
+
+    return body_without_page_number + line_ending, True
+
+
+def last_nonempty_line_text(lines: list[str]) -> str:
+    """Return the text from the last non-empty line already kept."""
+    for line in reversed(lines):
+        text = line.replace("\u00a0", " ").strip()
+        if text:
+            return text
+
+    return ""
+
+
+def next_nonempty_line_text(lines: list[str], start_index: int) -> str:
+    """Return the next non-empty source line after start_index."""
+    for line in lines[start_index:]:
+        text = line.replace("\u00a0", " ").strip()
+        if text:
+            return text
+
+    return ""
+
+
+def should_join_page_boundary(previous_text: str, next_text: str) -> bool:
+    """Return True when a removed page marker split one running paragraph."""
+    previous_text = previous_text.strip()
+    next_text = next_text.strip()
+
+    if not previous_text or not next_text:
+        return False
+
+    if ends_at_safe_boundary(previous_text):
+        return False
+
+    if previous_text.endswith(("-", "—", "–")):
+        return True
+
+    if next_text[:1].islower():
+        return True
+
+    return previous_text.endswith((",", ";", ":", "(", "[", "{"))
+
+
+def append_cleaned_line(
+    cleaned_lines: list[str],
+    cleaned_line: str,
+    join_with_previous: bool = False,
+) -> None:
+    """Append a cleaned line, optionally joining it to the previous text line."""
+    if not cleaned_line:
+        return
+
+    if not join_with_previous or not cleaned_lines:
+        cleaned_lines.append(cleaned_line)
+        return
+
+    while cleaned_lines and not cleaned_lines[-1].strip():
+        cleaned_lines.pop()
+
+    if not cleaned_lines:
+        cleaned_lines.append(cleaned_line)
+        return
+
+    previous_line = cleaned_lines[-1]
+    previous_body = previous_line.rstrip("\r\n")
+    cleaned_body = cleaned_line.lstrip().rstrip("\r\n")
+    cleaned_ending = cleaned_line[len(cleaned_line.rstrip("\r\n")):]
+
+    separator = "" if previous_body.rstrip().endswith(("-", "—", "–")) else " "
+    cleaned_lines[-1] = (
+        previous_body.rstrip()
+        + separator
+        + cleaned_body.strip()
+        + cleaned_ending
+    )
+
+
+def remove_terminal_page_number_footer(
+    cleaned_lines: list[str],
+) -> tuple[int, int]:
+    """Remove a final printed page number left at the end of a cleaned TXT file.
+
+    Page-boundary cleanup can remove numbers before generated "### Page ..."
+    markers, but the final PDF page has no following generated marker. In those
+    cases OCR/PDF extraction can leave a dangling footer like "14" as the last
+    line of the whole file.
+
+    To avoid deleting meaningful numbered content, this only removes a standalone
+    number when it is the final non-empty line and there is real text before it.
+    """
+    removed_marker_lines = 0
+    removed_empty_lines = 0
+
+    while cleaned_lines and not cleaned_lines[-1].strip():
+        cleaned_lines.pop()
+        removed_empty_lines += 1
+
+    if not cleaned_lines or not line_is_standalone_page_number(cleaned_lines[-1]):
+        return removed_marker_lines, removed_empty_lines
+
+    previous_text = ""
+    for previous_line in reversed(cleaned_lines[:-1]):
+        previous_text = previous_line.replace("\u00a0", " ").strip()
+        if previous_text:
+            break
+
+    # Do not turn a file that only contains a number into an empty file.
+    if not previous_text:
+        return removed_marker_lines, removed_empty_lines
+
+    cleaned_lines.pop()
+    removed_marker_lines += 1
+
+    while cleaned_lines and not cleaned_lines[-1].strip():
+        cleaned_lines.pop()
+        removed_empty_lines += 1
+
+    return removed_marker_lines, removed_empty_lines
+
+
 def custom_clean_string_has_linebreak(custom_clean_string: str) -> bool:
     """Return True when a custom literal cleanup string spans multiple lines."""
     return "\n" in custom_clean_string or "\r" in custom_clean_string
@@ -424,6 +592,11 @@ def clean_txt_content(
     custom_clean_string is treated as a literal plain-text value, not a regex.
     Single-line values are removed as standalone lines and inline occurrences.
     Multi-line values are removed as exact literal blocks before line cleanup.
+
+    Generated page markers are handled contextually:
+    - a standalone printed page number immediately before "### Page ..." is removed
+    - a trailing printed page number at the end of the previous line is removed
+    - if the marker split one running sentence, the next line is joined back
     """
     text, removed_custom_blocks = remove_multiline_custom_clean_string(
         text,
@@ -435,9 +608,60 @@ def clean_txt_content(
     removed_marker_lines = removed_custom_blocks
     removed_empty_lines = 0
     index = 0
+    join_next_line_to_previous = False
 
     while index < len(lines):
         line = lines[index]
+
+        if line_is_generated_page_marker(line):
+            removed_marker_lines += 1
+
+            # Remove the blank line directly before the generated page marker.
+            # In PDF chunks this blank line usually separates the marker from a
+            # printed page number or from a paragraph split across pages.
+            while cleaned_lines and not cleaned_lines[-1].strip():
+                cleaned_lines.pop()
+                removed_empty_lines += 1
+
+            # Remove a printed page number on its own line immediately before
+            # the generated page marker, e.g. "... body.\n\n44\n\n### Page 11".
+            if cleaned_lines and line_is_standalone_page_number(cleaned_lines[-1]):
+                cleaned_lines.pop()
+                removed_marker_lines += 1
+
+            # Remove a printed page number appended to the previous text line,
+            # e.g. "... brought in tea 35\n\n### Page 2".
+            if cleaned_lines:
+                cleaned_line, removed_inline_page_number = remove_trailing_page_number(
+                    cleaned_lines[-1]
+                )
+                if removed_inline_page_number:
+                    cleaned_lines[-1] = cleaned_line
+                    removed_marker_lines += 1
+
+            index += 1
+
+            while index < len(lines) and not lines[index].strip():
+                removed_empty_lines += 1
+                index += 1
+
+            previous_text = last_nonempty_line_text(cleaned_lines)
+            next_text = next_nonempty_line_text(lines, index)
+            join_next_line_to_previous = should_join_page_boundary(
+                previous_text,
+                next_text,
+            )
+
+            if (
+                previous_text
+                and next_text
+                and not join_next_line_to_previous
+                and cleaned_lines
+                and cleaned_lines[-1].strip()
+            ):
+                cleaned_lines.append("\n")
+
+            continue
 
         if line_is_standalone_clean_marker(line) or line_is_standalone_custom_clean_string(
             line,
@@ -460,9 +684,20 @@ def clean_txt_content(
             removed_marker_lines += 1
 
         if cleaned_line:
-            cleaned_lines.append(cleaned_line)
+            append_cleaned_line(
+                cleaned_lines,
+                cleaned_line,
+                join_with_previous=join_next_line_to_previous,
+            )
+            join_next_line_to_previous = False
 
         index += 1
+
+    terminal_removed_marker_lines, terminal_removed_empty_lines = (
+        remove_terminal_page_number_footer(cleaned_lines)
+    )
+    removed_marker_lines += terminal_removed_marker_lines
+    removed_empty_lines += terminal_removed_empty_lines
 
     return "".join(cleaned_lines), removed_marker_lines, removed_empty_lines
 
