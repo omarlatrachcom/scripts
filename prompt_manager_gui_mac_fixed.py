@@ -134,8 +134,11 @@ class AppStore:
         return {
             "version": self.version,
             "projects": {
-                project: [prompt.to_dict() for prompt in prompts]
-                for project, prompts in self.projects.items()
+                project: [prompt.to_dict() for prompt in sorted(prompts, key=prompt_title_sort_key)]
+                for project, prompts in sorted(
+                    self.projects.items(),
+                    key=lambda item: project_name_sort_key(item[0]),
+                )
             },
         }
 
@@ -253,6 +256,18 @@ def normalize_project_name(name: str) -> str:
     return " ".join(name.strip().split())
 
 
+def project_name_sort_key(name: str) -> tuple[str, str]:
+    """Case-insensitive project sorting with deterministic tie-breaking."""
+    normalized = normalize_project_name(name)
+    return (normalized.casefold(), normalized)
+
+
+def prompt_title_sort_key(prompt: PromptRecord) -> tuple[str, str, str, str]:
+    """Case-insensitive prompt sorting by display title with deterministic tie-breaking."""
+    display_title = prompt.title or "(untitled)"
+    return (display_title.casefold(), display_title, prompt.created_at, prompt.id)
+
+
 class PromptManagerService:
     def __init__(self, repository: StoreRepository) -> None:
         self.repository = repository
@@ -266,10 +281,10 @@ class PromptManagerService:
         self.repository.save(self.store)
 
     def list_projects(self) -> list[str]:
-        return sorted(self.store.projects.keys(), key=lambda s: s.lower())
+        return sorted(self.store.projects.keys(), key=project_name_sort_key)
 
     def get_prompts(self, project: str) -> list[PromptRecord]:
-        return list(self.store.projects.get(project, []))
+        return sorted(self.store.projects.get(project, []), key=prompt_title_sort_key)
 
     def find_prompt(self, project: str, prompt_id: str) -> PromptRecord | None:
         for prompt in self.store.projects.get(project, []):
