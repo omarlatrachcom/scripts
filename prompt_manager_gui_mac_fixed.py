@@ -13,6 +13,7 @@ Refactored for clearer separation of concerns and improved accessibility:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import uuid
@@ -430,6 +431,47 @@ def compose_prompt_with_attachments_hint(
     return f"{prompt_text}\n\n[ATTACHED FILE(S)]\n{hint_text}\n"
 
 
+VARIABLE_PATTERN = re.compile(r"{{\s*([^{}]+?)\s*}}")
+
+
+def normalize_variable_name(name: str) -> str:
+    """Normalize a template variable name while keeping it readable for display."""
+    return " ".join(name.strip().split())
+
+
+def extract_prompt_variables(prompt_text: str) -> list[str]:
+    """Return unique {{VARIABLE}} names from one prompt, preserving first-seen order."""
+    variables: list[str] = []
+    seen: set[str] = set()
+    for match in VARIABLE_PATTERN.finditer(prompt_text or ""):
+        name = normalize_variable_name(match.group(1))
+        if name and name not in seen:
+            seen.add(name)
+            variables.append(name)
+    return variables
+
+
+def extract_project_variables(prompts: list[PromptRecord]) -> list[str]:
+    """Return unique {{VARIABLE}} names across a whole project/pipeline."""
+    variables: list[str] = []
+    seen: set[str] = set()
+    for prompt in prompts:
+        for name in extract_prompt_variables(prompt.content):
+            if name not in seen:
+                seen.add(name)
+                variables.append(name)
+    return variables
+
+
+def render_prompt_template(prompt_text: str, variable_values: dict[str, str]) -> str:
+    """Replace {{VARIABLE}} placeholders with user-provided values."""
+    def replace_match(match: re.Match[str]) -> str:
+        name = normalize_variable_name(match.group(1))
+        return variable_values.get(name, match.group(0))
+
+    return VARIABLE_PATTERN.sub(replace_match, prompt_text or "")
+
+
 # ---------------------------------------------------------------------------
 # Theme and reusable widgets
 # ---------------------------------------------------------------------------
@@ -447,7 +489,7 @@ class Palette:
     accent: str = "#0F62FE"
     accent_hover: str = "#0353E9"
     accent_pressed: str = "#002D9C"
-    accent_text: str = "#FFFFFF"
+    accent_text: str = "#111827"
     neutral: str = "#E5E7EB"
     neutral_hover: str = "#D1D5DB"
     neutral_pressed: str = "#9CA3AF"
@@ -455,7 +497,7 @@ class Palette:
     danger: str = "#B42318"
     danger_hover: str = "#912018"
     danger_pressed: str = "#7A1212"
-    danger_text: str = "#FFFFFF"
+    danger_text: str = "#111827"
     focus: str = "#111827"
     selection: str = "#C7D2FE"
     status_bg: str = "#E0E7FF"
@@ -591,7 +633,7 @@ class Card(tk.Frame):
         )
 
 
-class AccessibleButton(tk.Label):
+class AccessibleButton(tk.Button):
     def __init__(
         self,
         master: tk.Misc,
@@ -603,76 +645,61 @@ class AccessibleButton(tk.Label):
         width: int | None = None,
     ) -> None:
         palette = theme.palette
-        self._command = command
-        self._kind = kind
 
-        self._normal_bg = palette.accent
-        self._hover_bg = palette.accent_hover
-        self._pressed_bg = palette.accent_pressed
-        self._fg = palette.accent_text
+        normal_bg = palette.accent
+        hover_bg = palette.accent_hover
+        pressed_bg = palette.accent_pressed
+        fg = palette.accent_text
 
         if kind == "neutral":
-            self._normal_bg = palette.neutral
-            self._hover_bg = palette.neutral_hover
-            self._pressed_bg = palette.neutral_pressed
-            self._fg = palette.neutral_text
+            normal_bg = palette.neutral
+            hover_bg = palette.neutral_hover
+            pressed_bg = palette.neutral_pressed
+            fg = palette.neutral_text
         elif kind == "danger":
-            self._normal_bg = palette.danger
-            self._hover_bg = palette.danger_hover
-            self._pressed_bg = palette.danger_pressed
-            self._fg = palette.danger_text
+            normal_bg = palette.danger
+            hover_bg = palette.danger_hover
+            pressed_bg = palette.danger_pressed
+            fg = palette.danger_text
+
+        self._normal_bg = normal_bg
+        self._hover_bg = hover_bg
+        self._pressed_bg = pressed_bg
 
         super().__init__(
             master,
             text=text,
+            command=command,
             font=theme.fonts.button,
-            bg=self._normal_bg,
-            fg=self._fg,
+            bg=normal_bg,
+            fg=fg,
+            activebackground=pressed_bg,
+            activeforeground=fg,
+            disabledforeground=palette.muted,
             bd=1,
             relief="solid",
             padx=16,
-            pady=12,
+            pady=10,
             cursor="hand2",
-            width=width,
+            width=width or 0,
             takefocus=True,
             highlightthickness=3,
-            highlightbackground=self._normal_bg,
+            highlightbackground=normal_bg,
             highlightcolor=palette.focus,
             anchor="center",
-            justify="center",
         )
-
-        self.bind("<Button-1>", self._on_click)
-        self.bind("<ButtonRelease-1>", self._on_release)
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
+        self.bind("<Enter>", lambda _event: self.configure(bg=self._hover_bg))
+        self.bind("<Leave>", lambda _event: self.configure(bg=self._normal_bg))
+        self.bind("<ButtonPress-1>", lambda _event: self.configure(bg=self._pressed_bg))
+        self.bind("<ButtonRelease-1>", lambda _event: self.configure(bg=self._hover_bg))
         self.bind("<FocusIn>", lambda _event: self.configure(highlightbackground=palette.focus))
         self.bind("<FocusOut>", lambda _event: self.configure(highlightbackground=self._normal_bg))
-        self.bind("<Return>", self._invoke)
-        self.bind("<space>", self._invoke)
+        self.bind("<Return>", self._invoke_from_keyboard)
+        self.bind("<KP_Enter>", self._invoke_from_keyboard)
 
-    def _on_enter(self, _event=None) -> None:
-        self.configure(bg=self._hover_bg)
-
-    def _on_leave(self, _event=None) -> None:
-        self.configure(bg=self._normal_bg)
-
-    def _on_click(self, _event=None) -> None:
-        self.focus_set()
-        self.configure(bg=self._pressed_bg)
-
-    def _on_release(self, event=None) -> None:
-        x = event.x if event is not None else None
-        y = event.y if event is not None else None
-        self.configure(bg=self._hover_bg)
-        if x is None or y is None or (0 <= x < self.winfo_width() and 0 <= y < self.winfo_height()):
-            self._command()
-
-    def _invoke(self, _event=None) -> str:
-        self.focus_set()
-        self._command()
+    def _invoke_from_keyboard(self, _event=None) -> str:
+        self.invoke()
         return "break"
-
 
 class AccessibleText(tk.Text):
     def __init__(self, master: tk.Misc, theme: ThemeManager, **kwargs) -> None:
@@ -715,6 +742,48 @@ class AccessibleEntry(tk.Entry):
         )
 
 
+class TextAreaWithScrollbar(tk.Frame):
+    """A keyboard-focusable multi-line field with a persistent scrollbar."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        theme: ThemeManager,
+        *,
+        height: int = 8,
+        read_only: bool = False,
+    ) -> None:
+        super().__init__(master, bg=theme.palette.card_bg)
+        self.read_only = read_only
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self.text = AccessibleText(self, theme, height=height)
+        self.text.grid(row=0, column=0, sticky="nsew")
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.text.configure(yscrollcommand=self.scrollbar.set)
+        if read_only:
+            self.text.config(state="disabled")
+
+    def set_text(self, content: str) -> None:
+        was_disabled = str(self.text.cget("state")) == "disabled"
+        if was_disabled:
+            self.text.config(state="normal")
+        self.text.delete("1.0", tk.END)
+        self.text.insert("1.0", content or "")
+        if was_disabled or self.read_only:
+            self.text.config(state="disabled")
+
+    def get_text(self) -> str:
+        return self.text.get("1.0", tk.END).rstrip()
+
+    def clear(self) -> None:
+        self.set_text("")
+
+    def focus_set(self) -> None:
+        self.text.focus_set()
+
+
 # ---------------------------------------------------------------------------
 # UI pages
 # ---------------------------------------------------------------------------
@@ -742,8 +811,8 @@ class HomePage(BasePage):
         ttk.Label(
             self,
             text=(
-                "Manage Projects and Prompts locally, then generate a final input with a temporary subject. "
-                "This version uses larger text and higher contrast for easier reading."
+                "Manage Projects and Prompts locally, then generate final inputs with a temporary subject "
+                "or fill reusable pipeline variables. This version uses larger text and higher contrast."
             ),
             style="Muted.TLabel",
             wraplength=940,
@@ -758,6 +827,7 @@ class HomePage(BasePage):
         AccessibleButton(inner, self.theme, text="1) Manage Projects", command=lambda: app.show("ManageProjectsPage"), width=28).grid(row=0, column=0, sticky="w", padx=6, pady=8)
         AccessibleButton(inner, self.theme, text="2) Manage Prompts", command=lambda: app.show("ManagePromptsPage"), width=28).grid(row=1, column=0, sticky="w", padx=6, pady=8)
         AccessibleButton(inner, self.theme, text="3) Handle a Subject", command=lambda: app.show("HandleSubjectPage"), width=28).grid(row=2, column=0, sticky="w", padx=6, pady=8)
+        AccessibleButton(inner, self.theme, text="4) Handle a Pipeline", command=lambda: app.show("HandlePipelinePage"), width=28).grid(row=3, column=0, sticky="w", padx=6, pady=8)
 
         info_card = Card(self, self.theme)
         info_card.pack(fill="x")
@@ -1100,13 +1170,16 @@ class HandleSubjectPage(BasePage):
         ttk.Label(self, text="Handle Subject", style="Header.TLabel").pack(anchor="w")
         ttk.Label(
             self,
-            text="Subjects are temporary. Pick a project and prompt, generate the final input, then copy it.",
+            text="One-off mode: pick one prompt, add a temporary subject, then copy the final input.",
             style="Muted.TLabel",
+            wraplength=940,
+            justify="left",
         ).pack(anchor="w", pady=(4, 14))
 
         nav = tk.Frame(self, bg=self.theme.palette.window_bg)
         nav.pack(fill="x", pady=(0, 12))
         AccessibleButton(nav, self.theme, text="← Home", command=lambda: app.show("HomePage"), kind="neutral").pack(side="left")
+        AccessibleButton(nav, self.theme, text="Handle Pipeline", command=lambda: app.show("HandlePipelinePage"), kind="neutral").pack(side="left", padx=(12, 0))
 
         main = tk.Frame(self, bg=self.theme.palette.window_bg)
         main.pack(fill="both", expand=True)
@@ -1118,21 +1191,25 @@ class HandleSubjectPage(BasePage):
 
         lf = tk.Frame(left, bg=self.theme.palette.card_bg)
         lf.pack(fill="both", expand=True, padx=18, pady=18)
+        lf.grid_columnconfigure(0, weight=1)
+        lf.grid_columnconfigure(1, weight=1)
+        lf.grid_columnconfigure(2, weight=1)
+        lf.grid_rowconfigure(1, weight=1)
 
-        ttk.Label(lf, text="Subject (temporary)", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        self.subject_text = AccessibleText(lf, self.theme, height=14)
-        self.subject_text.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(8, 12))
+        ttk.Label(lf, text="Subject (temporary)", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+        self.subject_area = TextAreaWithScrollbar(lf, self.theme, height=14)
+        self.subject_area.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(8, 12))
 
         ttk.Label(lf, text="Project", style="Section.TLabel").grid(row=2, column=0, sticky="w")
         self.project_var = tk.StringVar()
         self.project_combo = ttk.Combobox(lf, textvariable=self.project_var, state="readonly", width=24, style="Accessible.TCombobox")
-        self.project_combo.grid(row=3, column=0, sticky="w", pady=(8, 12))
+        self.project_combo.grid(row=3, column=0, sticky="we", pady=(8, 12), padx=(0, 8))
         self.project_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_prompts_for_project())
 
         ttk.Label(lf, text="Prompt", style="Section.TLabel").grid(row=2, column=1, sticky="w")
         self.prompt_var = tk.StringVar()
         self.prompt_combo = ttk.Combobox(lf, textvariable=self.prompt_var, state="readonly", width=30, style="Accessible.TCombobox")
-        self.prompt_combo.grid(row=3, column=1, sticky="w", pady=(8, 12))
+        self.prompt_combo.grid(row=3, column=1, sticky="we", pady=(8, 12), padx=(0, 8))
         self.prompt_combo.bind("<<ComboboxSelected>>", lambda _e: self.preview_selected_prompt())
 
         ttk.Label(lf, text="Separator style", style="Section.TLabel").grid(row=2, column=2, sticky="w")
@@ -1144,7 +1221,7 @@ class HandleSubjectPage(BasePage):
             width=24,
             style="Accessible.TCombobox",
         )
-        self.sep_combo.grid(row=3, column=2, sticky="w", pady=(8, 12))
+        self.sep_combo.grid(row=3, column=2, sticky="we", pady=(8, 12))
         self.sep_combo.set(SEPARATOR_KEY_TO_LABEL[self.sep_var.get()])
         self.sep_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_sep_changed())
 
@@ -1153,42 +1230,27 @@ class HandleSubjectPage(BasePage):
         AccessibleButton(buttons, self.theme, text="Generate final input", command=self.generate).pack(side="left")
         AccessibleButton(buttons, self.theme, text="Clear subject", command=self.clear_subject, kind="neutral").pack(side="left", padx=12)
 
-        self.hint = ttk.Label(lf, text="", style="Muted.Card.TLabel", wraplength=520, justify="left")
+        self.hint = ttk.Label(lf, text="", style="Muted.Card.TLabel", wraplength=620, justify="left")
         self.hint.grid(row=5, column=0, columnspan=3, sticky="w", pady=(12, 0))
-
-        lf.grid_rowconfigure(1, weight=1)
-        for col in range(3):
-            lf.grid_columnconfigure(col, weight=1)
 
         rf = tk.Frame(right, bg=self.theme.palette.card_bg)
         rf.pack(fill="both", expand=True, padx=18, pady=18)
         rf.grid_columnconfigure(0, weight=1)
-        rf.grid_rowconfigure(4, weight=1)
+        rf.grid_rowconfigure(1, weight=1)
+        rf.grid_rowconfigure(4, weight=2)
 
         ttk.Label(rf, text="Prompt preview", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        self.prompt_preview = AccessibleText(rf, self.theme, height=6)
-        self.prompt_preview.grid(row=1, column=0, sticky="ew", pady=(8, 14))
-        self.prompt_preview.config(state="disabled")
+        self.prompt_preview_area = TextAreaWithScrollbar(rf, self.theme, height=8, read_only=True)
+        self.prompt_preview_area.grid(row=1, column=0, sticky="nsew", pady=(8, 14))
 
         ttk.Label(rf, text="Final input (copy this into an LLM)", style="Section.TLabel").grid(row=2, column=0, sticky="w")
-
-        # Keep these actions above the large final-input box so they remain visible
-        # even when the window is shorter and the text area needs to shrink.
         output_buttons = tk.Frame(rf, bg=self.theme.palette.card_bg)
         output_buttons.grid(row=3, column=0, sticky="w", pady=(8, 8))
         AccessibleButton(output_buttons, self.theme, text="Copy final input", command=self.copy_final).pack(side="left")
         AccessibleButton(output_buttons, self.theme, text="Clear final input", command=self.clear_final, kind="neutral").pack(side="left", padx=12)
 
-        final_box = tk.Frame(rf, bg=self.theme.palette.card_bg)
-        final_box.grid(row=4, column=0, sticky="nsew")
-        final_box.grid_columnconfigure(0, weight=1)
-        final_box.grid_rowconfigure(0, weight=1)
-
-        self.final_text = AccessibleText(final_box, self.theme, height=10)
-        self.final_text.grid(row=0, column=0, sticky="nsew")
-        final_scroll = ttk.Scrollbar(final_box, orient="vertical", command=self.final_text.yview)
-        final_scroll.grid(row=0, column=1, sticky="ns")
-        self.final_text.configure(yscrollcommand=final_scroll.set)
+        self.final_area = TextAreaWithScrollbar(rf, self.theme, height=12)
+        self.final_area.grid(row=4, column=0, sticky="nsew")
 
         self.refresh()
 
@@ -1201,7 +1263,7 @@ class HandleSubjectPage(BasePage):
             )
             self.app.show("ManageProjectsPage")
             return
-        self.subject_text.focus_set()
+        self.subject_area.focus_set()
 
     def refresh(self) -> None:
         projects = self.service.list_projects()
@@ -1226,9 +1288,7 @@ class HandleSubjectPage(BasePage):
             self.hint.config(text=f"Project '{project}' has {len(titles)} prompt(s).")
         else:
             self.prompt_var.set("")
-            self.prompt_preview.config(state="normal")
-            self.prompt_preview.delete("1.0", tk.END)
-            self.prompt_preview.config(state="disabled")
+            self.prompt_preview_area.clear()
             self.hint.config(text=f"Project '{project}' has no prompts. Add one first in Manage Prompts.")
 
     def get_selected_prompt_content(self) -> str | None:
@@ -1243,22 +1303,19 @@ class HandleSubjectPage(BasePage):
 
     def preview_selected_prompt(self) -> None:
         content = self.get_selected_prompt_content() or ""
-        self.prompt_preview.config(state="normal")
-        self.prompt_preview.delete("1.0", tk.END)
-        self.prompt_preview.insert("1.0", content)
-        self.prompt_preview.config(state="disabled")
+        self.prompt_preview_area.set_text(content)
 
     def clear_subject(self) -> None:
-        self.subject_text.delete("1.0", tk.END)
+        self.subject_area.clear()
         self.hint.config(text="Subject cleared (not saved).")
 
     def clear_final(self) -> None:
-        self.final_text.delete("1.0", tk.END)
+        self.final_area.clear()
         self.hint.config(text="Final input cleared.")
-        self.final_text.focus_set()
+        self.final_area.focus_set()
 
     def generate(self) -> None:
-        subject = self.subject_text.get("1.0", tk.END).rstrip()
+        subject = self.subject_area.get_text()
         prompt_content = self.get_selected_prompt_content()
         if prompt_content is None:
             messagebox.showwarning("Missing prompt", "Please select a project and prompt first.", parent=self.app)
@@ -1270,11 +1327,11 @@ class HandleSubjectPage(BasePage):
         else:
             final = compose_prompt_with_attachments_hint(prompt_content, style_key)
 
-        self.final_text.delete("1.0", tk.END)
-        self.final_text.insert("1.0", final)
+        self.final_area.set_text(final)
+        self.hint.config(text="Generated final input.")
 
     def copy_final(self) -> None:
-        text = self.final_text.get("1.0", tk.END).rstrip()
+        text = self.final_area.get_text()
         if not text.strip():
             messagebox.showwarning("Nothing to copy", "Generate the final input first.", parent=self.app)
             return
@@ -1282,6 +1339,294 @@ class HandleSubjectPage(BasePage):
         self.clipboard_append(text)
         self.update()
         messagebox.showinfo("Copied", "Final input copied to clipboard.", parent=self.app)
+
+
+class HandlePipelinePage(BasePage):
+    def __init__(self, parent: tk.Misc, app: "PromptManagerApp") -> None:
+        super().__init__(parent, app)
+        self.variable_texts: dict[str, TextAreaWithScrollbar] = {}
+        self._variables_canvas_window: int | None = None
+
+        ttk.Label(self, text="Handle Pipeline", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(
+            self,
+            text=(
+                "Pipeline mode: select a project, fill every {{VARIABLE}} detected across its prompts, "
+                "then choose one prompt and generate the replaced version."
+            ),
+            style="Muted.TLabel",
+            wraplength=940,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 14))
+
+        nav = tk.Frame(self, bg=self.theme.palette.window_bg)
+        nav.pack(fill="x", pady=(0, 12))
+        AccessibleButton(nav, self.theme, text="← Home", command=lambda: app.show("HomePage"), kind="neutral").pack(side="left")
+        AccessibleButton(nav, self.theme, text="Handle Subject", command=lambda: app.show("HandleSubjectPage"), kind="neutral").pack(side="left", padx=(12, 0))
+
+        main = tk.Frame(self, bg=self.theme.palette.window_bg)
+        main.pack(fill="both", expand=True)
+
+        left = Card(main, self.theme)
+        right = Card(main, self.theme)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        right.pack(side="left", fill="both", expand=True, padx=(10, 0))
+
+        lf = tk.Frame(left, bg=self.theme.palette.card_bg)
+        lf.pack(fill="both", expand=True, padx=18, pady=18)
+        lf.grid_columnconfigure(0, weight=1)
+        lf.grid_columnconfigure(1, weight=1)
+        lf.grid_rowconfigure(5, weight=1)
+
+        ttk.Label(lf, text="Project / pipeline", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        self.project_var = tk.StringVar()
+        self.project_combo = ttk.Combobox(lf, textvariable=self.project_var, state="readonly", width=30, style="Accessible.TCombobox")
+        self.project_combo.grid(row=1, column=0, sticky="we", pady=(8, 12), padx=(0, 8))
+        self.project_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_prompts_for_project())
+
+        ttk.Label(lf, text="Prompt to generate", style="Section.TLabel").grid(row=0, column=1, sticky="w")
+        self.prompt_var = tk.StringVar()
+        self.prompt_combo = ttk.Combobox(lf, textvariable=self.prompt_var, state="readonly", width=34, style="Accessible.TCombobox")
+        self.prompt_combo.grid(row=1, column=1, sticky="we", pady=(8, 12))
+        self.prompt_combo.bind("<<ComboboxSelected>>", lambda _e: self.preview_selected_prompt())
+
+        buttons = tk.Frame(lf, bg=self.theme.palette.card_bg)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="we", pady=(0, 12))
+        AccessibleButton(buttons, self.theme, text="Generate edited prompt", command=self.generate_pipeline_prompt).pack(side="left")
+        AccessibleButton(buttons, self.theme, text="Clear variables", command=self.clear_variables, kind="neutral").pack(side="left", padx=12)
+
+        self.summary = ttk.Label(
+            lf,
+            text="Select a project to detect variables like {{CONTEXT CARD}} across all prompts in it.",
+            style="Muted.Card.TLabel",
+            wraplength=620,
+            justify="left",
+        )
+        self.summary.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        ttk.Label(lf, text="Variable values", style="Section.TLabel").grid(row=4, column=0, columnspan=2, sticky="w")
+        variables_box = tk.Frame(lf, bg=self.theme.palette.card_bg)
+        variables_box.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        variables_box.grid_columnconfigure(0, weight=1)
+        variables_box.grid_rowconfigure(0, weight=1)
+
+        self.variables_canvas = tk.Canvas(
+            variables_box,
+            bg=self.theme.palette.card_bg,
+            highlightthickness=1,
+            highlightbackground=self.theme.palette.border,
+            bd=0,
+        )
+        self.variables_scroll = ttk.Scrollbar(variables_box, orient="vertical", command=self.variables_canvas.yview)
+        self.variables_frame = tk.Frame(self.variables_canvas, bg=self.theme.palette.card_bg)
+        self._variables_canvas_window = self.variables_canvas.create_window((0, 0), window=self.variables_frame, anchor="nw")
+        self.variables_canvas.configure(yscrollcommand=self.variables_scroll.set)
+        self.variables_canvas.grid(row=0, column=0, sticky="nsew")
+        self.variables_scroll.grid(row=0, column=1, sticky="ns")
+        self.variables_frame.bind("<Configure>", lambda _e: self._sync_variables_scrollregion())
+        self.variables_canvas.bind("<Configure>", lambda event: self._resize_variables_frame(event.width))
+        self.variables_canvas.bind("<MouseWheel>", self._on_variables_mousewheel)
+        self.variables_frame.bind("<MouseWheel>", self._on_variables_mousewheel)
+
+        self.hint = ttk.Label(lf, text="", style="Muted.Card.TLabel", wraplength=620, justify="left")
+        self.hint.grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+        rf = tk.Frame(right, bg=self.theme.palette.card_bg)
+        rf.pack(fill="both", expand=True, padx=18, pady=18)
+        rf.grid_columnconfigure(0, weight=1)
+        rf.grid_rowconfigure(1, weight=1)
+        rf.grid_rowconfigure(4, weight=2)
+
+        ttk.Label(rf, text="Selected prompt preview", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        self.prompt_preview_area = TextAreaWithScrollbar(rf, self.theme, height=10, read_only=True)
+        self.prompt_preview_area.grid(row=1, column=0, sticky="nsew", pady=(8, 14))
+
+        ttk.Label(rf, text="Edited prompt output", style="Section.TLabel").grid(row=2, column=0, sticky="w")
+        output_buttons = tk.Frame(rf, bg=self.theme.palette.card_bg)
+        output_buttons.grid(row=3, column=0, sticky="w", pady=(8, 8))
+        AccessibleButton(output_buttons, self.theme, text="Copy edited prompt", command=self.copy_output).pack(side="left")
+        AccessibleButton(output_buttons, self.theme, text="Clear output", command=self.clear_output, kind="neutral").pack(side="left", padx=12)
+
+        self.output_area = TextAreaWithScrollbar(rf, self.theme, height=14)
+        self.output_area.grid(row=4, column=0, sticky="nsew")
+
+        self.refresh()
+
+    def on_show(self) -> None:
+        if not self.service.list_projects():
+            messagebox.showinfo(
+                "No projects yet",
+                "Please add a project and a prompt first.",
+                parent=self.app,
+            )
+            self.app.show("ManageProjectsPage")
+            return
+        self.project_combo.focus_set()
+
+    def refresh(self) -> None:
+        projects = self.service.list_projects()
+        self.project_combo["values"] = projects
+        if projects and self.project_var.get() not in projects:
+            self.project_var.set(projects[0])
+        self.refresh_prompts_for_project()
+
+    def _sync_variables_scrollregion(self) -> None:
+        self.variables_canvas.configure(scrollregion=self.variables_canvas.bbox("all"))
+
+    def _resize_variables_frame(self, width: int) -> None:
+        if self._variables_canvas_window is not None:
+            self.variables_canvas.itemconfigure(self._variables_canvas_window, width=width)
+
+    def _on_variables_mousewheel(self, event: tk.Event) -> str:
+        delta = -1 if event.delta > 0 else 1
+        self.variables_canvas.yview_scroll(delta, "units")
+        return "break"
+
+    def _remember_values(self) -> dict[str, str]:
+        return {name: area.get_text() for name, area in self.variable_texts.items()}
+
+    def refresh_prompts_for_project(self) -> None:
+        project = self.project_var.get()
+        prompts = self.service.get_prompts(project) if project else []
+        titles = [prompt.title or "(untitled)" for prompt in prompts]
+        self.prompt_combo["values"] = titles
+        if titles:
+            if self.prompt_var.get() not in titles:
+                self.prompt_var.set(titles[0])
+            self.preview_selected_prompt()
+        else:
+            self.prompt_var.set("")
+            self.prompt_preview_area.clear()
+        self.refresh_variable_fields(prompts)
+
+    def refresh_variable_fields(self, prompts: list[PromptRecord]) -> None:
+        old_values = self._remember_values()
+        for child in self.variables_frame.winfo_children():
+            child.destroy()
+        self.variable_texts.clear()
+
+        project = self.project_var.get() or "selected project"
+        variables = extract_project_variables(prompts)
+        if not prompts:
+            self.summary.config(text=f"No prompts found in '{project}'.")
+            self._sync_variables_scrollregion()
+            return
+        if not variables:
+            self.summary.config(
+                text=(
+                    f"No {{VARIABLE}} placeholders found in '{project}'. Use double braces, "
+                    "for example {{CONTEXT CARD}}."
+                )
+            )
+            self._sync_variables_scrollregion()
+            return
+
+        self.summary.config(
+            text=(
+                f"Detected {len(variables)} variable(s) across {len(prompts)} prompt(s) in '{project}'. "
+                "Fill them once; only variables used by the selected prompt are required at generation time."
+            )
+        )
+
+        for index, variable in enumerate(variables, start=1):
+            label = tk.Label(
+                self.variables_frame,
+                text=f"{index}. {variable}",
+                bg=self.theme.palette.card_bg,
+                fg=self.theme.palette.text,
+                font=self.theme.fonts.section,
+                anchor="w",
+                justify="left",
+            )
+            label.grid(row=(index - 1) * 2, column=0, sticky="we", padx=8, pady=(12, 2))
+            area = TextAreaWithScrollbar(self.variables_frame, self.theme, height=5)
+            area.grid(row=(index - 1) * 2 + 1, column=0, sticky="we", padx=8, pady=(0, 8))
+            if variable in old_values:
+                area.set_text(old_values[variable])
+            self.variable_texts[variable] = area
+
+        self.variables_frame.grid_columnconfigure(0, weight=1)
+        self._sync_variables_scrollregion()
+
+    def get_selected_prompt_content(self) -> str | None:
+        project = self.project_var.get()
+        title = self.prompt_var.get()
+        if not project or not title:
+            return None
+        for prompt in self.service.get_prompts(project):
+            if (prompt.title or "(untitled)") == title:
+                return prompt.content
+        return None
+
+    def preview_selected_prompt(self) -> None:
+        content = self.get_selected_prompt_content() or ""
+        self.prompt_preview_area.set_text(content)
+        variables = extract_prompt_variables(content)
+        if variables:
+            self.hint.config(text=f"Selected prompt uses {len(variables)} variable(s): {', '.join(variables)}")
+        else:
+            self.hint.config(text="Selected prompt has no variables.")
+
+    def clear_variables(self) -> None:
+        if not self.variable_texts:
+            self.hint.config(text="No variable fields to clear.")
+            return
+        for area in self.variable_texts.values():
+            area.clear()
+        self.hint.config(text="Variable values cleared (not saved).")
+
+    def clear_output(self) -> None:
+        self.output_area.clear()
+        self.hint.config(text="Output cleared.")
+        self.output_area.focus_set()
+
+    def generate_pipeline_prompt(self) -> None:
+        prompt_content = self.get_selected_prompt_content()
+        if prompt_content is None:
+            messagebox.showwarning("Missing prompt", "Please select a project and prompt first.", parent=self.app)
+            return
+        if not self.variable_texts:
+            messagebox.showwarning(
+                "No variables found",
+                "This project has no {{VARIABLE}} placeholders to replace.",
+                parent=self.app,
+            )
+            return
+
+        values = {name: area.get_text() for name, area in self.variable_texts.items()}
+        selected_variables = extract_prompt_variables(prompt_content)
+        missing = [name for name in selected_variables if not values.get(name, "").strip()]
+        if missing:
+            proceed = messagebox.askyesno(
+                "Empty variables",
+                (
+                    "These variable fields are empty for the selected prompt:\n\n"
+                    + "\n".join(f"- {name}" for name in missing)
+                    + "\n\nGenerate anyway?"
+                ),
+                parent=self.app,
+            )
+            if not proceed:
+                return
+
+        output = render_prompt_template(prompt_content, values)
+        self.output_area.set_text(output)
+        self.hint.config(
+            text=(
+                f"Generated edited prompt from '{self.prompt_var.get()}'. "
+                f"Replaced {len(selected_variables)} variable occurrence group(s)."
+            )
+        )
+
+    def copy_output(self) -> None:
+        text = self.output_area.get_text()
+        if not text.strip():
+            messagebox.showwarning("Nothing to copy", "Generate the edited prompt first.", parent=self.app)
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()
+        messagebox.showinfo("Copied", "Edited prompt copied to clipboard.", parent=self.app)
 
 
 # ---------------------------------------------------------------------------
@@ -1293,8 +1638,8 @@ class PromptManagerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1180x820")
-        self.minsize(980, 720)
+        self.geometry("1280x860")
+        self.minsize(1080, 740)
 
         self.repository = StoreRepository()
         self.service = PromptManagerService(self.repository)
@@ -1305,6 +1650,7 @@ class PromptManagerApp(tk.Tk):
         self.bind_all("<Command-2>", lambda _event: self.show("ManageProjectsPage"))
         self.bind_all("<Command-3>", lambda _event: self.show("ManagePromptsPage"))
         self.bind_all("<Command-4>", lambda _event: self.show("HandleSubjectPage"))
+        self.bind_all("<Command-5>", lambda _event: self.show("HandlePipelinePage"))
 
         outer = ttk.Frame(self, padding=18)
         outer.pack(fill="both", expand=True)
@@ -1334,7 +1680,7 @@ class PromptManagerApp(tk.Tk):
         self.container.grid_rowconfigure(0, weight=1)
 
         self.pages: dict[str, BasePage] = {}
-        for page_cls in (HomePage, ManageProjectsPage, ManagePromptsPage, HandleSubjectPage):
+        for page_cls in (HomePage, ManageProjectsPage, ManagePromptsPage, HandleSubjectPage, HandlePipelinePage):
             page = page_cls(self.container, self)
             self.pages[page_cls.__name__] = page
             page.grid(row=0, column=0, sticky="nsew")
@@ -1358,6 +1704,7 @@ class PromptManagerApp(tk.Tk):
         AccessibleButton(nav, self.theme, text="Projects", command=lambda: self.show("ManageProjectsPage"), kind="neutral").pack(side="left", padx=(10, 0))
         AccessibleButton(nav, self.theme, text="Prompts", command=lambda: self.show("ManagePromptsPage"), kind="neutral").pack(side="left", padx=(10, 0))
         AccessibleButton(nav, self.theme, text="Subject", command=lambda: self.show("HandleSubjectPage"), kind="neutral").pack(side="left", padx=(10, 0))
+        AccessibleButton(nav, self.theme, text="Pipeline", command=lambda: self.show("HandlePipelinePage"), kind="neutral").pack(side="left", padx=(10, 0))
 
     def set_status(self, message: str) -> None:
         self.status_var.set(message)
