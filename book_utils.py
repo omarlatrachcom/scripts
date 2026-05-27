@@ -26,6 +26,7 @@ Features:
    - Removes printed page numbers around generated page markers.
    - Joins paragraphs that were split only by generated page markers.
    - Optionally removes a user-provided literal string of any length.
+   - Optionally removes title-based running headers such as 'The Hidden Evil  8'.
    - Also removes one empty line immediately following each removed metadata line.
 
 Dependency handling:
@@ -583,15 +584,79 @@ def strip_embedded_clean_noise(
     return cleaned + line_ending, cleaned != line_body.strip()
 
 
+
+def make_flexible_literal_pattern(literal_text: str) -> str:
+    """Return a regex fragment for literal text with flexible whitespace.
+
+    Example: "The Hidden Evil" matches "The Hidden Evil" and
+    "The   Hidden   Evil", while punctuation and other characters remain
+    literal because every non-space chunk is escaped.
+    """
+    parts = [re.escape(part) for part in literal_text.replace("\u00a0", " ").split()]
+    return r"\s+".join(parts)
+
+
+def strip_running_header_prefix(
+    line: str,
+    running_header_title: str = "",
+) -> tuple[str, bool]:
+    """Remove a title + page number running header at the start of a line.
+
+    The title is user-provided and treated as literal text, not as regex.
+    This intentionally only removes headers at the beginning of a line, such as:
+
+        "The Hidden Evil  8 They are correct."
+
+    It becomes:
+
+        "They are correct."
+
+    Arabic and other Unicode titles are supported. Page numbers can use
+    Western digits or Arabic-Indic digits.
+    """
+    title = running_header_title.replace("\u00a0", " ").strip()
+    if not title:
+        return line, False
+
+    title_pattern = make_flexible_literal_pattern(title)
+    if not title_pattern:
+        return line, False
+
+    line_body = line.rstrip("\r\n")
+    line_ending = line[len(line_body):]
+    normalized_body = line_body.replace("\u00a0", " ")
+
+    pattern = re.compile(
+        rf"^[ \t]*{title_pattern}[ \t]+"
+        rf"(?:[0-9]{{1,5}}|[٠-٩]{{1,5}})"
+        rf"(?=$|[ \t]+)[ \t]*"
+    )
+
+    cleaned_body, count = pattern.subn("", normalized_body, count=1)
+    if not count:
+        return line, False
+
+    cleaned_body = cleaned_body.lstrip()
+    if not cleaned_body:
+        return "", True
+
+    return cleaned_body + line_ending, True
+
+
 def clean_txt_content(
     text: str,
     custom_clean_string: str = "",
+    running_header_title: str = "",
 ) -> tuple[str, int, int]:
     """Remove generated metadata/footer noise without erasing real paragraphs.
 
     custom_clean_string is treated as a literal plain-text value, not a regex.
     Single-line values are removed as standalone lines and inline occurrences.
     Multi-line values are removed as exact literal blocks before line cleanup.
+
+    running_header_title is also treated as literal text. When supplied, the
+    cleaner removes only line-start title + page-number prefixes, e.g.
+    "The Hidden Evil  8", while preserving the paragraph text that follows.
 
     Generated page markers are handled contextually:
     - a standalone printed page number immediately before "### Page ..." is removed
@@ -676,6 +741,22 @@ def clean_txt_content(
 
             continue
 
+        line, removed_running_header = strip_running_header_prefix(
+            line,
+            running_header_title=running_header_title,
+        )
+        if removed_running_header:
+            removed_marker_lines += 1
+
+            if not line:
+                index += 1
+
+                if index < len(lines) and not lines[index].strip():
+                    removed_empty_lines += 1
+                    index += 1
+
+                continue
+
         cleaned_line, changed = strip_embedded_clean_noise(
             line,
             custom_clean_string=custom_clean_string,
@@ -705,6 +786,7 @@ def clean_txt_content(
 def clean_txt_files_in_folder(
     folder: Path,
     custom_clean_string: str = "",
+    running_header_title: str = "",
     progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> TextCleanResult:
     """Clean all TXT files directly inside a selected folder."""
@@ -737,6 +819,7 @@ def clean_txt_files_in_folder(
         cleaned_text, removed_marker_lines, removed_empty_lines = clean_txt_content(
             original_text,
             custom_clean_string=custom_clean_string,
+            running_header_title=running_header_title,
         )
 
         total_removed_marker_lines += removed_marker_lines
@@ -1863,6 +1946,7 @@ class BookUtilsApp:
         self.selected_text_clean_folder: Path | None = None
         self.selected_pdf: Path | None = None
         self.custom_clean_text = None
+        self.running_header_title_entry = None
         self.pdf_part_rows: list[tuple[object, object, object]] = []
         self.is_running = False
 
@@ -1878,6 +1962,7 @@ class BookUtilsApp:
         self.pdf_var = tk.StringVar(value="No PDF selected")
         self.pdf_pages_var = tk.StringVar(value="")
         self.capacity_var = tk.StringVar(value=str(DEFAULT_MODEL_TOKEN_CAPACITY))
+        self.running_header_title_var = tk.StringVar(value="")
 
         self._build_ui()
 
@@ -2059,7 +2144,8 @@ class BookUtilsApp:
                 "'lett in chapter', 'Learning reading speed', and page percent "
                 "lines. If Kindle footer text was merged into a real paragraph, it "
                 "strips only the footer text and keeps the paragraph. You can also "
-                "paste a custom literal string to remove from the TXT files."
+                "remove title-based running headers such as 'The Hidden Evil  8', "
+                "or paste a custom literal string to remove from the TXT files."
             ),
             wraplength=700,
         )
@@ -2081,6 +2167,31 @@ class BookUtilsApp:
             wraplength=540,
         )
         folder_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
+
+        running_header_label = self.ttk.Label(
+            parent,
+            text="Optional running header title to remove before page numbers:",
+        )
+        running_header_label.pack(anchor="w", pady=(6, 4))
+
+        running_header_row = self.ttk.Frame(parent)
+        running_header_row.pack(fill="x", pady=(0, 4))
+
+        self.running_header_title_entry = self.ttk.Entry(
+            running_header_row,
+            textvariable=self.running_header_title_var,
+        )
+        self.running_header_title_entry.pack(side="left", fill="x", expand=True)
+
+        running_header_hint = self.ttk.Label(
+            parent,
+            text=(
+                "Example: enter 'The Hidden Evil' to remove line-start prefixes "
+                "like 'The Hidden Evil  8' while keeping the paragraph text after it."
+            ),
+            wraplength=700,
+        )
+        running_header_hint.pack(anchor="w", pady=(0, 10))
 
         custom_label = self.ttk.Label(
             parent,
@@ -2562,11 +2673,17 @@ class BookUtilsApp:
         if self.custom_clean_text is not None:
             custom_clean_string = self.custom_clean_text.get("1.0", "end-1c")
 
+        running_header_title = self.running_header_title_var.get().strip()
+
         self._set_running_state(True, "Starting TXT cleaning...")
 
         worker = threading.Thread(
             target=self._run_text_clean_worker,
-            args=(self.selected_text_clean_folder, custom_clean_string),
+            args=(
+                self.selected_text_clean_folder,
+                custom_clean_string,
+                running_header_title,
+            ),
             daemon=True,
         )
         worker.start()
@@ -2575,11 +2692,13 @@ class BookUtilsApp:
         self,
         folder: Path,
         custom_clean_string: str,
+        running_header_title: str,
     ) -> None:
         try:
             result = clean_txt_files_in_folder(
                 folder=folder,
                 custom_clean_string=custom_clean_string,
+                running_header_title=running_header_title,
                 progress_callback=self._thread_safe_progress,
             )
         except Exception as exc:
@@ -2754,6 +2873,8 @@ class BookUtilsApp:
         self.text_clean_button.configure(state=state)
         if self.custom_clean_text is not None:
             self.custom_clean_text.configure(state=state)
+        if self.running_header_title_entry is not None:
+            self.running_header_title_entry.configure(state=state)
         self.select_pdf_button.configure(state=state)
         self.add_part_button.configure(state=state)
         self.split_pdf_button.configure(state=state)
