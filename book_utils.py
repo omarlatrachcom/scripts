@@ -36,6 +36,7 @@ Dependency handling:
 
 from __future__ import annotations
 
+import difflib
 import importlib.util
 import json
 import platform
@@ -73,7 +74,9 @@ TXT_CLEAN_TRAILING_PAGE_NUMBER_RE = re.compile(
 TXT_CLEAN_NUMBERED_RUNNING_HEADER_RE = re.compile(
     r"""
     ^\s*
-    (?P<page_number>[0-9]{1,5}|[٠-٩]{1,5})
+    # OCR sometimes reads a low page number as a letter, e.g.
+    # "9. On Advanced Lovemaking" -> "g. On Advanced Lovemaking".
+    (?P<page_number>[0-9٠-٩gqOoIl|]{1,5})
     \s*
     [.\-–—•·:]
     \s*
@@ -82,8 +85,20 @@ TXT_CLEAN_NUMBERED_RUNNING_HEADER_RE = re.compile(
     """,
     re.VERBOSE,
 )
+TXT_CLEAN_OCR_PAGE_NUMBER_TRANSLATION = str.maketrans(
+    {
+        "g": "9",
+        "q": "9",
+        "O": "0",
+        "o": "0",
+        "I": "1",
+        "l": "1",
+        "|": "1",
+    }
+)
 TXT_CLEAN_NUMBERED_HEADER_MAX_TITLE_LENGTH = 90
 TXT_CLEAN_SINGLE_NUMBERED_HEADER_MIN_PAGE = 20
+TXT_CLEAN_FUZZY_REPEATED_HEADER_TITLE_RATIO = 0.88
 TXT_CLEAN_KINDLE_PROGRESS_RE = re.compile(
     r"""
     \s*
@@ -393,7 +408,9 @@ def line_is_standalone_page_number(line: str) -> bool:
 
 
 def parse_unicode_page_number(page_number: str) -> int | None:
-    """Parse Western or Arabic-Indic digits from a printed page header."""
+    """Parse Western, Arabic-Indic, and common OCR-confused page digits."""
+    page_number = page_number.translate(TXT_CLEAN_OCR_PAGE_NUMBER_TRANSLATION)
+
     try:
         return int("".join(str(unicodedata.digit(character)) for character in page_number))
     except (TypeError, ValueError):
@@ -463,6 +480,44 @@ def collect_numbered_running_header_titles(lines: list[str]) -> set[str]:
     return {title for title, count in title_counts.items() if count >= 2}
 
 
+def title_is_fuzzy_repeated_numbered_header(
+    normalized_title: str,
+    repeated_numbered_header_titles: set[str],
+) -> bool:
+    """Return True when a header title looks like an OCR variant of a repeated one.
+
+    This catches cases such as "The loy of Sex" versus "The Joy of Sex"
+    without making low-number cleanup broad enough to delete ordinary headings.
+    It is only used for the first non-empty line after a generated page marker.
+    """
+    if not normalized_title or not repeated_numbered_header_titles:
+        return False
+
+    title_words = normalized_title.split()
+    if len(normalized_title) < 8 or len(title_words) < 2:
+        return False
+
+    for repeated_title in repeated_numbered_header_titles:
+        repeated_words = repeated_title.split()
+        if len(repeated_title) < 8 or len(repeated_words) < 2:
+            continue
+
+        # Require stable outer words so unrelated chapter headings with a
+        # coincidentally high similarity score are not removed.
+        if title_words[0] != repeated_words[0] or title_words[-1] != repeated_words[-1]:
+            continue
+
+        ratio = difflib.SequenceMatcher(
+            None,
+            normalized_title,
+            repeated_title,
+        ).ratio()
+        if ratio >= TXT_CLEAN_FUZZY_REPEATED_HEADER_TITLE_RATIO:
+            return True
+
+    return False
+
+
 def line_is_contextual_numbered_running_header(
     line: str,
     repeated_numbered_header_titles: set[str],
@@ -472,6 +527,11 @@ def line_is_contextual_numbered_running_header(
     Removal is intentionally contextual: clean_txt_content() calls this only for
     the first non-empty line after a generated '### Page ...' marker. This avoids
     deleting normal numbered list items inside the body text.
+
+    Low page numbers are removed only when their title is repeated, or when it
+    is a close OCR variant of a repeated title. This catches running headers
+    such as "g. On Advanced Lovemaking" while preserving real headings like
+    "1. Introduction".
     """
     parts = numbered_running_header_parts(line)
     if parts is None:
@@ -479,6 +539,12 @@ def line_is_contextual_numbered_running_header(
 
     page_number, _, normalized_title = parts
     if normalized_title in repeated_numbered_header_titles:
+        return True
+
+    if title_is_fuzzy_repeated_numbered_header(
+        normalized_title,
+        repeated_numbered_header_titles,
+    ):
         return True
 
     # Keep single low-number headings such as '1. Introduction' by default, but
