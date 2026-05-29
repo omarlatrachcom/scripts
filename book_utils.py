@@ -89,11 +89,45 @@ TXT_CLEAN_KINDLE_PROGRESS_RE = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+TXT_CLEAN_KINDLE_PAGE_FOOTER_RE = re.compile(
+    r"""
+    \s*
+    (?<!\w)
+    Page
+    \s+
+    (?:\d{1,6}|[٠-٩]{1,6})
+    \s+
+    of
+    \s+
+    (?:\d{1,6}|[٠-٩]{1,6})
+    (?:\s+\d{1,3}\s*%)?
+    \s*
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+TXT_CLEAN_KINDLE_PAGE_FOOTER_INLINE_RE = re.compile(
+    r"""
+    (?<!\w)
+    \s*
+    Page
+    \s+
+    (?:\d{1,6}|[٠-٩]{1,6})
+    \s+
+    of
+    \s+
+    (?:\d{1,6}|[٠-٩]{1,6})
+    (?:\s+\d{1,3}\s*%)?
+    (?=\s|$)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 TXT_CLEAN_FOOTER_LINE_PATTERNS = (
+    TXT_CLEAN_KINDLE_PAGE_FOOTER_RE,
     re.compile(r"^\s*learning\s+reading\s+speed\b.*$", re.IGNORECASE),
     re.compile(r"^\s*\d+\s*%\s*$", re.IGNORECASE),
 )
 TXT_CLEAN_INLINE_NOISE_PATTERNS = (
+    TXT_CLEAN_KINDLE_PAGE_FOOTER_INLINE_RE,
     TXT_CLEAN_KINDLE_PROGRESS_RE,
     re.compile(r"\s*\blearning\s+reading\s+speed\b.*$", re.IGNORECASE),
     re.compile(r"\s+\d+\s*%\s*$", re.IGNORECASE),
@@ -326,7 +360,7 @@ def line_is_standalone_clean_marker(line: str) -> bool:
         bool(TXT_CLEAN_METADATA_LINE_RE.match(normalized_line))
         or bool(TXT_CLEAN_KINDLE_PROGRESS_RE.fullmatch(normalized_line))
         or any(
-            pattern.match(normalized_line)
+            pattern.fullmatch(normalized_line)
             for pattern in TXT_CLEAN_FOOTER_LINE_PATTERNS
         )
     )
@@ -2140,9 +2174,10 @@ class BookUtilsApp:
             text=(
                 "Choose a folder containing TXT files. The app removes standalone "
                 "generated metadata/footer lines such as '### Source', '### Page', "
-                "'1 min left in chapter' including common OCR variants like "
-                "'lett in chapter', 'Learning reading speed', and page percent "
-                "lines. If Kindle footer text was merged into a real paragraph, it "
+                "'Page 365 of 477', and '1 min left in chapter' including "
+                "common OCR variants like 'lett in chapter', 'Learning reading "
+                "speed', and page percent lines. If Kindle footer text was "
+                "merged into a real paragraph, it "
                 "strips only the footer text and keeps the paragraph. You can also "
                 "remove title-based running headers such as 'The Hidden Evil  8', "
                 "or paste a custom literal string to remove from the TXT files."
