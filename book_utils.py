@@ -194,6 +194,16 @@ SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 PDF_LARGE_IMAGE_AREA_RATIO = 0.60
 PDF_SUSPICIOUS_TEXT_LAYER_RATIO = 0.80
 
+# OCR/PDF extraction can accidentally merge marginal notes with the main body
+# when two independent text regions share the same vertical position. These
+# constants keep left-side notes/captions in their own blocks instead of joining
+# them into the right-side sentence stream. Values are normalized page units for
+# Vision OCR coordinates.
+LAYOUT_MARGIN_X_GAP = 0.045
+LAYOUT_MARGIN_MIN_MAIN_TEXT_CHARS = 24
+LAYOUT_BLOCK_VERTICAL_GAP_FACTOR = 1.65
+LAYOUT_MARGIN_VERTICAL_GAP_FACTOR = 3.25
+
 
 @dataclass(frozen=True)
 class OCRLine:
@@ -1171,34 +1181,187 @@ def recognize_text_from_image(image_path: Path) -> str:
     return lines_to_paragraphs(collected_lines)
 
 
+def normalize_extracted_line_text(text: str) -> str:
+    """Normalize spacing inside one extracted OCR/PDF line."""
+    text = re.sub(r"\s+", " ", text.replace("\u00a0", " ")).strip()
+    text = re.sub(r"\s+([,.;:!?%)\]}>])", r"\1", text)
+    text = re.sub(r"([([{<])\s+", r"\1", text)
+    return text
+
+
+def median_float(values: list[float], fallback: float = 0.0) -> float:
+    """Return the median of a list without importing statistics."""
+    if not values:
+        return fallback
+
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+
+    if len(ordered) % 2:
+        return ordered[middle]
+
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def estimate_main_text_left(lines: list[OCRLine]) -> float | None:
+    """Estimate the dominant main-body left edge from OCR line positions.
+
+    Marginal labels are usually short and less frequent. Long lines are a much
+    better signal for the main text column, so they get priority. This prevents
+    left-side labels such as "birdsong / at morning" from being treated as the
+    start of the paragraph.
+    """
+    long_line_x_values = [
+        line.x
+        for line in lines
+        if len(normalize_extracted_line_text(line.text)) >= LAYOUT_MARGIN_MIN_MAIN_TEXT_CHARS
+    ]
+    if long_line_x_values:
+        return median_float(long_line_x_values)
+
+    text_x_values = [line.x for line in lines if normalize_extracted_line_text(line.text)]
+    if not text_x_values:
+        return None
+
+    return median_float(text_x_values)
+
+
+def group_zone_lines(
+    zone: str,
+    zone_lines: list[OCRLine],
+    gap_threshold: float,
+) -> list[tuple[str, float, float, float, list[str]]]:
+    """Group lines from one layout zone into vertical text blocks."""
+    ordered = sorted(zone_lines, key=lambda line: (-line.top, line.x))
+    blocks: list[tuple[str, float, float, float, list[str]]] = []
+    current_lines: list[str] = []
+    current_top = 0.0
+    current_bottom = 0.0
+    current_x = 0.0
+    previous_line: OCRLine | None = None
+
+    def flush_current() -> None:
+        nonlocal current_lines, current_top, current_bottom, current_x
+        if current_lines:
+            blocks.append((zone, current_top, current_bottom, current_x, current_lines))
+        current_lines = []
+        current_top = 0.0
+        current_bottom = 0.0
+        current_x = 0.0
+
+    for line in ordered:
+        cleaned_text = normalize_extracted_line_text(line.text)
+        if not cleaned_text:
+            continue
+
+        if previous_line is not None:
+            vertical_gap = previous_line.bottom - line.top
+            if vertical_gap > gap_threshold:
+                flush_current()
+
+        if not current_lines:
+            current_top = line.top
+            current_x = line.x
+
+        current_lines.append(cleaned_text)
+        current_bottom = line.bottom
+        current_x = min(current_x, line.x)
+        previous_line = line
+
+    flush_current()
+    return blocks
+
+
+def group_ocr_lines_into_blocks(
+    lines: list[OCRLine],
+    paragraph_gap_threshold: float,
+    margin_gap_threshold: float,
+) -> list[tuple[str, float, float, float, list[str]]]:
+    """Group OCR lines into independent main/margin layout blocks.
+
+    Lines are classified first, then grouped per zone. Grouping per zone is
+    important: otherwise a row like "margin label | main paragraph" would split
+    a two-line marginal label into separate blocks.
+    """
+    main_left = estimate_main_text_left(lines)
+    if main_left is None:
+        return []
+
+    margin_cutoff = main_left - LAYOUT_MARGIN_X_GAP
+    main_lines: list[OCRLine] = []
+    margin_lines: list[OCRLine] = []
+
+    for line in lines:
+        if not normalize_extracted_line_text(line.text):
+            continue
+
+        if line.x < margin_cutoff:
+            margin_lines.append(line)
+        else:
+            main_lines.append(line)
+
+    blocks = [
+        *group_zone_lines("main", main_lines, paragraph_gap_threshold),
+        *group_zone_lines("margin", margin_lines, margin_gap_threshold),
+    ]
+
+    def block_sort_key(block: tuple[str, float, float, float, list[str]]) -> tuple[float, int, float]:
+        zone, top, _, x, _ = block
+        # For equal/near-equal vertical starts, marginal headings should precede
+        # the body paragraph they label. Otherwise normal top-to-bottom order is
+        # preserved.
+        zone_order = 0 if zone == "margin" else 1
+        return (-round(top, 3), zone_order, x)
+
+    return sorted(blocks, key=block_sort_key)
+
+
+def merge_text_lines_for_block(text_lines: list[str]) -> str:
+    """Merge visual lines from one layout block into readable text."""
+    return normalize_extracted_line_text(" ".join(text_lines))
+
+
 def lines_to_paragraphs(lines: list[OCRLine]) -> str:
-    """Group OCR lines into simple paragraphs."""
+    """Group OCR lines into paragraphs without mixing marginalia into body text.
+
+    Apple Vision returns coordinates for each recognized line. The old
+    implementation sorted by row and then x position, so a left-side note on
+    the same row as a right-side paragraph became part of the sentence, e.g.
+    "birdsong What your partner says ...".
+
+    This version estimates the dominant main-text left edge, classifies lines
+    to the left as margin/caption text, and emits those as separate blocks. It
+    still preserves their page order, but it no longer joins them into unrelated
+    main text.
+    """
     if not lines:
         return ""
 
-    ordered = sorted(lines, key=lambda line: (-line.top, line.x))
-    median_height = sorted(line.height for line in ordered)[len(ordered) // 2]
-    paragraph_gap_threshold = max(median_height * 1.6, 0.025)
+    usable_heights = [line.height for line in lines if line.height > 0]
+    median_height = median_float(usable_heights, fallback=0.025)
+    paragraph_gap_threshold = max(
+        median_height * LAYOUT_BLOCK_VERTICAL_GAP_FACTOR,
+        0.025,
+    )
+    margin_gap_threshold = max(
+        median_height * LAYOUT_MARGIN_VERTICAL_GAP_FACTOR,
+        paragraph_gap_threshold,
+    )
 
-    paragraphs: list[list[str]] = []
-    current: list[str] = []
-    previous: OCRLine | None = None
+    blocks = group_ocr_lines_into_blocks(
+        lines=lines,
+        paragraph_gap_threshold=paragraph_gap_threshold,
+        margin_gap_threshold=margin_gap_threshold,
+    )
 
-    for line in ordered:
-        if previous is not None:
-            vertical_gap = previous.bottom - line.top
+    if not blocks:
+        return ""
 
-            if vertical_gap > paragraph_gap_threshold and current:
-                paragraphs.append(current)
-                current = []
-
-        current.append(line.text)
-        previous = line
-
-    if current:
-        paragraphs.append(current)
-
-    return "\n\n".join(" ".join(paragraph).strip() for paragraph in paragraphs).strip()
+    paragraphs = [
+        merge_text_lines_for_block(block_lines)
+        for _, _, _, _, block_lines in blocks
+    ]
+    return "\n\n".join(paragraph for paragraph in paragraphs if paragraph).strip()
 
 
 def split_into_paragraphs(text: str) -> list[str]:
