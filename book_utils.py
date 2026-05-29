@@ -77,10 +77,25 @@ TXT_CLEAN_NUMBERED_RUNNING_HEADER_RE = re.compile(
     # OCR sometimes reads a low page number as a letter, e.g.
     # "9. On Advanced Lovemaking" -> "g. On Advanced Lovemaking".
     (?P<page_number>[0-9٠-٩gqOoIl|]{1,5})
-    \s*
-    [.\-–—•·:]
-    \s*
+    (?:
+        \s*[.\-–—•·∙●▪■*:;|\)\]\}]\s*
+        |
+        \s+
+    )
     (?P<title>\S(?:.*\S)?)
+    \s*$
+    """,
+    re.VERBOSE,
+)
+TXT_CLEAN_TITLE_FIRST_RUNNING_HEADER_RE = re.compile(
+    r"""
+    ^\s*
+    (?P<title>\S(?:.*?\S)?)
+    \s+
+    # Title-first running headers often look like "Starters 55-" or
+    # "Starters 91." in direct PDF text extraction.
+    (?P<page_number>[0-9٠-٩gqOoIl|]{1,5})
+    \s*[.\-–—•·∙●▪■*:;|\)\]\}]?
     \s*$
     """,
     re.VERBOSE,
@@ -99,6 +114,8 @@ TXT_CLEAN_OCR_PAGE_NUMBER_TRANSLATION = str.maketrans(
 TXT_CLEAN_NUMBERED_HEADER_MAX_TITLE_LENGTH = 90
 TXT_CLEAN_SINGLE_NUMBERED_HEADER_MIN_PAGE = 20
 TXT_CLEAN_FUZZY_REPEATED_HEADER_TITLE_RATIO = 0.88
+TXT_CLEAN_RUNNING_HEADER_PUNCTUATION = r".\-–—•·∙●▪■*:;|\)\]\}"
+TXT_CLEAN_RUNNING_HEADER_PUNCTUATION_CLASS = f"[{TXT_CLEAN_RUNNING_HEADER_PUNCTUATION}]"
 TXT_CLEAN_KINDLE_PROGRESS_RE = re.compile(
     r"""
     \s*
@@ -428,23 +445,40 @@ def parse_unicode_page_number(page_number: str) -> int | None:
 
 
 def normalize_numbered_running_header_title(title: str) -> str:
-    """Normalize a detected running-header title for repeat checks."""
-    return re.sub(r"\s+", " ", title.replace("\u00a0", " ").strip()).casefold()
+    """Normalize a detected running-header title for repeat/fuzzy checks."""
+    title = unicodedata.normalize("NFKC", title.replace("\u00a0", " "))
+    title = re.sub(r"[\s_]+", " ", title).strip()
+    title = title.strip(" .,-–—•·∙●▪■*:;|()[]{}")
+    return title.casefold()
 
 
 def numbered_running_header_parts(line: str) -> tuple[int | None, str, str] | None:
-    """Return parts for generic page headers such as '230. The Joy of Sex'.
+    """Return parts for generic page headers.
+
+    Supported shapes include:
+    - "230. The Joy of Sex" / "229- Problems" / "233• Problems"
+    - "51 Starters"
+    - "Starters 55-" / "Starters 91."
 
     The title can be anything; the detection is intentionally title-agnostic.
     This helper only identifies the shape. The caller decides whether it is safe
-    to remove the line based on page-marker context and repeated titles.
+    to remove the line based on page-marker context, page number, and repeated
+    titles.
     """
     normalized_line = line.replace("\u00a0", " ").strip()
-    match = TXT_CLEAN_NUMBERED_RUNNING_HEADER_RE.fullmatch(normalized_line)
-    if not match:
-        return None
 
-    title = match.group("title").strip()
+    match = TXT_CLEAN_NUMBERED_RUNNING_HEADER_RE.fullmatch(normalized_line)
+    if match:
+        title = match.group("title").strip()
+        page_number = parse_unicode_page_number(match.group("page_number"))
+    else:
+        match = TXT_CLEAN_TITLE_FIRST_RUNNING_HEADER_RE.fullmatch(normalized_line)
+        if not match:
+            return None
+
+        title = match.group("title").strip()
+        page_number = parse_unicode_page_number(match.group("page_number"))
+
     if len(title) > TXT_CLEAN_NUMBERED_HEADER_MAX_TITLE_LENGTH:
         return None
 
@@ -452,7 +486,6 @@ def numbered_running_header_parts(line: str) -> tuple[int | None, str, str] | No
     if not any(character.isalpha() for character in title):
         return None
 
-    page_number = parse_unicode_page_number(match.group("page_number"))
     normalized_title = normalize_numbered_running_header_title(title)
     if not normalized_title:
         return None
@@ -461,11 +494,12 @@ def numbered_running_header_parts(line: str) -> tuple[int | None, str, str] | No
 
 
 def collect_numbered_running_header_titles(lines: list[str]) -> set[str]:
-    """Collect repeated number-first running-header titles after page markers.
+    """Collect repeated running-header titles after page markers.
 
-    Examples include '230. The Joy of Sex', '229- Problems', and
-    '233• Problems'. Repetition makes removal safer because ordinary chapter
-    headings like '1. Introduction' often appear only once.
+    Examples include '230. The Joy of Sex', '229- Problems',
+    '233• Problems', '51 Starters', and 'Starters 55-'. Repetition makes
+    removal safer because ordinary chapter headings like '1. Introduction'
+    often appear only once.
     """
     title_counts: dict[str, int] = {}
     index = 0
@@ -532,10 +566,11 @@ def line_is_contextual_numbered_running_header(
     line: str,
     repeated_numbered_header_titles: set[str],
 ) -> bool:
-    """Return True for removable number-first page headers after markers.
+    """Return True for removable page running headers after markers.
 
     Removal is intentionally contextual: clean_txt_content() calls this only for
-    the first non-empty line after a generated '### Page ...' marker. This avoids
+    the first non-empty line after a generated '### Page ...' marker, or for
+    the first non-empty line of an already-cleaned single-page chunk. This avoids
     deleting normal numbered list items inside the body text.
 
     Low page numbers are removed only when their title is repeated, or when it
@@ -592,6 +627,72 @@ def remove_contextual_numbered_running_header(
         index += 1
 
     return index, removed_marker_lines, removed_empty_lines
+
+
+def line_looks_like_body_text_after_header(text: str) -> bool:
+    """Return True when text after/under a header looks like prose, not a title."""
+    normalized_text = text.replace("\u00a0", " ").strip()
+    if not normalized_text:
+        return False
+
+    if numbered_running_header_parts(normalized_text) is not None:
+        return False
+
+    if normalized_text[:1].islower():
+        return True
+
+    words = normalized_text.split()
+    has_lowercase = any(character.islower() for character in normalized_text)
+    has_sentence_punctuation = bool(re.search(r"[,.;:!?]", normalized_text))
+
+    return (
+        len(normalized_text) >= 35
+        and len(words) >= 6
+        and has_lowercase
+        and (has_sentence_punctuation or not normalized_text.isupper())
+    )
+
+
+def line_is_initial_running_header(
+    lines: list[str],
+    index: int,
+    repeated_numbered_header_titles: set[str],
+) -> bool:
+    """Return True for a running header at the start of a cleaned chunk.
+
+    This is intentionally narrower than post-page-marker cleanup. It lets a user
+    rerun TXT Cleaner on a file that was already cleaned by an older version,
+    where the generated page marker is gone but the first line is still a page
+    header such as "51 Starters", "Starters 91.", "80 The loy of Sex",
+    "The Joy of Sex 114•", or "151 Main Courses".
+    """
+    if index >= len(lines):
+        return False
+
+    parts = numbered_running_header_parts(lines[index])
+    if parts is None:
+        return False
+
+    page_number, _, normalized_title = parts
+    title_is_learned = (
+        normalized_title in repeated_numbered_header_titles
+        or title_is_fuzzy_repeated_numbered_header(
+            normalized_title,
+            repeated_numbered_header_titles,
+        )
+    )
+
+    # At the very beginning of an already-cleaned file we do not have the
+    # generated page marker anymore, so require either a learned/repeated title
+    # or a high book-page number. This keeps low numbered real headings safer.
+    if not title_is_learned and not (
+        page_number is not None
+        and page_number >= TXT_CLEAN_SINGLE_NUMBERED_HEADER_MIN_PAGE
+    ):
+        return False
+
+    next_text = next_nonempty_line_text(lines, index + 1)
+    return line_looks_like_body_text_after_header(next_text)
 
 
 def remove_trailing_page_number(line: str) -> tuple[str, bool]:
@@ -835,6 +936,69 @@ def strip_embedded_clean_noise(
 
 
 
+def strip_learned_running_header_prefix(
+    line: str,
+    repeated_numbered_header_titles: set[str],
+) -> tuple[str, bool]:
+    """Remove learned running-header prefixes even when OCR merged body text.
+
+    Examples:
+        "The Joy of Sex 114• It starts here." -> "It starts here."
+        "151 Main Courses initially at least..." -> "initially at least..."
+
+    This only uses titles learned as repeated headers in the current file/folder,
+    which is safer than stripping arbitrary title-like prefixes.
+    """
+    if not repeated_numbered_header_titles:
+        return line, False
+
+    line_body = line.rstrip("\r\n")
+    line_ending = line[len(line_body):]
+    normalized_body = line_body.replace("\u00a0", " ")
+
+    page_number_pattern = r"(?:[0-9٠-٩gqOoIl|]{1,5})"
+    punct_pattern = TXT_CLEAN_RUNNING_HEADER_PUNCTUATION_CLASS
+
+    # Longer titles first avoids partially stripping a shorter prefix when one
+    # header title is a prefix of another.
+    for normalized_title in sorted(
+        repeated_numbered_header_titles,
+        key=len,
+        reverse=True,
+    ):
+        title_pattern = make_flexible_literal_pattern(normalized_title)
+        if not title_pattern:
+            continue
+
+        title_first_pattern = re.compile(
+            rf"^[ \t]*{title_pattern}[ \t]+{page_number_pattern}"
+            rf"[ \t]*{punct_pattern}?[ \t]*(?P<body>.*)$",
+            re.IGNORECASE,
+        )
+        page_first_pattern = re.compile(
+            rf"^[ \t]*{page_number_pattern}"
+            rf"(?:[ \t]*{punct_pattern}[ \t]*|[ \t]+)"
+            rf"{title_pattern}[ \t]*{punct_pattern}?[ \t]*(?P<body>.*)$",
+            re.IGNORECASE,
+        )
+
+        for pattern in (title_first_pattern, page_first_pattern):
+            match = pattern.match(normalized_body)
+            if not match:
+                continue
+
+            body = match.group("body").strip()
+            if not body:
+                return "", True
+
+            if not line_looks_like_body_text_after_header(body):
+                continue
+
+            return body + line_ending, True
+
+    return line, False
+
+
 def make_flexible_literal_pattern(literal_text: str) -> str:
     """Return a regex fragment for literal text with flexible whitespace.
 
@@ -897,6 +1061,7 @@ def clean_txt_content(
     text: str,
     custom_clean_string: str = "",
     running_header_title: str = "",
+    extra_repeated_numbered_header_titles: set[str] | None = None,
 ) -> tuple[str, int, int]:
     """Remove generated metadata/footer noise without erasing real paragraphs.
 
@@ -911,8 +1076,8 @@ def clean_txt_content(
     Generated page markers are handled contextually:
     - a standalone printed page number immediately before "### Page ..." is removed
     - a trailing printed page number at the end of the previous line is removed
-    - a number-first running header immediately after "### Page ..." is removed,
-      e.g. "230. The Joy of Sex", "229- Problems", or "233• Problems"
+    - a running header immediately after "### Page ..." is removed, e.g.
+      "230. The Joy of Sex", "51 Starters", or "Starters 55-"
     - if the marker split one running sentence, the next line is joined back
     """
     text, removed_custom_blocks = remove_multiline_custom_clean_string(
@@ -922,6 +1087,10 @@ def clean_txt_content(
 
     lines = text.splitlines(keepends=True)
     repeated_numbered_header_titles = collect_numbered_running_header_titles(lines)
+    if extra_repeated_numbered_header_titles:
+        repeated_numbered_header_titles = (
+            repeated_numbered_header_titles | extra_repeated_numbered_header_titles
+        )
     cleaned_lines: list[str] = []
     removed_marker_lines = removed_custom_blocks
     removed_empty_lines = 0
@@ -930,6 +1099,20 @@ def clean_txt_content(
 
     while index < len(lines):
         line = lines[index]
+
+        if not cleaned_lines and line_is_initial_running_header(
+            lines,
+            index,
+            repeated_numbered_header_titles,
+        ):
+            removed_marker_lines += 1
+            index += 1
+
+            if index < len(lines) and not lines[index].strip():
+                removed_empty_lines += 1
+                index += 1
+
+            continue
 
         if line_is_generated_page_marker(line):
             removed_marker_lines += 1
@@ -1022,6 +1205,22 @@ def clean_txt_content(
 
                 continue
 
+        line, removed_learned_running_header = strip_learned_running_header_prefix(
+            line,
+            repeated_numbered_header_titles,
+        )
+        if removed_learned_running_header:
+            removed_marker_lines += 1
+
+            if not line:
+                index += 1
+
+                if index < len(lines) and not lines[index].strip():
+                    removed_empty_lines += 1
+                    index += 1
+
+                continue
+
         cleaned_line, changed = strip_embedded_clean_noise(
             line,
             custom_clean_string=custom_clean_string,
@@ -1048,6 +1247,57 @@ def clean_txt_content(
     return "".join(cleaned_lines), removed_marker_lines, removed_empty_lines
 
 
+def collect_numbered_running_header_titles_from_files(
+    txt_files: list[Path],
+) -> set[str]:
+    """Learn repeated running-header titles across a folder of TXT pages.
+
+    This catches cleaned single-page files where page markers are already gone,
+    so each file starts directly with a header such as "The Joy of Sex 114•".
+    """
+    title_counts: dict[str, int] = {}
+
+    def add_candidate(line: str) -> None:
+        parts = numbered_running_header_parts(line)
+        if parts is None:
+            return
+        _, _, normalized_title = parts
+        title_counts[normalized_title] = title_counts.get(normalized_title, 0) + 1
+
+    for txt_path in txt_files:
+        try:
+            text = txt_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = txt_path.read_text(encoding="utf-8-sig")
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+        lines = text.splitlines()
+
+        for line in lines:
+            if line.strip():
+                add_candidate(line)
+                break
+
+        index = 0
+        while index < len(lines):
+            if not line_is_generated_page_marker(lines[index]):
+                index += 1
+                continue
+
+            index += 1
+            while index < len(lines) and not lines[index].strip():
+                index += 1
+
+            if index < len(lines):
+                add_candidate(lines[index])
+
+    return {title for title, count in title_counts.items() if count >= 2}
+
+
 def clean_txt_files_in_folder(
     folder: Path,
     custom_clean_string: str = "",
@@ -1059,6 +1309,10 @@ def clean_txt_files_in_folder(
 
     if not txt_files:
         raise TextCleanerError("No TXT files were found in the selected folder.")
+
+    folder_repeated_numbered_header_titles = (
+        collect_numbered_running_header_titles_from_files(txt_files)
+    )
 
     cleaned_files: list[Path] = []
     errors: list[str] = []
@@ -1085,6 +1339,7 @@ def clean_txt_files_in_folder(
             original_text,
             custom_clean_string=custom_clean_string,
             running_header_title=running_header_title,
+            extra_repeated_numbered_header_titles=folder_repeated_numbered_header_titles,
         )
 
         total_removed_marker_lines += removed_marker_lines
