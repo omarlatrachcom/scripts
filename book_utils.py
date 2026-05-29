@@ -70,6 +70,20 @@ TXT_CLEAN_STANDALONE_PAGE_NUMBER_RE = re.compile(r"^\s*\d{1,5}\s*$")
 TXT_CLEAN_TRAILING_PAGE_NUMBER_RE = re.compile(
     r"^(?P<body>.*\S)\s+(?P<page_number>\d{1,5})\s*$"
 )
+TXT_CLEAN_NUMBERED_RUNNING_HEADER_RE = re.compile(
+    r"""
+    ^\s*
+    (?P<page_number>[0-9]{1,5}|[٠-٩]{1,5})
+    \s*
+    [.\-–—•·:]
+    \s*
+    (?P<title>\S(?:.*\S)?)
+    \s*$
+    """,
+    re.VERBOSE,
+)
+TXT_CLEAN_NUMBERED_HEADER_MAX_TITLE_LENGTH = 90
+TXT_CLEAN_SINGLE_NUMBERED_HEADER_MIN_PAGE = 20
 TXT_CLEAN_KINDLE_PROGRESS_RE = re.compile(
     r"""
     \s*
@@ -376,6 +390,132 @@ def line_is_standalone_page_number(line: str) -> bool:
     """Return True for a printed page number on its own line."""
     normalized_line = line.replace("\u00a0", " ").strip()
     return bool(TXT_CLEAN_STANDALONE_PAGE_NUMBER_RE.fullmatch(normalized_line))
+
+
+def parse_unicode_page_number(page_number: str) -> int | None:
+    """Parse Western or Arabic-Indic digits from a printed page header."""
+    try:
+        return int("".join(str(unicodedata.digit(character)) for character in page_number))
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_numbered_running_header_title(title: str) -> str:
+    """Normalize a detected running-header title for repeat checks."""
+    return re.sub(r"\s+", " ", title.replace("\u00a0", " ").strip()).casefold()
+
+
+def numbered_running_header_parts(line: str) -> tuple[int | None, str, str] | None:
+    """Return parts for generic page headers such as '230. The Joy of Sex'.
+
+    The title can be anything; the detection is intentionally title-agnostic.
+    This helper only identifies the shape. The caller decides whether it is safe
+    to remove the line based on page-marker context and repeated titles.
+    """
+    normalized_line = line.replace("\u00a0", " ").strip()
+    match = TXT_CLEAN_NUMBERED_RUNNING_HEADER_RE.fullmatch(normalized_line)
+    if not match:
+        return None
+
+    title = match.group("title").strip()
+    if len(title) > TXT_CLEAN_NUMBERED_HEADER_MAX_TITLE_LENGTH:
+        return None
+
+    # Avoid treating punctuation/garbage-only OCR lines as real headers.
+    if not any(character.isalpha() for character in title):
+        return None
+
+    page_number = parse_unicode_page_number(match.group("page_number"))
+    normalized_title = normalize_numbered_running_header_title(title)
+    if not normalized_title:
+        return None
+
+    return page_number, title, normalized_title
+
+
+def collect_numbered_running_header_titles(lines: list[str]) -> set[str]:
+    """Collect repeated number-first running-header titles after page markers.
+
+    Examples include '230. The Joy of Sex', '229- Problems', and
+    '233• Problems'. Repetition makes removal safer because ordinary chapter
+    headings like '1. Introduction' often appear only once.
+    """
+    title_counts: dict[str, int] = {}
+    index = 0
+
+    while index < len(lines):
+        if not line_is_generated_page_marker(lines[index]):
+            index += 1
+            continue
+
+        index += 1
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+
+        if index >= len(lines):
+            break
+
+        parts = numbered_running_header_parts(lines[index])
+        if parts is not None:
+            _, _, normalized_title = parts
+            title_counts[normalized_title] = title_counts.get(normalized_title, 0) + 1
+
+    return {title for title, count in title_counts.items() if count >= 2}
+
+
+def line_is_contextual_numbered_running_header(
+    line: str,
+    repeated_numbered_header_titles: set[str],
+) -> bool:
+    """Return True for removable number-first page headers after markers.
+
+    Removal is intentionally contextual: clean_txt_content() calls this only for
+    the first non-empty line after a generated '### Page ...' marker. This avoids
+    deleting normal numbered list items inside the body text.
+    """
+    parts = numbered_running_header_parts(line)
+    if parts is None:
+        return False
+
+    page_number, _, normalized_title = parts
+    if normalized_title in repeated_numbered_header_titles:
+        return True
+
+    # Keep single low-number headings such as '1. Introduction' by default, but
+    # still clean isolated book-page headers in small chunks such as
+    # '230. The Joy of Sex' where the title may occur only once.
+    return (
+        page_number is not None
+        and page_number >= TXT_CLEAN_SINGLE_NUMBERED_HEADER_MIN_PAGE
+    )
+
+
+def remove_contextual_numbered_running_header(
+    lines: list[str],
+    index: int,
+    repeated_numbered_header_titles: set[str],
+) -> tuple[int, int, int]:
+    """Remove a number-first running header at index, plus one following blank.
+
+    Returns the new index, removed marker-line count, and removed empty-line
+    count. The caller must ensure index points to the first non-empty line after
+    a generated page marker.
+    """
+    if index >= len(lines) or not line_is_contextual_numbered_running_header(
+        lines[index],
+        repeated_numbered_header_titles,
+    ):
+        return index, 0, 0
+
+    index += 1
+    removed_marker_lines = 1
+    removed_empty_lines = 0
+
+    if index < len(lines) and not lines[index].strip():
+        removed_empty_lines += 1
+        index += 1
+
+    return index, removed_marker_lines, removed_empty_lines
 
 
 def remove_trailing_page_number(line: str) -> tuple[str, bool]:
@@ -695,6 +835,8 @@ def clean_txt_content(
     Generated page markers are handled contextually:
     - a standalone printed page number immediately before "### Page ..." is removed
     - a trailing printed page number at the end of the previous line is removed
+    - a number-first running header immediately after "### Page ..." is removed,
+      e.g. "230. The Joy of Sex", "229- Problems", or "233• Problems"
     - if the marker split one running sentence, the next line is joined back
     """
     text, removed_custom_blocks = remove_multiline_custom_clean_string(
@@ -703,6 +845,7 @@ def clean_txt_content(
     )
 
     lines = text.splitlines(keepends=True)
+    repeated_numbered_header_titles = collect_numbered_running_header_titles(lines)
     cleaned_lines: list[str] = []
     removed_marker_lines = removed_custom_blocks
     removed_empty_lines = 0
@@ -743,6 +886,18 @@ def clean_txt_content(
             while index < len(lines) and not lines[index].strip():
                 removed_empty_lines += 1
                 index += 1
+
+            (
+                index,
+                removed_numbered_header_lines,
+                removed_numbered_header_empty_lines,
+            ) = remove_contextual_numbered_running_header(
+                lines,
+                index,
+                repeated_numbered_header_titles,
+            )
+            removed_marker_lines += removed_numbered_header_lines
+            removed_empty_lines += removed_numbered_header_empty_lines
 
             previous_text = last_nonempty_line_text(cleaned_lines)
             next_text = next_nonempty_line_text(lines, index)
