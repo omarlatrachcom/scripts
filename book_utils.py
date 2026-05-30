@@ -221,6 +221,22 @@ LAYOUT_MARGIN_MIN_MAIN_TEXT_CHARS = 24
 LAYOUT_BLOCK_VERTICAL_GAP_FACTOR = 1.65
 LAYOUT_MARGIN_VERTICAL_GAP_FACTOR = 3.25
 
+# Side captions/marginalia in illustrated books often contain cue words such as
+# "opposite" or "overleaf". They should be kept, but they must not interrupt a
+# paragraph that continues onto the next PDF page. The TXT cleaner uses these
+# patterns to move an interrupting side caption after the paragraph it annotates.
+TXT_CLEAN_SIDE_NOTE_CUE_WORDS = {
+    "opposite",
+    "overleaf",
+    "above",
+    "below",
+}
+TXT_CLEAN_SIDE_NOTE_CUE_RE = re.compile(
+    r"\b(?:opposite|overleaf|above|below|facing\s+page|plate|fig\.?|figure)\b",
+    re.IGNORECASE,
+)
+TXT_CLEAN_MAX_SIDE_NOTE_CHARS = 360
+
 
 @dataclass(frozen=True)
 class OCRLine:
@@ -493,6 +509,105 @@ def numbered_running_header_parts(line: str) -> tuple[int | None, str, str] | No
     return page_number, title, normalized_title
 
 
+def numbered_running_header_prefix_parts(
+    line: str,
+) -> tuple[int | None, str, str, str] | None:
+    """Return header parts when a running header is merged into body text.
+
+    This is intentionally used only for learning repeated folder headers and
+    prefix stripping. Standalone detection remains stricter.
+    """
+    normalized_line = line.replace("\u00a0", " ").strip()
+    if not normalized_line:
+        return None
+
+    page_number_pattern = r"(?P<page_number>[0-9٠-٩gqOoIl|]{1,5})"
+    punct_pattern = TXT_CLEAN_RUNNING_HEADER_PUNCTUATION_CLASS
+
+    # Title-first with a visible separator after the page number:
+    # "The Joy of Sex 114• It starts..."
+    match = re.match(
+        rf"^\s*(?P<title>\S(?:.*?\S)?)\s+{page_number_pattern}"
+        rf"\s*{punct_pattern}\s+(?P<body>\S.*)$",
+        normalized_line,
+        re.IGNORECASE,
+    )
+    if match:
+        title = match.group("title").strip()
+        body = match.group("body").strip()
+        page_number = parse_unicode_page_number(match.group("page_number"))
+
+        if (
+            page_number is not None
+            and page_number >= TXT_CLEAN_SINGLE_NUMBERED_HEADER_MIN_PAGE
+            and len(title) <= TXT_CLEAN_NUMBERED_HEADER_MAX_TITLE_LENGTH
+            and any(character.isalpha() for character in title)
+            and line_looks_like_body_text_after_header(body)
+        ):
+            normalized_title = normalize_numbered_running_header_title(title)
+            if normalized_title:
+                return page_number, title, normalized_title, body
+
+    # Page-first with a visible separator and a learned-looking title followed
+    # by lowercase body text, e.g. "151 Main Courses initially at least...".
+    match = re.match(
+        rf"^\s*{page_number_pattern}"
+        rf"(?:\s*{punct_pattern}\s*|\s+)"
+        rf"(?P<rest>\S.*)$",
+        normalized_line,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    page_number = parse_unicode_page_number(match.group("page_number"))
+    if page_number is None or page_number < TXT_CLEAN_SINGLE_NUMBERED_HEADER_MIN_PAGE:
+        return None
+
+    rest = match.group("rest").strip()
+    words = rest.split()
+    if len(words) < 3:
+        return None
+
+    # Prefer a split before the first clearly lowercase body word, while
+    # allowing short lowercase connector words inside titles: "The Joy of Sex".
+    connector_words = {"a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "the", "to", "with"}
+    title_words: list[str] = []
+    body_words: list[str] = []
+
+    for word in words:
+        stripped_word = word.strip(" .,-–—•·∙●▪■*:;|()[]{}'\"")
+        is_lower_body_word = (
+            bool(stripped_word)
+            and stripped_word[:1].islower()
+            and stripped_word.casefold() not in connector_words
+            and len(title_words) >= 1
+        )
+        if is_lower_body_word:
+            body_words = words[len(title_words):]
+            break
+        title_words.append(word)
+
+    if not body_words:
+        return None
+
+    title = " ".join(title_words).strip()
+    body = " ".join(body_words).strip()
+    if (
+        not title
+        or len(title) > TXT_CLEAN_NUMBERED_HEADER_MAX_TITLE_LENGTH
+        or not any(character.isalpha() for character in title)
+        or not line_looks_like_body_text_after_header(body)
+    ):
+        return None
+
+    normalized_title = normalize_numbered_running_header_title(title)
+    if not normalized_title:
+        return None
+
+    return page_number, title, normalized_title, body
+
+
 def collect_numbered_running_header_titles(lines: list[str]) -> set[str]:
     """Collect repeated running-header titles after page markers.
 
@@ -628,6 +743,48 @@ def remove_contextual_numbered_running_header(
 
     return index, removed_marker_lines, removed_empty_lines
 
+
+
+def strip_contextual_numbered_running_header_prefix(
+    line: str,
+    repeated_numbered_header_titles: set[str],
+) -> tuple[str, bool]:
+    """Strip a page running-header prefix from the first line after a page marker.
+
+    This catches OCR/PDF cases where the header and body were merged into one
+    line, for example:
+        "55- Starters vagina and the genital odor..."
+        "151 Main Courses initially at least..."
+
+    It is contextual and conservative: callers should use it only at a page
+    boundary or at the very first line of an already-cleaned page chunk.
+    """
+    parts = numbered_running_header_prefix_parts(line)
+    if parts is None:
+        return line, False
+
+    page_number, _, normalized_title, body = parts
+    if not body:
+        return "", True
+
+    removable = normalized_title in repeated_numbered_header_titles
+    if not removable:
+        removable = title_is_fuzzy_repeated_numbered_header(
+            normalized_title,
+            repeated_numbered_header_titles,
+        )
+    if not removable:
+        removable = (
+            page_number is not None
+            and page_number >= TXT_CLEAN_SINGLE_NUMBERED_HEADER_MIN_PAGE
+        )
+
+    if not removable:
+        return line, False
+
+    line_body = line.rstrip("\r\n")
+    line_ending = line[len(line_body):]
+    return body.strip() + line_ending, True
 
 def line_looks_like_body_text_after_header(text: str) -> bool:
     """Return True when text after/under a header looks like prose, not a title."""
@@ -1057,6 +1214,397 @@ def strip_running_header_prefix(
     return cleaned_body + line_ending, True
 
 
+
+def normalize_clean_paragraph_text(paragraph: str) -> str:
+    """Return one-line normalized text for paragraph-level cleanup checks."""
+    return re.sub(r"\s+", " ", paragraph.replace("\u00a0", " ").strip())
+
+
+def first_meaningful_character(text: str) -> str:
+    """Return the first alphanumeric character after quotes/brackets, if any."""
+    for character in text.lstrip(" \t\r\n'\"“”‘’([{<"):
+        if character.isalnum():
+            return character
+    return ""
+
+
+def paragraph_starts_like_continuation(paragraph: str) -> bool:
+    """Return True when a paragraph looks like the continuation of a split one."""
+    text = normalize_clean_paragraph_text(paragraph)
+    first_character = first_meaningful_character(text)
+    return bool(first_character and first_character.islower())
+
+
+def uppercase_letter_ratio(text: str) -> float:
+    """Return the ratio of uppercase letters among cased letters."""
+    letters = [character for character in text if character.isalpha()]
+    if not letters:
+        return 0.0
+    uppercase_letters = [character for character in letters if character.isupper()]
+    return len(uppercase_letters) / len(letters)
+
+
+def word_without_trailing_punctuation(word: str) -> str:
+    """Normalize a word for cue-word matching."""
+    return word.strip(" \t\r\n.,;:!?()[]{}<>•·-*—–").casefold()
+
+
+def paragraph_looks_like_side_note_caption(paragraph: str) -> bool:
+    """Return True for short side captions such as 'BIRTH CONTROL opposite ...'.
+
+    This is intentionally conservative. It detects captions/marginal notes with
+    layout cue words, but does not classify ordinary short paragraphs as side
+    notes merely because they are short.
+    """
+    text = normalize_clean_paragraph_text(paragraph)
+    if not text or len(text) > TXT_CLEAN_MAX_SIDE_NOTE_CHARS:
+        return False
+
+    if not TXT_CLEAN_SIDE_NOTE_CUE_RE.search(text):
+        return False
+
+    words = text.split()
+    if len(words) < 2:
+        return False
+
+    normalized_words = [word_without_trailing_punctuation(word) for word in words]
+
+    for index, normalized_word in enumerate(normalized_words[:8]):
+        if normalized_word not in TXT_CLEAN_SIDE_NOTE_CUE_WORDS:
+            continue
+
+        # Common shapes:
+        #   BIRTH CONTROL opposite The discovery ...
+        #   REAL SEX opposite Permissiveness ...
+        #   overleaf BEDS Still the most important ...
+        if index == 0:
+            following_label = " ".join(words[1:4])
+            return uppercase_letter_ratio(following_label) >= 0.60
+
+        leading_label = " ".join(words[:index])
+        if uppercase_letter_ratio(leading_label) >= 0.60:
+            return True
+
+        # Some OCR engines merge a lowercase marginal title with an uppercase
+        # caption, e.g. "birth contro BIRTH CONTROL opposite ...". The cue word
+        # still makes it caption-like, so allow a slightly lower uppercase ratio
+        # when there are multiple words before the cue.
+        if index >= 2 and uppercase_letter_ratio(leading_label) >= 0.50:
+            return True
+
+    return False
+
+
+def join_split_paragraph_fragments(previous_paragraph: str, next_paragraph: str) -> str:
+    """Join two paragraph fragments split by a page boundary or side note."""
+    previous_body = previous_paragraph.rstrip()
+    next_body = next_paragraph.lstrip()
+    separator = "" if previous_body.endswith(("-", "—", "–")) else " "
+    return previous_body + separator + next_body
+
+
+
+def words_for_caption_similarity(text: str) -> list[str]:
+    """Return normalized words for side-caption/main-text similarity checks."""
+    return [
+        word.casefold()
+        for word in re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,}", text)
+    ]
+
+
+def side_note_caption_tail(paragraph: str) -> str:
+    """Return the descriptive part after a side-caption cue word."""
+    text = normalize_clean_paragraph_text(paragraph)
+    match = TXT_CLEAN_SIDE_NOTE_CUE_RE.search(text)
+    if not match:
+        return text
+    return text[match.end():].strip(" .,-–—•·:;")
+
+
+def side_note_caption_matches_following_paragraph(
+    side_note_paragraph: str,
+    following_paragraph: str,
+) -> bool:
+    """Return True when a caption appears to summarize the following paragraph."""
+    caption_tail = side_note_caption_tail(side_note_paragraph)
+    if len(caption_tail) < 20:
+        return False
+
+    caption_words = words_for_caption_similarity(caption_tail)
+    following_words = words_for_caption_similarity(following_paragraph)[:28]
+    if len(caption_words) < 4 or len(following_words) < 4:
+        return False
+
+    caption_set = set(caption_words)
+    following_set = set(following_words)
+    overlap_ratio = len(caption_set & following_set) / max(1, len(caption_set))
+    if overlap_ratio >= 0.45:
+        return True
+
+    following_start = " ".join(following_words[: min(16, len(following_words))])
+    caption_start = " ".join(caption_words[: min(16, len(caption_words))])
+    return difflib.SequenceMatcher(None, caption_start, following_start).ratio() >= 0.62
+
+
+
+def previous_nonempty_output_index(lines: list[str]) -> int | None:
+    """Return the last non-empty index from an output line buffer."""
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].strip():
+            return index
+    return None
+
+
+def next_nonempty_source_index(lines: list[str], start_index: int) -> int | None:
+    """Return the next non-empty source-line index, if any."""
+    for index in range(start_index, len(lines)):
+        if lines[index].strip():
+            return index
+    return None
+
+
+def collect_line_block(lines: list[str], start_index: int) -> tuple[list[str], int, bool]:
+    """Collect one visual/text block from start_index until a blank line.
+
+    Returns the collected non-empty lines, the next index after the block and
+    following blank lines, and whether at least one blank line was consumed.
+    """
+    block: list[str] = []
+    index = start_index
+
+    while index < len(lines) and lines[index].strip():
+        block.append(lines[index].strip())
+        index += 1
+
+    consumed_blank = False
+    while index < len(lines) and not lines[index].strip():
+        consumed_blank = True
+        index += 1
+
+    return block, index, consumed_blank
+
+
+def relocate_side_note_caption_lines(text: str) -> tuple[str, int]:
+    """Line-level relocation for standalone side-caption lines.
+
+    This catches cases where the caption is separated by only a single newline,
+    so paragraph splitting on blank lines cannot see it as an independent
+    paragraph.
+    """
+    if not text.strip():
+        return text, 0
+
+    had_final_newline = text.endswith(("\n", "\r"))
+    lines = text.splitlines()
+    relocated: list[str] = []
+    moved_count = 0
+    index = 0
+
+    while index < len(lines):
+        current_line = lines[index].strip()
+        if not paragraph_looks_like_side_note_caption(current_line):
+            relocated.append(lines[index])
+            index += 1
+            continue
+
+        next_index = next_nonempty_source_index(lines, index + 1)
+        if next_index is None:
+            relocated.append(lines[index])
+            index += 1
+            continue
+
+        next_block, after_next_block, consumed_blank = collect_line_block(
+            lines,
+            next_index,
+        )
+        if not next_block:
+            relocated.append(lines[index])
+            index += 1
+            continue
+
+        previous_index = previous_nonempty_output_index(relocated)
+        previous_text = relocated[previous_index].strip() if previous_index is not None else ""
+        next_block_text = " ".join(next_block)
+
+        # Shape: previous fragment -> side caption -> continuation block.
+        #
+        # Older versions appended the caption after the entire next visual block.
+        # In illustrated PDFs one extracted block may contain several real
+        # paragraphs and even another side caption, so this made captions drift
+        # too far down the text. Consume only the continuation lines needed to
+        # complete the broken paragraph, then resume scanning the source lines so
+        # later captions can be handled independently.
+        if (
+            previous_index is not None
+            and previous_text
+            and not ends_at_safe_boundary(previous_text)
+            and paragraph_starts_like_continuation(next_block[0])
+        ):
+            target_lines: list[str] = []
+            target_index = next_index
+
+            while target_index < len(lines) and lines[target_index].strip():
+                target_line = lines[target_index].strip()
+                target_lines.append(target_line)
+                target_index += 1
+
+                if ends_at_safe_boundary(target_line):
+                    break
+
+            if not target_lines:
+                relocated.append(lines[index])
+                index += 1
+                continue
+
+            relocated[previous_index] = join_split_paragraph_fragments(
+                relocated[previous_index],
+                target_lines[0],
+            )
+            relocated.extend(target_lines[1:])
+            relocated.append(current_line)
+            moved_count += 1
+            index = target_index
+            continue
+
+        # Shape: side caption -> paragraph it summarizes. Move the caption
+        # after the first completed following paragraph, not after every
+        # subsequent non-empty line in the same extracted block.
+        if side_note_caption_matches_following_paragraph(
+            current_line,
+            next_block_text,
+        ):
+            target_lines: list[str] = []
+            remaining_lines: list[str] = []
+            target_is_complete = False
+
+            for block_line in next_block:
+                if target_is_complete:
+                    remaining_lines.append(block_line)
+                    continue
+
+                target_lines.append(block_line)
+                if ends_at_safe_boundary(block_line):
+                    target_is_complete = True
+
+            relocated.extend(target_lines)
+            relocated.append(current_line)
+            relocated.extend(remaining_lines)
+            moved_count += 1
+            index = after_next_block
+            if consumed_blank and index < len(lines):
+                relocated.append("")
+            continue
+
+        relocated.append(lines[index])
+        index += 1
+
+    if not moved_count:
+        return text, 0
+
+    relocated_text = "\n".join(relocated)
+    if had_final_newline:
+        relocated_text += "\n"
+
+    return relocated_text, moved_count
+
+
+def relocate_interrupting_side_note_captions(text: str) -> tuple[str, int]:
+    """Move side captions after the paragraph they interrupt.
+
+    OCR/layout extraction can emit a marginal caption between a paragraph that
+    starts at the bottom of one page and continues at the top of the next page:
+
+        ... both the feel of the
+        BIRTH CONTROL opposite ...
+        vagina and the genital odor ...
+
+    The caption is real text and should not be deleted. This pass moves it after
+    the completed adjacent paragraph, allowing page-boundary paragraph joining to
+    read naturally while preserving the caption.
+    """
+    if not text.strip():
+        return text, 0
+
+    text, line_moved_count = relocate_side_note_caption_lines(text)
+
+    had_final_newline = text.endswith(("\n", "\r"))
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n+", text)
+        if paragraph.strip()
+    ]
+
+    if len(paragraphs) < 3:
+        return text, line_moved_count
+
+    relocated: list[str] = []
+    moved_count = 0
+    index = 0
+
+    while index < len(paragraphs):
+        # Shape from embedded text layers that emit a side caption immediately
+        # before the main paragraph it summarizes. Move it after that paragraph
+        # when the caption text clearly overlaps the paragraph start.
+        if (
+            index + 1 < len(paragraphs)
+            and paragraph_looks_like_side_note_caption(paragraphs[index])
+            and not paragraph_looks_like_side_note_caption(paragraphs[index + 1])
+            and side_note_caption_matches_following_paragraph(
+                paragraphs[index],
+                paragraphs[index + 1],
+            )
+        ):
+            relocated.append(paragraphs[index + 1])
+            relocated.append(paragraphs[index])
+            moved_count += 1
+            index += 2
+            continue
+
+        # Shape after OCR block ordering:
+        #   main fragment -> side caption -> continuation fragment
+        if (
+            index + 2 < len(paragraphs)
+            and not ends_at_safe_boundary(paragraphs[index])
+            and paragraph_looks_like_side_note_caption(paragraphs[index + 1])
+            and paragraph_starts_like_continuation(paragraphs[index + 2])
+        ):
+            relocated.append(
+                join_split_paragraph_fragments(paragraphs[index], paragraphs[index + 2])
+            )
+            relocated.append(paragraphs[index + 1])
+            moved_count += 1
+            index += 3
+            continue
+
+        # Shape from some embedded text layers:
+        #   side caption -> main fragment -> continuation fragment
+        if (
+            index + 2 < len(paragraphs)
+            and paragraph_looks_like_side_note_caption(paragraphs[index])
+            and not ends_at_safe_boundary(paragraphs[index + 1])
+            and paragraph_starts_like_continuation(paragraphs[index + 2])
+        ):
+            relocated.append(
+                join_split_paragraph_fragments(paragraphs[index + 1], paragraphs[index + 2])
+            )
+            relocated.append(paragraphs[index])
+            moved_count += 1
+            index += 3
+            continue
+
+        relocated.append(paragraphs[index])
+        index += 1
+
+    if not moved_count:
+        return text, line_moved_count
+
+    relocated_text = "\n\n".join(relocated)
+    if had_final_newline:
+        relocated_text += "\n"
+
+    return relocated_text, moved_count + line_moved_count
+
+
 def clean_txt_content(
     text: str,
     custom_clean_string: str = "",
@@ -1114,6 +1662,27 @@ def clean_txt_content(
 
             continue
 
+        if not cleaned_lines:
+            stripped_line, removed_initial_header_prefix = (
+                strip_contextual_numbered_running_header_prefix(
+                    line,
+                    repeated_numbered_header_titles,
+                )
+            )
+            if removed_initial_header_prefix:
+                removed_marker_lines += 1
+                if not stripped_line:
+                    index += 1
+
+                    if index < len(lines) and not lines[index].strip():
+                        removed_empty_lines += 1
+                        index += 1
+
+                    continue
+
+                line = stripped_line
+                lines[index] = stripped_line
+
         if line_is_generated_page_marker(line):
             removed_marker_lines += 1
 
@@ -1157,6 +1726,17 @@ def clean_txt_content(
             )
             removed_marker_lines += removed_numbered_header_lines
             removed_empty_lines += removed_numbered_header_empty_lines
+
+            if index < len(lines):
+                stripped_line, removed_header_prefix = (
+                    strip_contextual_numbered_running_header_prefix(
+                        lines[index],
+                        repeated_numbered_header_titles,
+                    )
+                )
+                if removed_header_prefix:
+                    lines[index] = stripped_line
+                    removed_marker_lines += 1
 
             previous_text = last_nonempty_line_text(cleaned_lines)
             next_text = next_nonempty_line_text(lines, index)
@@ -1244,7 +1824,10 @@ def clean_txt_content(
     removed_marker_lines += terminal_removed_marker_lines
     removed_empty_lines += terminal_removed_empty_lines
 
-    return "".join(cleaned_lines), removed_marker_lines, removed_empty_lines
+    cleaned_text = "".join(cleaned_lines)
+    cleaned_text, _ = relocate_interrupting_side_note_captions(cleaned_text)
+
+    return cleaned_text, removed_marker_lines, removed_empty_lines
 
 
 def collect_numbered_running_header_titles_from_files(
@@ -1258,9 +1841,19 @@ def collect_numbered_running_header_titles_from_files(
     title_counts: dict[str, int] = {}
 
     def add_candidate(line: str) -> None:
+        # Try prefix parsing first. Otherwise an inline-merged line such as
+        # "151 Main Courses initially..." can be misread as one giant
+        # standalone title.
+        prefix_parts = numbered_running_header_prefix_parts(line)
+        if prefix_parts is not None:
+            _, _, normalized_title, _ = prefix_parts
+            title_counts[normalized_title] = title_counts.get(normalized_title, 0) + 1
+            return
+
         parts = numbered_running_header_parts(line)
         if parts is None:
             return
+
         _, _, normalized_title = parts
         title_counts[normalized_title] = title_counts.get(normalized_title, 0) + 1
 
@@ -2072,6 +2665,190 @@ def normalize_pdf_text(text: str) -> str:
     return "\n\n".join(cleaned).strip()
 
 
+
+def pdf_text_block_text(block: tuple[object, ...]) -> str:
+    """Return normalized raw text from one PyMuPDF text block."""
+    try:
+        raw_text = str(block[4])
+    except Exception:
+        return ""
+
+    lines = [normalize_extracted_line_text(line) for line in raw_text.splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
+def pdf_text_block_bbox(block: tuple[object, ...]) -> tuple[float, float, float, float]:
+    """Return a PyMuPDF text block bbox as floats."""
+    return float(block[0]), float(block[1]), float(block[2]), float(block[3])
+
+
+def pdf_text_block_is_top_running_header(
+    block: tuple[object, ...],
+    page_height: float,
+) -> bool:
+    """Return True for a small running header near the top of a PDF page."""
+    text = normalize_clean_paragraph_text(pdf_text_block_text(block))
+    if not text:
+        return False
+
+    _, y0, _, y1 = pdf_text_block_bbox(block)
+    if y1 > max(32.0, page_height * 0.07):
+        return False
+
+    return numbered_running_header_parts(text) is not None
+
+
+def estimate_pdf_main_text_left(
+    blocks: list[tuple[object, ...]],
+    page_width: float,
+) -> float | None:
+    """Estimate the dominant main text column left edge from PDF text blocks."""
+    candidates: list[float] = []
+
+    for block in blocks:
+        text = normalize_clean_paragraph_text(pdf_text_block_text(block))
+        if len(text) < LAYOUT_MARGIN_MIN_MAIN_TEXT_CHARS:
+            continue
+
+        x0, _, x1, _ = pdf_text_block_bbox(block)
+        width = x1 - x0
+        if width < page_width * 0.25:
+            continue
+
+        # Very low x values are usually marginal captions in illustrated books.
+        if x0 < page_width * 0.12:
+            continue
+
+        candidates.append(x0)
+
+    if candidates:
+        return median_float(candidates)
+
+    fallback = [
+        pdf_text_block_bbox(block)[0]
+        for block in blocks
+        if normalize_clean_paragraph_text(pdf_text_block_text(block))
+    ]
+    if not fallback:
+        return None
+
+    return median_float(fallback)
+
+
+def group_pdf_side_blocks(
+    blocks: list[tuple[object, ...]],
+    page_height: float,
+) -> list[list[tuple[object, ...]]]:
+    """Group nearby marginal PDF text blocks into side-note/caption groups."""
+    if not blocks:
+        return []
+
+    ordered = sorted(blocks, key=lambda block: (pdf_text_block_bbox(block)[1], pdf_text_block_bbox(block)[0]))
+    groups: list[list[tuple[object, ...]]] = []
+    current: list[tuple[object, ...]] = []
+    previous_bottom: float | None = None
+    gap_threshold = max(18.0, page_height * 0.045)
+
+    for block in ordered:
+        _, y0, _, y1 = pdf_text_block_bbox(block)
+        if current and previous_bottom is not None and y0 - previous_bottom > gap_threshold:
+            groups.append(current)
+            current = []
+
+        current.append(block)
+        previous_bottom = y1
+
+    if current:
+        groups.append(current)
+
+    return groups
+
+
+def merge_pdf_text_blocks(blocks: list[tuple[object, ...]]) -> str:
+    """Merge PDF text blocks into paragraph-like text using the normalizer."""
+    if not blocks:
+        return ""
+
+    ordered = sorted(blocks, key=lambda block: (pdf_text_block_bbox(block)[1], pdf_text_block_bbox(block)[0]))
+    return normalize_pdf_text("\n".join(pdf_text_block_text(block) for block in ordered if pdf_text_block_text(block)))
+
+
+def merge_pdf_side_group(blocks: list[tuple[object, ...]]) -> str:
+    """Merge one marginal/caption group into one paragraph."""
+    text = " ".join(
+        normalize_clean_paragraph_text(pdf_text_block_text(block))
+        for block in sorted(blocks, key=lambda block: (pdf_text_block_bbox(block)[1], pdf_text_block_bbox(block)[0]))
+        if pdf_text_block_text(block)
+    )
+    return normalize_clean_paragraph_text(text)
+
+
+def extract_layout_text_from_pdf_page(fitz_page) -> str:
+    """Extract one PDF page with coordinate-aware block ordering.
+
+    pypdf/PDF embedded text order often emits marginal image captions before the
+    main body even when they are visually at the bottom/side of the page. That
+    breaks cross-page paragraphs. This PyMuPDF layout pass classifies the
+    dominant main column separately from side captions, emits the main body
+    first, and appends true side captions at the end of the page so the TXT
+    cleaner can move each caption after the exact completed paragraph it
+    interrupts.
+    """
+    try:
+        raw_blocks = [block for block in fitz_page.get_text("blocks") if len(block) >= 7 and int(block[6]) == 0]
+    except Exception:
+        return ""
+
+    if not raw_blocks:
+        return ""
+
+    page_width = float(fitz_page.rect.width)
+    page_height = float(fitz_page.rect.height)
+
+    text_blocks = [
+        block
+        for block in raw_blocks
+        if pdf_text_block_text(block)
+        and not pdf_text_block_is_top_running_header(block, page_height)
+    ]
+    if not text_blocks:
+        return ""
+
+    main_left = estimate_pdf_main_text_left(text_blocks, page_width)
+    if main_left is None:
+        return merge_pdf_text_blocks(text_blocks)
+
+    margin_cutoff = main_left - max(18.0, page_width * LAYOUT_MARGIN_X_GAP)
+    main_blocks: list[tuple[object, ...]] = []
+    side_blocks: list[tuple[object, ...]] = []
+
+    for block in text_blocks:
+        x0, _, x1, _ = pdf_text_block_bbox(block)
+        text = normalize_clean_paragraph_text(pdf_text_block_text(block))
+        width = x1 - x0
+
+        if x0 < margin_cutoff and width < page_width * 0.45:
+            side_blocks.append(block)
+        else:
+            main_blocks.append(block)
+
+    side_caption_groups: list[str] = []
+    non_caption_side_blocks: list[tuple[object, ...]] = []
+
+    for group in group_pdf_side_blocks(side_blocks, page_height):
+        group_text = merge_pdf_side_group(group)
+        if paragraph_looks_like_side_note_caption(group_text):
+            side_caption_groups.append(group_text)
+        else:
+            non_caption_side_blocks.extend(group)
+
+    # Non-caption marginal text can be real section text, so keep it in visual
+    # order with the body. Caption-like notes are appended after the page body.
+    main_text = merge_pdf_text_blocks([*main_blocks, *non_caption_side_blocks])
+    parts = [part for part in [main_text, *side_caption_groups] if part]
+    return "\n\n".join(parts).strip()
+
+
 def render_pdf_page_to_image(
     pdf_document,
     page_index: int,
@@ -2154,17 +2931,44 @@ def extract_text_from_pdf_file(
 
                 page_text = ""
 
+                fitz_page = fitz_document.load_page(page_index)
+
+                layout_text = ""
                 try:
-                    direct_text = normalize_pdf_text(page.extract_text() or "")
+                    layout_text = extract_layout_text_from_pdf_page(fitz_page)
                 except Exception as exc:
-                    direct_text = ""
+                    errors.append(
+                        f"{pdf_path.name} page {page_index + 1}: layout text failed: {exc}"
+                    )
+
+                try:
+                    pypdf_text = normalize_pdf_text(page.extract_text() or "")
+                except Exception as exc:
+                    pypdf_text = ""
                     errors.append(
                         f"{pdf_path.name} page {page_index + 1}: direct text failed: {exc}"
                     )
 
+                # Prefer coordinate-aware PyMuPDF text as the embedded-text
+                # fallback because its block order is better than pypdf for
+                # side captions. Do NOT let useful-looking layout text bypass
+                # OCR, though: searchable scanned PDFs often contain a full-page
+                # image plus a hidden/synthetic OCR layer whose characters are
+                # corrupted even when the text length/letter ratio looks fine
+                # (for example "bGClS ^t'" t^ie" instead of "beds Still the").
+                # For image-first pages with hidden/synthetic text, OCR the
+                # rendered page and keep the embedded layout text only as a
+                # fallback if OCR fails.
+                if has_useful_text(layout_text):
+                    direct_text = layout_text
+                else:
+                    direct_text = pypdf_text
+
                 direct_text_is_useful = has_useful_text(direct_text)
-                fitz_page = fitz_document.load_page(page_index)
-                use_ocr = should_ocr_pdf_page(fitz_page, direct_text)
+                use_ocr = should_ocr_pdf_page(
+                    fitz_page,
+                    direct_text,
+                )
 
                 if direct_text_is_useful and not use_ocr:
                     page_text = direct_text
