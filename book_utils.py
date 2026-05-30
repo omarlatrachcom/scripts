@@ -68,6 +68,9 @@ TXT_CLEAN_PAGE_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 TXT_CLEAN_STANDALONE_PAGE_NUMBER_RE = re.compile(r"^\s*\d{1,5}\s*$")
+TXT_CLEAN_LEADING_PAGE_NUMBER_RE = re.compile(
+    r"^\s*(?P<page_number>[0-9٠-٩gqOoIl|]{1,5})\s+(?P<body>\S.*)$"
+)
 TXT_CLEAN_TRAILING_PAGE_NUMBER_RE = re.compile(
     r"^(?P<body>.*\S)\s+(?P<page_number>\d{1,5})\s*$"
 )
@@ -468,6 +471,18 @@ def normalize_numbered_running_header_title(title: str) -> str:
     return title.casefold()
 
 
+def numbered_running_header_title_looks_like_structural_heading(title: str) -> bool:
+    """Return True for real section headings that can follow a printed page number."""
+    normalized_title = normalize_numbered_running_header_title(title)
+    return bool(
+        re.match(
+            r"^(?:chapter|chap\.?|book|part|volume|vol\.?)\s+"
+            r"(?:\d+|[ivxlcdm]+)\b",
+            normalized_title,
+        )
+    )
+
+
 def numbered_running_header_parts(line: str) -> tuple[int | None, str, str] | None:
     """Return parts for generic page headers.
 
@@ -697,7 +712,10 @@ def line_is_contextual_numbered_running_header(
     if parts is None:
         return False
 
-    page_number, _, normalized_title = parts
+    page_number, title, normalized_title = parts
+    if numbered_running_header_title_looks_like_structural_heading(title):
+        return False
+
     if normalized_title in repeated_numbered_header_titles:
         return True
 
@@ -757,34 +775,31 @@ def strip_contextual_numbered_running_header_prefix(
         "151 Main Courses initially at least..."
 
     It is contextual and conservative: callers should use it only at a page
-    boundary or at the very first line of an already-cleaned page chunk.
+    boundary or at the very first line of an already-cleaned page chunk. Inline
+    prefixes remove the title only when that title was learned as repeated
+    header text; otherwise the caller can remove just the fused page number.
     """
     parts = numbered_running_header_prefix_parts(line)
     if parts is None:
         return line, False
 
-    page_number, _, normalized_title, body = parts
+    _, _, normalized_title, body = parts
     if not body:
         return "", True
 
-    removable = normalized_title in repeated_numbered_header_titles
-    if not removable:
-        removable = title_is_fuzzy_repeated_numbered_header(
+    if not (
+        normalized_title in repeated_numbered_header_titles
+        or title_is_fuzzy_repeated_numbered_header(
             normalized_title,
             repeated_numbered_header_titles,
         )
-    if not removable:
-        removable = (
-            page_number is not None
-            and page_number >= TXT_CLEAN_SINGLE_NUMBERED_HEADER_MIN_PAGE
-        )
-
-    if not removable:
+    ):
         return line, False
 
     line_body = line.rstrip("\r\n")
     line_ending = line[len(line_body):]
     return body.strip() + line_ending, True
+
 
 def line_looks_like_body_text_after_header(text: str) -> bool:
     """Return True when text after/under a header looks like prose, not a title."""
@@ -830,7 +845,10 @@ def line_is_initial_running_header(
     if parts is None:
         return False
 
-    page_number, _, normalized_title = parts
+    page_number, title, normalized_title = parts
+    if numbered_running_header_title_looks_like_structural_heading(title):
+        return False
+
     title_is_learned = (
         normalized_title in repeated_numbered_header_titles
         or title_is_fuzzy_repeated_numbered_header(
@@ -879,6 +897,41 @@ def remove_trailing_page_number(line: str) -> tuple[str, bool]:
         return line, False
 
     return body_without_page_number + line_ending, True
+
+
+def remove_leading_page_number_after_marker(
+    line: str,
+    previous_text: str,
+) -> tuple[str, bool]:
+    """Remove a printed page number fused to the first line after a page marker.
+
+    Direct PDF extraction can emit a top page number and the first text block as
+    one line, e.g. "125 I used..." or "124 never got...". This removes only the
+    number, leaving the body text intact.
+    """
+    line_body = line.rstrip("\r\n")
+    line_ending = line[len(line_body):]
+    normalized_body = line_body.replace("\u00a0", " ")
+    match = TXT_CLEAN_LEADING_PAGE_NUMBER_RE.match(normalized_body)
+    if not match:
+        return line, False
+
+    page_number = parse_unicode_page_number(match.group("page_number"))
+    if page_number is None:
+        return line, False
+
+    body = match.group("body").strip()
+    if not body:
+        return line, False
+
+    first_character = first_meaningful_character(body)
+    if first_character and first_character.isupper():
+        return body + line_ending, True
+
+    if previous_text and should_join_page_boundary(previous_text, body):
+        return body + line_ending, True
+
+    return line, False
 
 
 def last_nonempty_line_text(lines: list[str]) -> str:
@@ -1624,6 +1677,7 @@ def clean_txt_content(
     Generated page markers are handled contextually:
     - a standalone printed page number immediately before "### Page ..." is removed
     - a trailing printed page number at the end of the previous line is removed
+    - a leading printed page number fused to the next page's first line is removed
     - a running header immediately after "### Page ..." is removed, e.g.
       "230. The Joy of Sex", "51 Starters", or "Starters 55-"
     - if the marker split one running sentence, the next line is joined back
@@ -1727,6 +1781,8 @@ def clean_txt_content(
             removed_marker_lines += removed_numbered_header_lines
             removed_empty_lines += removed_numbered_header_empty_lines
 
+            previous_text = last_nonempty_line_text(cleaned_lines)
+
             if index < len(lines):
                 stripped_line, removed_header_prefix = (
                     strip_contextual_numbered_running_header_prefix(
@@ -1738,7 +1794,17 @@ def clean_txt_content(
                     lines[index] = stripped_line
                     removed_marker_lines += 1
 
-            previous_text = last_nonempty_line_text(cleaned_lines)
+            if index < len(lines):
+                stripped_line, removed_leading_page_number = (
+                    remove_leading_page_number_after_marker(
+                        lines[index],
+                        previous_text,
+                    )
+                )
+                if removed_leading_page_number:
+                    lines[index] = stripped_line
+                    removed_marker_lines += 1
+
             next_text = next_nonempty_line_text(lines, index)
             join_next_line_to_previous = should_join_page_boundary(
                 previous_text,
