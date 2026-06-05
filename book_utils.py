@@ -115,10 +115,58 @@ TXT_CLEAN_OCR_PAGE_NUMBER_TRANSLATION = str.maketrans(
     }
 )
 TXT_CLEAN_NUMBERED_HEADER_MAX_TITLE_LENGTH = 90
+TXT_CLEAN_NUMBERED_HEADER_MIN_TITLE_LENGTH = 2
 TXT_CLEAN_SINGLE_NUMBERED_HEADER_MIN_PAGE = 20
 TXT_CLEAN_FUZZY_REPEATED_HEADER_TITLE_RATIO = 0.88
 TXT_CLEAN_RUNNING_HEADER_PUNCTUATION = r".\-–—•·∙●▪■*:;|\)\]\}"
 TXT_CLEAN_RUNNING_HEADER_PUNCTUATION_CLASS = f"[{TXT_CLEAN_RUNNING_HEADER_PUNCTUATION}]"
+TXT_CLEAN_UNSAFE_STANDALONE_HEADER_TITLES = {
+    "a",
+    "all",
+    "an",
+    "and",
+    "as",
+    "at",
+    "but",
+    "for",
+    "from",
+    "had",
+    "he",
+    "her",
+    "his",
+    "how",
+    "i",
+    "if",
+    "in",
+    "it",
+    "my",
+    "next",
+    "no",
+    "nothing",
+    "our",
+    "right",
+    "she",
+    "so",
+    "spent",
+    "that",
+    "the",
+    "their",
+    "then",
+    "there",
+    "they",
+    "this",
+    "to",
+    "we",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "woman",
+    "yes",
+    "your",
+}
 TXT_CLEAN_KINDLE_PROGRESS_RE = re.compile(
     r"""
     \s*
@@ -463,12 +511,59 @@ def parse_unicode_page_number(page_number: str) -> int | None:
         return None
 
 
+def page_number_token_has_decimal_digit(page_number: str) -> bool:
+    """Return True when a page-number token includes at least one real digit."""
+    return any(character.isdecimal() for character in page_number)
+
+
+def page_number_token_has_header_separator(line: str, page_number_end: int) -> bool:
+    """Return True when an OCR-only page token is followed by header punctuation."""
+    return bool(
+        re.match(
+            rf"\s*{TXT_CLEAN_RUNNING_HEADER_PUNCTUATION_CLASS}",
+            line[page_number_end:],
+        )
+    )
+
+
 def normalize_numbered_running_header_title(title: str) -> str:
     """Normalize a detected running-header title for repeat/fuzzy checks."""
     title = unicodedata.normalize("NFKC", title.replace("\u00a0", " "))
     title = re.sub(r"[\s_]+", " ", title).strip()
     title = title.strip(" .,-–—•·∙●▪■*:;|()[]{}")
     return title.casefold()
+
+
+def normalized_numbered_running_header_title_is_safe(normalized_title: str) -> bool:
+    """Return True when a learned header title is long enough to strip safely."""
+    return (
+        len(normalized_title) >= TXT_CLEAN_NUMBERED_HEADER_MIN_TITLE_LENGTH
+        and normalized_title not in TXT_CLEAN_UNSAFE_STANDALONE_HEADER_TITLES
+    )
+
+
+def numbered_running_header_title_looks_like_body_prose(title: str) -> bool:
+    """Return True when a page-number suffix looks like real body text."""
+    normalized_title = title.replace("\u00a0", " ").strip()
+    if not normalized_title:
+        return False
+
+    words = normalized_title.split()
+    first_word = words[0].strip(" .,-–—•·∙●▪■*:;|()[]{}'\"").casefold()
+
+    if (
+        first_word in TXT_CLEAN_UNSAFE_STANDALONE_HEADER_TITLES
+        and len(words) >= 2
+        and words[1][:1].islower()
+    ):
+        return True
+
+    if re.search(r"[,.;:!?]", normalized_title) and any(
+        character.islower() for character in normalized_title
+    ):
+        return True
+
+    return line_looks_like_body_text_after_header(normalized_title)
 
 
 def numbered_running_header_title_looks_like_structural_heading(title: str) -> bool:
@@ -500,15 +595,35 @@ def numbered_running_header_parts(line: str) -> tuple[int | None, str, str] | No
 
     match = TXT_CLEAN_NUMBERED_RUNNING_HEADER_RE.fullmatch(normalized_line)
     if match:
+        page_number_token = match.group("page_number")
+        if (
+            not page_number_token_has_decimal_digit(page_number_token)
+            and not page_number_token_has_header_separator(
+                normalized_line,
+                match.end("page_number"),
+            )
+        ):
+            return None
+
         title = match.group("title").strip()
-        page_number = parse_unicode_page_number(match.group("page_number"))
+        page_number = parse_unicode_page_number(page_number_token)
     else:
         match = TXT_CLEAN_TITLE_FIRST_RUNNING_HEADER_RE.fullmatch(normalized_line)
         if not match:
             return None
 
+        page_number_token = match.group("page_number")
+        if (
+            not page_number_token_has_decimal_digit(page_number_token)
+            and not page_number_token_has_header_separator(
+                normalized_line,
+                match.end("page_number"),
+            )
+        ):
+            return None
+
         title = match.group("title").strip()
-        page_number = parse_unicode_page_number(match.group("page_number"))
+        page_number = parse_unicode_page_number(page_number_token)
 
     if len(title) > TXT_CLEAN_NUMBERED_HEADER_MAX_TITLE_LENGTH:
         return None
@@ -518,7 +633,9 @@ def numbered_running_header_parts(line: str) -> tuple[int | None, str, str] | No
         return None
 
     normalized_title = normalize_numbered_running_header_title(title)
-    if not normalized_title:
+    if not normalized_title or not normalized_numbered_running_header_title_is_safe(
+        normalized_title
+    ):
         return None
 
     return page_number, title, normalized_title
@@ -550,7 +667,8 @@ def numbered_running_header_prefix_parts(
     if match:
         title = match.group("title").strip()
         body = match.group("body").strip()
-        page_number = parse_unicode_page_number(match.group("page_number"))
+        page_number_token = match.group("page_number")
+        page_number = parse_unicode_page_number(page_number_token)
 
         if (
             page_number is not None
@@ -560,14 +678,16 @@ def numbered_running_header_prefix_parts(
             and line_looks_like_body_text_after_header(body)
         ):
             normalized_title = normalize_numbered_running_header_title(title)
-            if normalized_title:
+            if normalized_title and normalized_numbered_running_header_title_is_safe(
+                normalized_title
+            ):
                 return page_number, title, normalized_title, body
 
     # Page-first with a visible separator and a learned-looking title followed
     # by lowercase body text, e.g. "151 Main Courses initially at least...".
     match = re.match(
         rf"^\s*{page_number_pattern}"
-        rf"(?:\s*{punct_pattern}\s*|\s+)"
+        rf"(?P<separator>\s*{punct_pattern}\s*|\s+)"
         rf"(?P<rest>\S.*)$",
         normalized_line,
         re.IGNORECASE,
@@ -575,7 +695,17 @@ def numbered_running_header_prefix_parts(
     if not match:
         return None
 
-    page_number = parse_unicode_page_number(match.group("page_number"))
+    page_number_token = match.group("page_number")
+    if (
+        not page_number_token_has_decimal_digit(page_number_token)
+        and not page_number_token_has_header_separator(
+            normalized_line,
+            match.end("page_number"),
+        )
+    ):
+        return None
+
+    page_number = parse_unicode_page_number(page_number_token)
     if page_number is None or page_number < TXT_CLEAN_SINGLE_NUMBERED_HEADER_MIN_PAGE:
         return None
 
@@ -617,7 +747,14 @@ def numbered_running_header_prefix_parts(
         return None
 
     normalized_title = normalize_numbered_running_header_title(title)
-    if not normalized_title:
+    if not normalized_title or not normalized_numbered_running_header_title_is_safe(
+        normalized_title
+    ):
+        return None
+    if (
+        len(normalized_title.split()) == 1
+        and not re.search(punct_pattern, match.group("separator"))
+    ):
         return None
 
     return page_number, title, normalized_title, body
@@ -724,6 +861,9 @@ def line_is_contextual_numbered_running_header(
         repeated_numbered_header_titles,
     ):
         return True
+
+    if numbered_running_header_title_looks_like_body_prose(title):
+        return False
 
     # Keep single low-number headings such as '1. Introduction' by default, but
     # still clean isolated book-page headers in small chunks such as
@@ -916,7 +1056,11 @@ def remove_leading_page_number_after_marker(
     if not match:
         return line, False
 
-    page_number = parse_unicode_page_number(match.group("page_number"))
+    page_number_token = match.group("page_number")
+    if not page_number_token_has_decimal_digit(page_number_token):
+        return line, False
+
+    page_number = parse_unicode_page_number(page_number_token)
     if page_number is None:
         return line, False
 
@@ -962,6 +1106,9 @@ def should_join_page_boundary(previous_text: str, next_text: str) -> bool:
     if not previous_text or not next_text:
         return False
 
+    if text_has_unclosed_double_quote(previous_text):
+        return True
+
     if ends_at_safe_boundary(previous_text):
         return False
 
@@ -972,6 +1119,11 @@ def should_join_page_boundary(previous_text: str, next_text: str) -> bool:
         return True
 
     return previous_text.endswith((",", ";", ":", "(", "[", "{"))
+
+
+def text_has_unclosed_double_quote(text: str) -> bool:
+    """Return True when text appears to end inside an open double quote."""
+    return text.count('"') % 2 == 1 or text.count("“") > text.count("”")
 
 
 def append_cleaned_line(
