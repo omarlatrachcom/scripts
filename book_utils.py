@@ -180,7 +180,7 @@ TXT_CLEAN_KINDLE_PROGRESS_RE = re.compile(
     )
     \s+
     (?:left|lett|lelt|1eft|ieft)
-    \s+in\s+chapter
+    \s+in\s+(?:chapter|book|b00k|bo0k)
     (?:\s+\d+\s*%?)?
     \s*
     """,
