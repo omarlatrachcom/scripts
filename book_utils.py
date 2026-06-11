@@ -20,7 +20,12 @@ Features:
    - Add as many page ranges as needed with the + button.
    - Each part is saved into the same folder as the selected PDF.
 
-4. TXT Cleaner
+4. Word to PDF
+   - Select one Word-format document.
+   - Converts it to PDF beside the original document.
+   - Uses LibreOffice headless conversion.
+
+5. TXT Cleaner
    - Select a folder containing TXT files.
    - Removes metadata lines containing configured markers.
    - Removes printed page numbers around generated page markers.
@@ -41,6 +46,7 @@ import importlib.util
 import json
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -59,6 +65,15 @@ PDF_OUTPUT_SUFFIX = "part"
 PDF_TEXT_OUTPUT_PREFIX = "chatgpt_pdf"
 PDF_TEXT_ERRORS_FILENAME = "chatgpt_pdf_errors.txt"
 PDF_TEXT_MANIFEST_FILENAME = "chatgpt_pdf_manifest.json"
+WORD_TO_PDF_TIMEOUT_SECONDS = 600
+WORD_DOCUMENT_EXTENSIONS = {
+    ".doc",
+    ".docx",
+    ".docm",
+    ".dot",
+    ".dotx",
+    ".dotm",
+}
 TXT_CLEAN_METADATA_LINE_RE = re.compile(
     r"^\s*###\s+(?:Source|Page)\b.*$",
     re.IGNORECASE,
@@ -333,6 +348,13 @@ class PDFTextResult:
 
 
 @dataclass(frozen=True)
+class WordPDFResult:
+    source_document: Path
+    output_pdf: Path
+    converter: str
+
+
+@dataclass(frozen=True)
 class TextCleanResult:
     cleaned_files: list[Path]
     scanned_files: int
@@ -356,6 +378,10 @@ class PDFSplitterError(BookUtilsError):
 
 class PDFTextExtractionError(BookUtilsError):
     """Raised for user-facing PDF text extraction failures."""
+
+
+class WordPDFConversionError(BookUtilsError):
+    """Raised for user-facing Word to PDF conversion failures."""
 
 
 class TextCleanerError(BookUtilsError):
@@ -3627,6 +3653,172 @@ def split_pdf(
     )
 
 
+def unique_word_pdf_output_path(word_path: Path) -> Path:
+    """Return a non-existing PDF path beside the selected Word document."""
+    output_path = word_path.with_suffix(".pdf")
+    if not output_path.exists():
+        return output_path
+
+    for counter in range(2, 10_000):
+        candidate = output_path.with_name(f"{output_path.stem}_{counter}.pdf")
+        if not candidate.exists():
+            return candidate
+
+    raise WordPDFConversionError(
+        f"Could not create a unique PDF output name for {word_path.name}."
+    )
+
+
+def process_error_details(result: subprocess.CompletedProcess[str]) -> str:
+    """Return useful stdout/stderr details for a failed converter process."""
+    details = "\n".join(
+        part.strip()
+        for part in (result.stdout, result.stderr)
+        if part and part.strip()
+    )
+    return details or f"exit code {result.returncode}"
+
+
+def remove_partial_output(path: Path) -> None:
+    """Remove a failed conversion output if one was created."""
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def find_libreoffice_executable() -> Path | None:
+    """Return the LibreOffice command-line executable when installed."""
+    candidates = [
+        shutil.which("soffice"),
+        shutil.which("libreoffice"),
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        str(Path.home() / "Applications/LibreOffice.app/Contents/MacOS/soffice"),
+        "/opt/homebrew/bin/soffice",
+        "/opt/homebrew/bin/libreoffice",
+        "/usr/local/bin/soffice",
+        "/usr/local/bin/libreoffice",
+    ]
+    seen: set[str] = set()
+
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+
+        seen.add(candidate)
+        path = Path(candidate)
+        if path.exists() and path.is_file():
+            return path
+
+    return None
+
+
+def convert_word_to_pdf_with_libreoffice(
+    word_path: Path,
+    output_path: Path,
+    soffice_path: Path,
+) -> None:
+    """Convert a Word document with LibreOffice headless mode."""
+    with tempfile.TemporaryDirectory(prefix="book_utils_word_pdf_") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        command = [
+            str(soffice_path),
+            "--headless",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            str(temp_dir),
+            str(word_path),
+        ]
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=WORD_TO_PDF_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise WordPDFConversionError(
+                "LibreOffice timed out while converting the document."
+            ) from exc
+        except OSError as exc:
+            raise WordPDFConversionError(f"Could not run LibreOffice: {exc}") from exc
+
+        if result.returncode != 0:
+            raise WordPDFConversionError(
+                f"LibreOffice conversion failed: {process_error_details(result)}"
+            )
+
+        expected_pdf = temp_dir / f"{word_path.stem}.pdf"
+        if expected_pdf.exists():
+            generated_pdf = expected_pdf
+        else:
+            pdfs = sorted(temp_dir.glob("*.pdf"), key=natural_sort_key)
+            if not pdfs:
+                raise WordPDFConversionError(
+                    "LibreOffice finished but did not create a PDF."
+                )
+            generated_pdf = pdfs[0]
+
+        shutil.copy2(generated_pdf, output_path)
+
+    if not output_path.exists():
+        raise WordPDFConversionError(
+            "LibreOffice finished but did not create a PDF."
+        )
+
+
+def convert_word_to_pdf(
+    word_path: Path,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> WordPDFResult:
+    """Convert one Word-format document to PDF beside the source file."""
+    if not word_path.exists() or not word_path.is_file():
+        raise WordPDFConversionError("Select a valid Word document first.")
+
+    if word_path.suffix.lower() not in WORD_DOCUMENT_EXTENSIONS:
+        raise WordPDFConversionError(
+            "The selected file must be a Word-format document."
+        )
+
+    soffice_path = find_libreoffice_executable()
+    if soffice_path is None:
+        raise WordPDFConversionError(
+            "LibreOffice is required for Word to PDF conversion. Install "
+            "LibreOffice, then try again."
+        )
+
+    if progress_callback:
+        progress_callback("Converting Word document with LibreOffice...", 0, 1)
+
+    output_path = unique_word_pdf_output_path(word_path)
+
+    try:
+        convert_word_to_pdf_with_libreoffice(
+            word_path=word_path,
+            output_path=output_path,
+            soffice_path=soffice_path,
+        )
+    except WordPDFConversionError as exc:
+        remove_partial_output(output_path)
+        raise WordPDFConversionError(
+            "Could not convert the Word document to PDF. Install LibreOffice, "
+            f"then try again.\n\nDetails:\n- {exc}"
+        ) from exc
+
+    if progress_callback:
+        progress_callback("Done.", 1, 1)
+
+    return WordPDFResult(
+        source_document=word_path,
+        output_pdf=output_path,
+        converter="LibreOffice",
+    )
+
+
 class BookUtilsApp:
     """Tkinter GUI application."""
 
@@ -3640,6 +3832,7 @@ class BookUtilsApp:
         self.selected_pdf_text_folder: Path | None = None
         self.selected_text_clean_folder: Path | None = None
         self.selected_pdf: Path | None = None
+        self.selected_word_doc: Path | None = None
         self.custom_clean_text = None
         self.running_header_title_entry = None
         self.pdf_part_rows: list[tuple[object, object, object]] = []
@@ -3655,6 +3848,7 @@ class BookUtilsApp:
         self.pdf_text_folder_var = tk.StringVar(value="No PDF folder selected")
         self.text_clean_folder_var = tk.StringVar(value="No TXT folder selected")
         self.pdf_var = tk.StringVar(value="No PDF selected")
+        self.word_doc_var = tk.StringVar(value="No Word document selected")
         self.pdf_pages_var = tk.StringVar(value="")
         self.capacity_var = tk.StringVar(value=str(DEFAULT_MODEL_TOKEN_CAPACITY))
         self.running_header_title_var = tk.StringVar(value="")
@@ -3676,8 +3870,8 @@ class BookUtilsApp:
             frame,
             text=(
                 "Convert JPG images or PDFs to ChatGPT-safe text chunks, clean TXT "
-                "metadata markers, or split a selected PDF into page ranges saved "
-                "beside the original file."
+                "metadata markers, split a selected PDF into page ranges, or convert "
+                "a Word document to PDF beside the original file."
             ),
             wraplength=700,
         )
@@ -3690,15 +3884,18 @@ class BookUtilsApp:
         pdf_text_tab = self.ttk.Frame(notebook, padding=12)
         text_clean_tab = self.ttk.Frame(notebook, padding=12)
         pdf_tab = self.ttk.Frame(notebook, padding=12)
+        word_pdf_tab = self.ttk.Frame(notebook, padding=12)
         notebook.add(ocr_tab, text="JPG to TXT")
         notebook.add(pdf_text_tab, text="PDF to TXT")
         notebook.add(text_clean_tab, text="Clean TXT")
         notebook.add(pdf_tab, text="Split PDF")
+        notebook.add(word_pdf_tab, text="Word to PDF")
 
         self._build_ocr_tab(ocr_tab)
         self._build_pdf_text_tab(pdf_text_tab)
         self._build_text_clean_tab(text_clean_tab)
         self._build_pdf_tab(pdf_tab)
+        self._build_word_pdf_tab(word_pdf_tab)
 
         self.progress_bar = self.ttk.Progressbar(
             frame,
@@ -4030,6 +4227,51 @@ class BookUtilsApp:
 
         self.add_pdf_part_row(default_start="1", default_end="")
 
+    def _build_word_pdf_tab(self, parent) -> None:
+        description = self.ttk.Label(
+            parent,
+            text=(
+                "Select a Word-format document. The app converts it to PDF and "
+                "saves the PDF in the same folder as the selected document."
+            ),
+            wraplength=660,
+        )
+        description.pack(anchor="w", pady=(0, 14))
+
+        doc_row = self.ttk.Frame(parent)
+        doc_row.pack(fill="x", pady=(0, 12))
+
+        self.select_word_doc_button = self.ttk.Button(
+            doc_row,
+            text="Select Word File",
+            command=self.select_word_doc,
+        )
+        self.select_word_doc_button.pack(side="left")
+
+        doc_label = self.ttk.Label(
+            doc_row,
+            textvariable=self.word_doc_var,
+            wraplength=500,
+        )
+        doc_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
+
+        hint = self.ttk.Label(
+            parent,
+            text=(
+                "Supported files: .doc, .docx, .docm, .dot, .dotx, .dotm. "
+                "Requires LibreOffice to be installed."
+            ),
+            wraplength=660,
+        )
+        hint.pack(anchor="w", pady=(0, 12))
+
+        self.word_pdf_button = self.ttk.Button(
+            parent,
+            text="Convert to PDF",
+            command=self.start_word_pdf_conversion,
+        )
+        self.word_pdf_button.pack(anchor="w")
+
     def _on_pdf_parts_frame_configure(self, _event=None) -> None:
         """Update the PDF parts scrollable region after rows are added/removed."""
         if not hasattr(self, "pdf_parts_canvas"):
@@ -4163,6 +4405,29 @@ class BookUtilsApp:
             if hasattr(start_var, "set") and hasattr(end_var, "set"):
                 start_var.set("1")
                 end_var.set(str(total_pages))
+
+    def select_word_doc(self) -> None:
+        from tkinter import filedialog
+
+        file_name = filedialog.askopenfilename(
+            parent=self.root,
+            title="Select Word document to convert",
+            filetypes=[
+                (
+                    "Word documents",
+                    "*.doc *.docx *.docm *.dot *.dotx *.dotm",
+                ),
+                ("All files", "*.*"),
+            ],
+        )
+
+        if not file_name:
+            return
+
+        word_path = Path(file_name)
+        self.selected_word_doc = word_path
+        self.word_doc_var.set(str(word_path))
+        self.status_var.set("Word document selected. Click Convert to PDF to start.")
 
     def add_pdf_part_row(self, default_start: str = "", default_end: str = "") -> None:
         row_frame = self.ttk.Frame(self.parts_frame)
@@ -4454,6 +4719,41 @@ class BookUtilsApp:
 
         self.root.after(0, self._show_pdf_success, result)
 
+    def start_word_pdf_conversion(self) -> None:
+        from tkinter import messagebox
+
+        if self.is_running:
+            return
+
+        if self.selected_word_doc is None:
+            messagebox.showwarning(
+                title="No Word document selected",
+                message="Please click Select Word Doc first.",
+                parent=self.root,
+            )
+            return
+
+        self._set_running_state(True, "Starting Word to PDF conversion...")
+
+        worker = threading.Thread(
+            target=self._run_word_pdf_worker,
+            args=(self.selected_word_doc,),
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_word_pdf_worker(self, word_path: Path) -> None:
+        try:
+            result = convert_word_to_pdf(
+                word_path=word_path,
+                progress_callback=self._thread_safe_progress,
+            )
+        except Exception as exc:
+            self.root.after(0, self._show_error, exc)
+            return
+
+        self.root.after(0, self._show_word_pdf_success, result)
+
     def _thread_safe_progress(self, message: str, value: int, maximum: int) -> None:
         self.root.after(0, self._update_progress, message, value, maximum)
 
@@ -4525,6 +4825,23 @@ class BookUtilsApp:
         )
 
 
+    def _show_word_pdf_success(self, result: WordPDFResult) -> None:
+        from tkinter import messagebox
+
+        self._update_progress("Done.", 1, 1)
+        self._set_running_state(False)
+
+        messagebox.showinfo(
+            title="Done",
+            message=(
+                "Converted Word document to PDF.\n"
+                f"Converter: {result.converter}\n\n"
+                f"Saved as:\n{result.output_pdf}"
+            ),
+            parent=self.root,
+        )
+
+
     def _show_pdf_success(self, result: PDFSplitResult) -> None:
         from tkinter import messagebox
 
@@ -4574,6 +4891,8 @@ class BookUtilsApp:
         self.select_pdf_button.configure(state=state)
         self.add_part_button.configure(state=state)
         self.split_pdf_button.configure(state=state)
+        self.select_word_doc_button.configure(state=state)
+        self.word_pdf_button.configure(state=state)
 
         for frame, _start_var, _end_var in self.pdf_part_rows:
             for child in frame.winfo_children():
