@@ -26,6 +26,7 @@ import subprocess
 import shutil
 import tkinter as tk
 from dataclasses import dataclass
+from datetime import date
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from typing import List, Optional, Dict, Tuple
 from pathlib import Path
@@ -33,6 +34,7 @@ from pathlib import Path
 # ------------- CONFIG -------------
 
 MAX_LINES_PER_CHUNK = 150  # subtitle text lines per tab/chunk
+DEFAULT_MODEL_NAME = "GPT-5.5 High"
 
 VIDEO_EXTENSIONS = [".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".mpeg", ".mpg"]
 
@@ -149,6 +151,11 @@ PROMPT_TEXT = _PROMPT_RAW.strip()
 PROMPT_ONE_LINE = " ".join(_PROMPT_RAW.splitlines())
 
 APP_CLASS_NAME = "SRTTranslator"
+
+
+def default_model_text(today: Optional[date] = None) -> str:
+    today = today or date.today()
+    return f"used {DEFAULT_MODEL_NAME} on {today:%a} {today.day} {today:%b %Y}"
 
 
 def apply_app_icon(root: tk.Tk, preferred_names: list[str]) -> None:
@@ -1508,7 +1515,7 @@ class SRTTranslatorGUI:
                 )
                 return
 
-            default_model = "GPT-5.4 Thinking"
+            default_model = default_model_text()
             model_text = simpledialog.askstring(
                 "Bilingual ASS",
                 "Model text to show near the end of the ASS file:",
@@ -1607,7 +1614,7 @@ class SRTTranslatorGUI:
                 )
                 return
 
-            default_model = "GPT-5.4 Thinking"
+            default_model = default_model_text()
             model_text = simpledialog.askstring(
                 "Arabic-only ASS",
                 "Model text to show near the end of the ASS file:",
@@ -1719,4 +1726,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
