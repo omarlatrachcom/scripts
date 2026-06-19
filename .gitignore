@@ -1,3 +1,5 @@
 .DS_Store
 __pycache__/
 *.py[cod]
+youtube_channel_views_report.html
+youtube_channel_views_hidden_videos.json

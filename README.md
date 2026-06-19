@@ -96,6 +96,74 @@ brew install node
 Use it when you want a GUI for repeatable YouTube/playlist downloads without
 typing long `yt-dlp` commands.
 
+### `youtube_channel_views_browser.py`
+
+YouTube Channel Views Browser builds a local HTML report from channels listed in
+`youtube_channel_views_config.json`.
+
+What it does:
+
+- Reads `min_views` and `channels` from the JSON config file.
+- Lets you enable or disable individual channels from the GUI before fetching.
+- Fetches channel video metadata with `yt-dlp`.
+- Filters out videos below the configured minimum view count.
+- Sorts matching videos by view count, highest first.
+- Writes `youtube_channel_views_report.html` and opens it in the browser.
+- Adds a `Hide` button beside each video in the report. Hidden-video records
+  are stored in `youtube_channel_views_hidden_videos.json` and are filtered out
+  of future reports.
+- Auto-installs `yt-dlp` and `yt-dlp-ejs` on first run if they are missing.
+  Dependencies are kept in a private environment at
+  `~/Library/Application Support/YouTubeChannelViewsBrowser/venv`.
+- Opens as a GUI by default. Fetching starts only when you click
+  `Fetch Videos`.
+
+Open the GUI from Terminal:
+
+```bash
+python3 youtube_channel_views_browser.py
+```
+
+Or double-click `YouTube Channel Views Browser.command` from Finder.
+In the Channels table, select one or more rows and use `Enable`, `Disable`, or
+`Toggle`. Disabled channels stay in the config but are skipped during fetching.
+In the generated report, click `Hide` beside any video to keep it from appearing
+in future reports. This writes to the external hidden-video JSON file shown in
+the GUI and report. Edit that JSON file or remove entries from it if you need to
+reverse a hide. Keep the GUI open while clicking `Hide`; the report writes to
+the file through the GUI's local helper.
+
+If YouTube shows `Sign in to confirm you're not a bot`, keep
+`cookies_from_browser` enabled in `youtube_channel_views_config.json`. The
+current config uses Chrome:
+
+```json
+"cookies_from_browser": "chrome"
+```
+
+Change it to the browser where you are signed into YouTube, for example
+`"safari"`, `"firefox"`, `"brave"`, or `"edge"`. If you prefer a cookies export
+file, set `cookies_from_browser` to `null` and set `cookies_file` to the
+cookies.txt path. Safari may require extra macOS privacy permissions, so Chrome
+is usually easier if you are signed into YouTube there.
+
+For a quick test run, limit how many videos are scanned per channel:
+
+```bash
+python3 youtube_channel_views_browser.py --cli --limit 25
+```
+
+`min_views` accepts values like `50000`, `50k`, or `1.2m`.
+For large channels, set `max_videos_per_channel` in the config to a number like
+`100` or `250` if you want a faster partial scan. Leave it as `null` to scan
+everything.
+
+To force dependency updates later:
+
+```bash
+python3 youtube_channel_views_browser.py --update-deps
+```
+
 ### `srt_translator_gui_mac.py`
 
 SRT Translator is a subtitle translation helper for creating Arabic subtitles
@@ -220,6 +288,27 @@ PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
 nohup "$PYTHON_BIN" "$SCRIPT_DIR/$SCRIPT_NAME" > "$LOG_DIR/smart-ytdlp-downloader.log" 2>&1 &
 ```
 
+### YouTube Channel Views Browser Automator Launcher
+
+```bash
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PYTHONUNBUFFERED=1
+
+SCRIPT_DIR="$HOME/Documents/scripts"
+SCRIPT_NAME="youtube_channel_views_browser.py"
+LOG_DIR="$HOME/Library/Logs/scripts-apps"
+APP_VENV_PYTHON="$HOME/Library/Application Support/YouTubeChannelViewsBrowser/venv/bin/python"
+mkdir -p "$LOG_DIR"
+
+cd "$SCRIPT_DIR" || exit 1
+if [ -x "$APP_VENV_PYTHON" ]; then
+  PYTHON_BIN="$APP_VENV_PYTHON"
+else
+  PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
+fi
+nohup "$PYTHON_BIN" -u "$SCRIPT_DIR/$SCRIPT_NAME" > "$LOG_DIR/youtube-channel-views.log" 2>&1 &
+```
+
 ### SRT Translator Automator Launcher
 
 ```bash
@@ -268,4 +357,3 @@ If an Automator app opens and immediately closes:
 ```bash
 PYTHON_BIN="/opt/homebrew/bin/python3"
 ```
-
