@@ -13,6 +13,9 @@
       "report_file": "youtube_channel_views_books_report.html",
       "saved_videos_file": "youtube_channel_views_books_saved_videos.json",
       "recent_saved_videos_file": "youtube_channel_views_books_recent_saved_videos.json",
+      "extra_saved_videos_files": [
+        "youtube_channel_views_books_novels_saved_videos.json"
+      ],
       "channels": [
         {
           "enabled": true,

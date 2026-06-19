@@ -108,6 +108,7 @@ class ThemeConfig:
     report_file: Path
     saved_videos_file: Path
     recent_saved_videos_file: Path
+    extra_saved_videos_files: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,7 @@ class Config:
     report_file: Path = DEFAULT_OUTPUT_PATH
     saved_videos_file: Path = DEFAULT_SAVED_VIDEOS_PATH
     recent_saved_videos_file: Path = DEFAULT_RECENT_SAVED_VIDEOS_PATH
+    extra_saved_videos_files: tuple[Path, ...] = ()
     config_dir: Path = SCRIPT_DIR
     theme_name: str = DEFAULT_THEME_NAME
     themes: tuple[ThemeConfig, ...] = ()
@@ -237,6 +239,27 @@ def optional_path(value: Any, config_dir: Path) -> Path | None:
     return path
 
 
+def optional_path_list(value: Any, config_dir: Path, field_name: str) -> tuple[Path, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        path = optional_path(value, config_dir)
+        return () if path is None else (path,)
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a JSON list.")
+
+    paths: list[Path] = []
+    for index, item in enumerate(value):
+        if item is None:
+            continue
+        if not isinstance(item, str):
+            raise ValueError(f"{field_name}[{index}] must be a file path string.")
+        path = optional_path(item, config_dir)
+        if path is not None:
+            paths.append(path)
+    return tuple(paths)
+
+
 def optional_cookie_file(value: Any, config_dir: Path) -> Path | None:
     return optional_path(value, config_dir)
 
@@ -328,6 +351,11 @@ def parse_theme_config(value: Any, index: int, config_dir: Path, fallback_name: 
         value.get("recent_saved_videos_file"),
         config_dir,
     ) or default_recent_saved_videos_file_for_theme(name, config_dir)
+    extra_saved_videos_files = optional_path_list(
+        value.get("extra_saved_videos_files", value.get("additional_saved_videos_files")),
+        config_dir,
+        f"themes[{index}].extra_saved_videos_files",
+    )
 
     return ThemeConfig(
         name=name,
@@ -335,6 +363,7 @@ def parse_theme_config(value: Any, index: int, config_dir: Path, fallback_name: 
         report_file=report_file,
         saved_videos_file=saved_videos_file,
         recent_saved_videos_file=recent_saved_videos_file,
+        extra_saved_videos_files=extra_saved_videos_files,
     )
 
 
@@ -407,13 +436,19 @@ def channel_config_to_json(channel: ChannelConfig) -> dict[str, Any]:
 
 
 def theme_config_to_json(theme: ThemeConfig, config_dir: Path) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "name": theme.name,
         "report_file": path_text_relative_to(theme.report_file, config_dir),
         "saved_videos_file": path_text_relative_to(theme.saved_videos_file, config_dir),
         "recent_saved_videos_file": path_text_relative_to(theme.recent_saved_videos_file, config_dir),
         "channels": [channel_config_to_json(channel) for channel in theme.channels],
     }
+    if theme.extra_saved_videos_files:
+        payload["extra_saved_videos_files"] = [
+            path_text_relative_to(path, config_dir)
+            for path in theme.extra_saved_videos_files
+        ]
+    return payload
 
 
 def load_video_records(path: Path) -> dict[str, dict[str, Any]]:
@@ -490,6 +525,32 @@ def normalize_video_record(data: dict[str, Any]) -> dict[str, Any]:
 
 def load_saved_video_records(path: Path) -> dict[str, dict[str, Any]]:
     return load_video_records(path)
+
+
+def unique_video_store_paths(paths: tuple[Path, ...]) -> tuple[Path, ...]:
+    unique_paths: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        expanded = path.expanduser()
+        try:
+            key = expanded.resolve(strict=False)
+        except OSError:
+            key = expanded
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_paths.append(path)
+    return tuple(unique_paths)
+
+
+def saved_video_filter_files(config: Config) -> tuple[Path, ...]:
+    return unique_video_store_paths(
+        (
+            config.saved_videos_file,
+            config.recent_saved_videos_file,
+            *config.extra_saved_videos_files,
+        )
+    )
 
 
 def write_saved_video_records(path: Path, records: dict[str, dict[str, Any]]) -> None:
@@ -639,6 +700,11 @@ def load_config(path: Path) -> Config:
                     or default_saved_videos_file_for_theme(fallback_theme_name, path.parent),
                     recent_saved_videos_file=optional_path(raw.get("recent_saved_videos_file"), path.parent)
                     or default_recent_saved_videos_file_for_theme(fallback_theme_name, path.parent),
+                    extra_saved_videos_files=optional_path_list(
+                        raw.get("extra_saved_videos_files", raw.get("additional_saved_videos_files")),
+                        path.parent,
+                        "extra_saved_videos_files",
+                    ),
                 )
             ]
         active_theme_name = optional_string(raw.get("active_theme") or raw.get("theme"))
@@ -663,6 +729,7 @@ def load_config(path: Path) -> Config:
         report_file=selected_theme.report_file,
         saved_videos_file=selected_theme.saved_videos_file,
         recent_saved_videos_file=selected_theme.recent_saved_videos_file,
+        extra_saved_videos_files=selected_theme.extra_saved_videos_files,
         config_dir=path.parent,
         theme_name=selected_theme.name,
         themes=tuple(themes),
@@ -1192,6 +1259,11 @@ def render_html(
     unique_report_video_count = len({video.video_id for video in [*videos_by_views, *recent_videos]})
     saved_file_text = escape(path_text_relative_to(config.saved_videos_file, config.config_dir))
     recent_saved_file_text = escape(path_text_relative_to(config.recent_saved_videos_file, config.config_dir))
+    extra_saved_file_html = "".join(
+        "\n        "
+        f"<span>Extra saved store: <code>{escape(path_text_relative_to(path, config.config_dir))}</code></span>"
+        for path in config.extra_saved_videos_files
+    )
     theme_name = escape(config.theme_name)
 
     return f"""<!doctype html>
@@ -1374,6 +1446,7 @@ def render_html(
       <div class="report-controls">
         <span>Most-viewed saved videos: <code>{saved_file_text}</code></span>
         <span>Recent saved videos: <code>{recent_saved_file_text}</code></span>
+        {extra_saved_file_html}
         <span id="action-status"></span>
       </div>
       {render_video_table(
@@ -1499,6 +1572,7 @@ def apply_arg_overrides(config: Config, args: argparse.Namespace) -> Config:
             report_file=selected_theme.report_file,
             saved_videos_file=selected_theme.saved_videos_file,
             recent_saved_videos_file=selected_theme.recent_saved_videos_file,
+            extra_saved_videos_files=selected_theme.extra_saved_videos_files,
             theme_name=selected_theme.name,
         )
     if getattr(args, "recent_min_views", None) is not None:
@@ -1605,16 +1679,18 @@ def build_report(
             f"videos from {channel_stats.title}"
         )
 
-    saved_records = load_saved_video_records(config.saved_videos_file)
-    recent_saved_records = load_saved_video_records(config.recent_saved_videos_file)
-    ignored_video_ids = set(saved_records) | set(recent_saved_records)
+    saved_store_files = saved_video_filter_files(config)
+    ignored_video_ids: set[str] = set()
+    for store_file in saved_store_files:
+        ignored_video_ids.update(load_saved_video_records(store_file))
     if ignored_video_ids:
         before_count = len(all_videos)
         all_videos = [video for video in all_videos if video.video_id not in ignored_video_ids]
         filtered_count = before_count - len(all_videos)
         if filtered_count:
             logger(
-                f"Filtered out {format_count(filtered_count)} saved video(s) from saved stores."
+                f"Filtered out {format_count(filtered_count)} saved video(s) from "
+                f"{format_count(len(saved_store_files))} saved store(s)."
             )
 
     videos_by_views = [video for video in all_videos if video.view_count >= config.min_views]
@@ -2077,6 +2153,12 @@ def launch_gui(args: argparse.Namespace) -> int:
 
         def theme_from_form(self, name: str) -> ThemeConfig:
             config_dir = self.config_dir()
+            existing_index = self.theme_index(name)
+            extra_saved_videos_files = (
+                self.themes[existing_index].extra_saved_videos_files
+                if existing_index is not None
+                else ()
+            )
             report_file = optional_path(self.output_var.get(), config_dir) or default_report_file_for_theme(
                 name,
                 config_dir,
@@ -2095,6 +2177,7 @@ def launch_gui(args: argparse.Namespace) -> int:
                 report_file=report_file,
                 saved_videos_file=saved_videos_file,
                 recent_saved_videos_file=recent_saved_videos_file,
+                extra_saved_videos_files=extra_saved_videos_files,
             )
 
         def capture_current_theme(self) -> None:
@@ -2156,6 +2239,7 @@ def launch_gui(args: argparse.Namespace) -> int:
                 report_file=default_report_file_for_theme(name, config_dir),
                 saved_videos_file=default_saved_videos_file_for_theme(name, config_dir),
                 recent_saved_videos_file=default_recent_saved_videos_file_for_theme(name, config_dir),
+                extra_saved_videos_files=(),
             )
             self.themes.append(theme)
             self.current_theme_name = name
@@ -2187,6 +2271,7 @@ def launch_gui(args: argparse.Namespace) -> int:
                 report_file=old_theme.report_file,
                 saved_videos_file=old_theme.saved_videos_file,
                 recent_saved_videos_file=old_theme.recent_saved_videos_file,
+                extra_saved_videos_files=old_theme.extra_saved_videos_files,
             )
             self.themes[index] = renamed
             self.current_theme_name = name
@@ -2322,6 +2407,7 @@ def launch_gui(args: argparse.Namespace) -> int:
                     report_file=config.report_file,
                     saved_videos_file=config.saved_videos_file,
                     recent_saved_videos_file=config.recent_saved_videos_file,
+                    extra_saved_videos_files=config.extra_saved_videos_files,
                 )
             ]
             self.current_theme_name = config.theme_name
@@ -2333,6 +2419,7 @@ def launch_gui(args: argparse.Namespace) -> int:
                     report_file=config.report_file,
                     saved_videos_file=config.saved_videos_file,
                     recent_saved_videos_file=config.recent_saved_videos_file,
+                    extra_saved_videos_files=config.extra_saved_videos_files,
                 )
             )
             if show_status:
@@ -2352,6 +2439,7 @@ def launch_gui(args: argparse.Namespace) -> int:
                         report_file=default_report_file_for_theme(DEFAULT_THEME_NAME, config_dir),
                         saved_videos_file=default_saved_videos_file_for_theme(DEFAULT_THEME_NAME, config_dir),
                         recent_saved_videos_file=default_recent_saved_videos_file_for_theme(DEFAULT_THEME_NAME, config_dir),
+                        extra_saved_videos_files=(),
                     )
                 ]
                 self.current_theme_name = DEFAULT_THEME_NAME
@@ -2379,6 +2467,7 @@ def launch_gui(args: argparse.Namespace) -> int:
                 report_file=selected_theme.report_file,
                 saved_videos_file=selected_theme.saved_videos_file,
                 recent_saved_videos_file=selected_theme.recent_saved_videos_file,
+                extra_saved_videos_files=selected_theme.extra_saved_videos_files,
                 config_dir=config_dir,
                 theme_name=selected_theme.name,
                 themes=tuple(self.themes),
