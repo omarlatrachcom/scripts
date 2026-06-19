@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Fetch videos from configured YouTube channels, sort them by view count, and
-open a local HTML report in the browser.
+Fetch videos from configured YouTube channels, sort them by view count and
+published date, and open a local HTML report in the browser.
 
 The script installs its own Python metadata dependencies on first run if they
 are missing:
@@ -44,8 +44,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "youtube_channel_views_config.json"
 DEFAULT_REPORT_FILENAME = "youtube_channel_views_report.html"
 DEFAULT_OUTPUT_PATH = SCRIPT_DIR / DEFAULT_REPORT_FILENAME
-DEFAULT_HIDDEN_VIDEOS_FILENAME = "youtube_channel_views_hidden_videos.json"
-DEFAULT_HIDDEN_VIDEOS_PATH = SCRIPT_DIR / DEFAULT_HIDDEN_VIDEOS_FILENAME
+DEFAULT_SAVED_VIDEOS_FILENAME = "youtube_channel_views_saved_videos.json"
+DEFAULT_SAVED_VIDEOS_PATH = SCRIPT_DIR / DEFAULT_SAVED_VIDEOS_FILENAME
+DEFAULT_RECENT_SAVED_VIDEOS_FILENAME = "youtube_channel_views_recent_saved_videos.json"
+DEFAULT_RECENT_SAVED_VIDEOS_PATH = SCRIPT_DIR / DEFAULT_RECENT_SAVED_VIDEOS_FILENAME
 DEFAULT_THEME_NAME = "Default"
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "YouTubeChannelViewsBrowser"
 VENV_DIR = APP_SUPPORT_DIR / "venv"
@@ -55,6 +57,7 @@ SUPPORTED_COOKIE_BROWSERS = {"brave", "chrome", "chromium", "edge", "firefox", "
 
 DEFAULT_CONFIG = {
     "min_views": "50k",
+    "recent_min_views": "10k",
     "max_videos_per_channel": None,
     "cookies_from_browser": "chrome",
     "browser_profile": None,
@@ -65,7 +68,8 @@ DEFAULT_CONFIG = {
         {
             "name": DEFAULT_THEME_NAME,
             "report_file": DEFAULT_REPORT_FILENAME,
-            "hidden_videos_file": DEFAULT_HIDDEN_VIDEOS_FILENAME,
+            "saved_videos_file": DEFAULT_SAVED_VIDEOS_FILENAME,
+            "recent_saved_videos_file": DEFAULT_RECENT_SAVED_VIDEOS_FILENAME,
             "channels": [
                 {"enabled": True, "url": "https://www.youtube.com/@audiobookbelaraby/videos"},
                 {"enabled": True, "url": "https://www.youtube.com/@EslamAdel/videos"},
@@ -102,12 +106,14 @@ class ThemeConfig:
     name: str
     channels: list[ChannelConfig]
     report_file: Path
-    hidden_videos_file: Path
+    saved_videos_file: Path
+    recent_saved_videos_file: Path
 
 
 @dataclass(frozen=True)
 class Config:
     min_views: int
+    recent_min_views: int
     channels: list[ChannelConfig]
     max_videos_per_channel: int | None = None
     fetch_missing_view_counts: bool = True
@@ -118,7 +124,8 @@ class Config:
     browser_container: str | None = None
     cookies_file: Path | None = None
     report_file: Path = DEFAULT_OUTPUT_PATH
-    hidden_videos_file: Path = DEFAULT_HIDDEN_VIDEOS_PATH
+    saved_videos_file: Path = DEFAULT_SAVED_VIDEOS_PATH
+    recent_saved_videos_file: Path = DEFAULT_RECENT_SAVED_VIDEOS_PATH
     config_dir: Path = SCRIPT_DIR
     theme_name: str = DEFAULT_THEME_NAME
     themes: tuple[ThemeConfig, ...] = ()
@@ -134,6 +141,8 @@ class Video:
     channel_url: str
     duration: str
     published: str
+    published_sort_value: int
+    source_order: int
     thumbnail_url: str
 
 
@@ -311,16 +320,21 @@ def parse_theme_config(value: Any, index: int, config_dir: Path, fallback_name: 
         value.get("report_file") or value.get("output_file"),
         config_dir,
     ) or default_report_file_for_theme(name, config_dir)
-    hidden_videos_file = optional_path(
-        value.get("hidden_videos_file"),
+    saved_videos_file = optional_path(
+        value.get("saved_videos_file"),
         config_dir,
-    ) or default_hidden_videos_file_for_theme(name, config_dir)
+    ) or default_saved_videos_file_for_theme(name, config_dir)
+    recent_saved_videos_file = optional_path(
+        value.get("recent_saved_videos_file"),
+        config_dir,
+    ) or default_recent_saved_videos_file_for_theme(name, config_dir)
 
     return ThemeConfig(
         name=name,
         channels=channels,
         report_file=report_file,
-        hidden_videos_file=hidden_videos_file,
+        saved_videos_file=saved_videos_file,
+        recent_saved_videos_file=recent_saved_videos_file,
     )
 
 
@@ -373,10 +387,16 @@ def default_report_file_for_theme(name: str, config_dir: Path) -> Path:
     return config_dir / f"youtube_channel_views_{slugify_theme_name(name)}_report.html"
 
 
-def default_hidden_videos_file_for_theme(name: str, config_dir: Path) -> Path:
+def default_saved_videos_file_for_theme(name: str, config_dir: Path) -> Path:
     if name == DEFAULT_THEME_NAME:
-        return config_dir / DEFAULT_HIDDEN_VIDEOS_FILENAME
-    return config_dir / f"youtube_channel_views_{slugify_theme_name(name)}_hidden_videos.json"
+        return config_dir / DEFAULT_SAVED_VIDEOS_FILENAME
+    return config_dir / f"youtube_channel_views_{slugify_theme_name(name)}_saved_videos.json"
+
+
+def default_recent_saved_videos_file_for_theme(name: str, config_dir: Path) -> Path:
+    if name == DEFAULT_THEME_NAME:
+        return config_dir / DEFAULT_RECENT_SAVED_VIDEOS_FILENAME
+    return config_dir / f"youtube_channel_views_{slugify_theme_name(name)}_recent_saved_videos.json"
 
 
 def channel_config_to_json(channel: ChannelConfig) -> dict[str, Any]:
@@ -390,12 +410,13 @@ def theme_config_to_json(theme: ThemeConfig, config_dir: Path) -> dict[str, Any]
     return {
         "name": theme.name,
         "report_file": path_text_relative_to(theme.report_file, config_dir),
-        "hidden_videos_file": path_text_relative_to(theme.hidden_videos_file, config_dir),
+        "saved_videos_file": path_text_relative_to(theme.saved_videos_file, config_dir),
+        "recent_saved_videos_file": path_text_relative_to(theme.recent_saved_videos_file, config_dir),
         "channels": [channel_config_to_json(channel) for channel in theme.channels],
     }
 
 
-def load_hidden_video_records(path: Path) -> dict[str, dict[str, Any]]:
+def load_video_records(path: Path) -> dict[str, dict[str, Any]]:
     try:
         raw = json.loads(path.expanduser().read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -429,7 +450,7 @@ def load_hidden_video_records(path: Path) -> dict[str, dict[str, Any]]:
     return records
 
 
-def write_hidden_video_records(path: Path, records: dict[str, dict[str, Any]]) -> None:
+def write_video_records(path: Path, records: dict[str, dict[str, Any]]) -> None:
     path = path.expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -441,7 +462,7 @@ def write_hidden_video_records(path: Path, records: dict[str, dict[str, Any]]) -
     tmp_path.replace(path)
 
 
-def normalize_hidden_video_record(data: dict[str, Any]) -> dict[str, Any]:
+def normalize_video_record(data: dict[str, Any]) -> dict[str, Any]:
     video_id = str(data.get("video_id") or data.get("id") or "").strip()
     url = str(data.get("url") or "").strip()
     if not video_id:
@@ -449,17 +470,38 @@ def normalize_hidden_video_record(data: dict[str, Any]) -> dict[str, Any]:
     if not video_id:
         raise ValueError("Missing video_id or URL.")
 
-    return {
+    record: dict[str, Any] = {
         "video_id": video_id,
         "title": str(data.get("title") or "").strip(),
         "url": url,
         "channel": str(data.get("channel") or "").strip(),
-        "hidden_at": datetime.now().isoformat(timespec="seconds"),
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
     }
 
+    view_count = coerce_optional_count(data.get("view_count"))
+    if view_count is not None:
+        record["view_count"] = view_count
+    for key in ("published", "duration"):
+        text = str(data.get(key) or "").strip()
+        if text:
+            record[key] = text
+    return record
 
-class HideVideoRequestHandler(BaseHTTPRequestHandler):
-    server_version = "YouTubeChannelViewsHideServer/1.0"
+
+def load_saved_video_records(path: Path) -> dict[str, dict[str, Any]]:
+    return load_video_records(path)
+
+
+def write_saved_video_records(path: Path, records: dict[str, dict[str, Any]]) -> None:
+    write_video_records(path, records)
+
+
+def normalize_saved_video_record(data: dict[str, Any]) -> dict[str, Any]:
+    return normalize_video_record(data)
+
+
+class VideoActionRequestHandler(BaseHTTPRequestHandler):
+    server_version = "YouTubeChannelViewsActionServer/1.0"
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -483,7 +525,15 @@ class HideVideoRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
-        if self.path != "/hide-video":
+        if self.path == "/save-video":
+            storage_attr = "saved_videos_file"
+            response_key = "saved_videos_file"
+            store_name = "saved"
+        elif self.path == "/save-recent-video":
+            storage_attr = "recent_saved_videos_file"
+            response_key = "recent_saved_videos_file"
+            store_name = "recent_saved"
+        else:
             self.send_json(404, {"ok": False, "error": "Not found"})
             return
 
@@ -493,34 +543,47 @@ class HideVideoRequestHandler(BaseHTTPRequestHandler):
             data = json.loads(raw_body) if raw_body else {}
             if not isinstance(data, dict):
                 raise ValueError("Expected a JSON object.")
-            record = normalize_hidden_video_record(data)
-            hidden_file = Path(getattr(self.server, "hidden_videos_file"))
-            records = load_hidden_video_records(hidden_file)
+            record = normalize_saved_video_record(data)
+            storage_file = Path(getattr(self.server, storage_attr))
+            records = load_video_records(storage_file)
             records[record["video_id"]] = record
-            write_hidden_video_records(hidden_file, records)
+            write_video_records(storage_file, records)
         except Exception as exc:
             self.send_json(400, {"ok": False, "error": str(exc)})
             return
 
-        base_dir = Path(getattr(self.server, "hidden_videos_base_dir", SCRIPT_DIR))
+        base_dir = Path(getattr(self.server, "video_records_base_dir", SCRIPT_DIR))
+        storage_file_text = path_text_relative_to(storage_file, base_dir)
         self.send_json(
             200,
             {
                 "ok": True,
+                "action": "save",
+                "store": store_name,
                 "video_id": record["video_id"],
-                "hidden_videos_file": path_text_relative_to(hidden_file, base_dir),
+                "store_file": storage_file_text,
+                response_key: storage_file_text,
                 "count": len(records),
             },
         )
 
 
-def start_hide_video_server(hidden_videos_file: Path, base_dir: Path = SCRIPT_DIR) -> tuple[ThreadingHTTPServer, str]:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), HideVideoRequestHandler)
-    server.hidden_videos_file = hidden_videos_file.expanduser()  # type: ignore[attr-defined]
-    server.hidden_videos_base_dir = base_dir.expanduser()  # type: ignore[attr-defined]
+def start_save_video_server(
+    saved_videos_file: Path,
+    recent_saved_videos_file: Path,
+    base_dir: Path = SCRIPT_DIR,
+) -> tuple[ThreadingHTTPServer, dict[str, str]]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), VideoActionRequestHandler)
+    server.saved_videos_file = saved_videos_file.expanduser()  # type: ignore[attr-defined]
+    server.recent_saved_videos_file = recent_saved_videos_file.expanduser()  # type: ignore[attr-defined]
+    server.video_records_base_dir = base_dir.expanduser()  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    return server, f"http://127.0.0.1:{server.server_port}/hide-video"
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    return server, {
+        "saved": f"{base_url}/save-video",
+        "recent_saved": f"{base_url}/save-recent-video",
+    }
 
 
 def ensure_default_config(path: Path) -> None:
@@ -540,6 +603,12 @@ def load_config(path: Path) -> Config:
 
     try:
         min_views = parse_count(raw.get("min_views", DEFAULT_CONFIG["min_views"]))
+        recent_min_views = parse_count(
+            raw.get(
+                "recent_min_views",
+                raw.get("min_recent_views", raw.get("recent_minimum_views", min_views)),
+            )
+        )
         max_videos_per_channel = optional_positive_int(
             raw.get("max_videos_per_channel"),
             "max_videos_per_channel",
@@ -553,24 +622,23 @@ def load_config(path: Path) -> Config:
         cookies_file = optional_cookie_file(raw.get("cookies_file"), path.parent)
         themes = parse_theme_configs(raw.get("themes"), path.parent)
         if not themes:
-            legacy_channels = parse_channel_configs(raw.get("channels", []))
-            if not legacy_channels:
+            fallback_channels = parse_channel_configs(raw.get("channels", []))
+            if not fallback_channels:
                 raise ValueError("channels cannot be empty.")
-            legacy_theme_name = optional_string(raw.get("active_theme") or raw.get("theme")) or DEFAULT_THEME_NAME
+            fallback_theme_name = optional_string(raw.get("active_theme") or raw.get("theme")) or DEFAULT_THEME_NAME
             themes = [
                 ThemeConfig(
-                    name=legacy_theme_name,
-                    channels=legacy_channels,
+                    name=fallback_theme_name,
+                    channels=fallback_channels,
                     report_file=optional_path(
                         raw.get("report_file") or raw.get("output_file"),
                         path.parent,
                     )
-                    or default_report_file_for_theme(legacy_theme_name, path.parent),
-                    hidden_videos_file=optional_path(
-                        raw.get("hidden_videos_file"),
-                        path.parent,
-                    )
-                    or default_hidden_videos_file_for_theme(legacy_theme_name, path.parent),
+                    or default_report_file_for_theme(fallback_theme_name, path.parent),
+                    saved_videos_file=optional_path(raw.get("saved_videos_file"), path.parent)
+                    or default_saved_videos_file_for_theme(fallback_theme_name, path.parent),
+                    recent_saved_videos_file=optional_path(raw.get("recent_saved_videos_file"), path.parent)
+                    or default_recent_saved_videos_file_for_theme(fallback_theme_name, path.parent),
                 )
             ]
         active_theme_name = optional_string(raw.get("active_theme") or raw.get("theme"))
@@ -582,6 +650,7 @@ def load_config(path: Path) -> Config:
 
     return Config(
         min_views=min_views,
+        recent_min_views=recent_min_views,
         channels=selected_theme.channels,
         max_videos_per_channel=max_videos_per_channel,
         fetch_missing_view_counts=fetch_missing_view_counts,
@@ -592,7 +661,8 @@ def load_config(path: Path) -> Config:
         browser_container=browser_container,
         cookies_file=cookies_file,
         report_file=selected_theme.report_file,
-        hidden_videos_file=selected_theme.hidden_videos_file,
+        saved_videos_file=selected_theme.saved_videos_file,
+        recent_saved_videos_file=selected_theme.recent_saved_videos_file,
         config_dir=path.parent,
         theme_name=selected_theme.name,
         themes=tuple(themes),
@@ -798,17 +868,32 @@ def format_duration(entry: dict[str, Any]) -> str:
 
 
 def format_published(entry: dict[str, Any]) -> str:
-    upload_date = entry.get("upload_date")
-    if isinstance(upload_date, str) and re.fullmatch(r"\d{8}", upload_date):
-        return f"{upload_date[0:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+    for key in ("upload_date", "release_date"):
+        raw_date = entry.get(key)
+        if isinstance(raw_date, str) and re.fullmatch(r"\d{8}", raw_date):
+            return f"{raw_date[0:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
 
-    timestamp = entry.get("timestamp")
-    if isinstance(timestamp, (int, float)):
-        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+    for key in ("timestamp", "release_timestamp", "modified_timestamp"):
+        timestamp = entry.get(key)
+        if isinstance(timestamp, (int, float)):
+            return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
     return ""
 
 
-def video_from_entry(entry: dict[str, Any], channel_title: str, channel_url: str) -> Video | None:
+def published_sort_value(entry: dict[str, Any]) -> int:
+    for key in ("upload_date", "release_date"):
+        raw_date = entry.get(key)
+        if isinstance(raw_date, str) and re.fullmatch(r"\d{8}", raw_date):
+            return int(raw_date)
+
+    for key in ("timestamp", "release_timestamp", "modified_timestamp"):
+        timestamp = entry.get(key)
+        if isinstance(timestamp, (int, float)):
+            return int(datetime.fromtimestamp(timestamp).strftime("%Y%m%d"))
+    return 0
+
+
+def video_from_entry(entry: dict[str, Any], channel_title: str, channel_url: str, source_order: int) -> Video | None:
     view_count = coerce_optional_count(entry.get("view_count"))
     if view_count is None:
         return None
@@ -828,6 +913,8 @@ def video_from_entry(entry: dict[str, Any], channel_title: str, channel_url: str
         channel_url=entry_channel_url,
         duration=format_duration(entry),
         published=format_published(entry),
+        published_sort_value=published_sort_value(entry),
+        source_order=source_order,
         thumbnail_url=best_thumbnail_url(entry),
     )
 
@@ -937,12 +1024,13 @@ def fetch_channel_videos(
 
     videos: list[Video] = []
     missing_view_count = 0
-    for entry in entries:
-        video = video_from_entry(entry, channel_title, channel_url)
+    candidate_min_views = min(config.min_views, config.recent_min_views)
+    for source_order, entry in enumerate(entries, start=1):
+        video = video_from_entry(entry, channel_title, channel_url, source_order)
         if video is None:
             missing_view_count += 1
             continue
-        if video.view_count >= config.min_views:
+        if video.view_count >= candidate_min_views:
             videos.append(video)
 
     return videos, ChannelStats(
@@ -973,7 +1061,7 @@ def render_channel_stats(stats: list[ChannelStats]) -> str:
             result = f"<span class=\"error\">{escape(stat.error)}</span>"
         else:
             parts = [
-                f"{format_count(stat.included)} included / {format_count(stat.scanned)} scanned"
+                f"{format_count(stat.included)} candidates / {format_count(stat.scanned)} scanned"
                 f" / {format_count(stat.missing_view_count)} missing views",
             ]
             if stat.auth_failed:
@@ -990,11 +1078,16 @@ def render_channel_stats(stats: list[ChannelStats]) -> str:
     return "\n".join(rows)
 
 
-def render_video_rows(videos: list[Video], *, hide_endpoint: str | None = None) -> str:
+def render_video_rows(
+    videos: list[Video],
+    *,
+    save_endpoint: str | None = None,
+    empty_message: str = "No videos met the configured minimum view count.",
+) -> str:
     if not videos:
         return (
             "<tr>"
-            "<td class=\"empty\" colspan=\"8\">No videos met the configured minimum view count.</td>"
+            f"<td class=\"empty\" colspan=\"8\">{escape(empty_message)}</td>"
             "</tr>"
         )
 
@@ -1006,12 +1099,15 @@ def render_video_rows(videos: list[Video], *, hide_endpoint: str | None = None) 
         channel_url = escape(video.channel_url)
         thumbnail = escape(video.thumbnail_url)
         video_id = escape(video.video_id)
-        if hide_endpoint:
-            action_html = "<button type=\"button\" class=\"hide-video\">Hide</button>"
+        published = escape(video.published)
+        duration = escape(video.duration)
+        if save_endpoint:
+            endpoint = escape(save_endpoint)
+            action_html = f"<button type=\"button\" class=\"save-video\" data-save-endpoint=\"{endpoint}\">Save</button>"
         else:
             action_html = (
-                "<button type=\"button\" class=\"hide-video\" disabled "
-                "title=\"Open this report from the GUI to enable hiding\">Hide</button>"
+                "<button type=\"button\" class=\"save-video\" disabled "
+                "title=\"Open this report from the GUI to enable saving\">Save</button>"
             )
         thumbnail_html = (
             f"<a href=\"{url}\" target=\"_blank\" rel=\"noopener\"><img src=\"{thumbnail}\" alt=\"\"></a>"
@@ -1033,32 +1129,69 @@ def render_video_rows(videos: list[Video], *, hide_endpoint: str | None = None) 
             f"data-video-id=\"{video_id}\" "
             f"data-video-title=\"{title}\" "
             f"data-video-url=\"{url}\" "
-            f"data-video-channel=\"{channel}\">"
+            f"data-video-channel=\"{channel}\" "
+            f"data-video-view-count=\"{video.view_count}\" "
+            f"data-video-published=\"{published}\" "
+            f"data-video-duration=\"{duration}\">"
             f"<td class=\"rank\">{index}</td>"
             f"<td class=\"thumb\">{thumbnail_html}</td>"
             f"<td>{title_html}<div class=\"url\">{url}</div></td>"
             f"<td class=\"views\">{format_count(video.view_count)}</td>"
             f"<td>{channel_html}</td>"
-            f"<td>{escape(video.published)}</td>"
-            f"<td>{escape(video.duration)}</td>"
+            f"<td>{published}</td>"
+            f"<td>{duration}</td>"
             f"<td class=\"actions\">{action_html}</td>"
             "</tr>"
         )
     return "\n".join(rows)
 
 
-def render_html(
+def render_video_table(
     videos: list[Video],
+    *,
+    save_endpoint: str | None,
+    empty_message: str,
+) -> str:
+    return f"""
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Thumbnail</th>
+            <th>Video</th>
+            <th>Views</th>
+            <th>Channel</th>
+            <th>Published</th>
+            <th>Duration</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {render_video_rows(
+              videos,
+              save_endpoint=save_endpoint,
+              empty_message=empty_message,
+          )}
+        </tbody>
+      </table>
+"""
+
+
+def render_html(
+    videos_by_views: list[Video],
+    recent_videos: list[Video],
     stats: list[ChannelStats],
     config: Config,
     *,
-    hide_endpoint: str | None = None,
+    save_endpoint: str | None = None,
+    recent_save_endpoint: str | None = None,
 ) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     scanned_count = sum(stat.scanned for stat in stats)
     error_count = sum(1 for stat in stats if stat.error)
-    hide_endpoint_js = json.dumps(hide_endpoint or "")
-    hidden_file_text = escape(path_text_relative_to(config.hidden_videos_file, config.config_dir))
+    unique_report_video_count = len({video.video_id for video in [*videos_by_views, *recent_videos]})
+    saved_file_text = escape(path_text_relative_to(config.saved_videos_file, config.config_dir))
+    recent_saved_file_text = escape(path_text_relative_to(config.recent_saved_videos_file, config.config_dir))
     theme_name = escape(config.theme_name)
 
     return f"""<!doctype html>
@@ -1191,7 +1324,7 @@ def render_html(
       padding: 5px 9px;
     }}
     button:hover {{ border-color: var(--accent); color: var(--accent); }}
-    .hidden-by-user {{ display: none; }}
+    .saved-by-user {{ display: none; }}
     .report-controls {{
       align-items: center;
       display: flex;
@@ -1200,7 +1333,7 @@ def render_html(
       margin: 0 0 12px;
     }}
     .report-controls code,
-    #hide-status {{
+    #action-status {{
       color: var(--muted);
       font-size: 13px;
     }}
@@ -1224,39 +1357,39 @@ def render_html(
 <body>
   <header>
     <h1>YouTube Channel Videos by Views</h1>
-    <p>Theme: {theme_name}. Generated {escape(generated_at)}. Minimum views: {format_count(config.min_views)}.</p>
+    <p>Theme: {theme_name}. Generated {escape(generated_at)}. Minimum views: {format_count(config.min_views)}. Recent minimum views: {format_count(config.recent_min_views)}.</p>
   </header>
   <main>
     <div class="stats">
-      <div class="stat"><strong>{format_count(len(videos))}</strong><span>videos included</span></div>
+      <div class="stat"><strong>{format_count(len(videos_by_views))}</strong><span>videos by views</span></div>
+      <div class="stat"><strong>{format_count(len(recent_videos))}</strong><span>recent videos</span></div>
+      <div class="stat"><strong>{format_count(unique_report_video_count)}</strong><span>unique videos shown</span></div>
       <div class="stat"><strong>{format_count(scanned_count)}</strong><span>videos scanned</span></div>
       <div class="stat"><strong>{format_count(len(stats))}</strong><span>channels configured</span></div>
       <div class="stat"><strong>{format_count(error_count)}</strong><span>channel errors</span></div>
     </div>
 
     <section>
-      <h2>Videos</h2>
+      <h2>Videos by Views</h2>
       <div class="report-controls">
-        <span>Hidden-video file: <code>{hidden_file_text}</code></span>
-        <span id="hide-status"></span>
+        <span>Most-viewed saved videos: <code>{saved_file_text}</code></span>
+        <span>Recent saved videos: <code>{recent_saved_file_text}</code></span>
+        <span id="action-status"></span>
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>#</th>
-            <th>Thumbnail</th>
-            <th>Video</th>
-            <th>Views</th>
-            <th>Channel</th>
-            <th>Published</th>
-            <th>Duration</th>
-            <th>Action</th>
-          </tr>
-        </thead>
-        <tbody>
-          {render_video_rows(videos, hide_endpoint=hide_endpoint)}
-        </tbody>
-      </table>
+      {render_video_table(
+          videos_by_views,
+          save_endpoint=save_endpoint,
+          empty_message="No videos met the configured minimum view count.",
+      )}
+    </section>
+
+    <section>
+      <h2>Recent Videos</h2>
+      {render_video_table(
+          recent_videos,
+          save_endpoint=recent_save_endpoint,
+          empty_message="No recent videos met the configured recent minimum view count.",
+      )}
     </section>
 
     <section>
@@ -1276,28 +1409,39 @@ def render_html(
   </main>
   <script>
     (function () {{
-      var hideEndpoint = {hide_endpoint_js};
-      var hideStatus = document.getElementById("hide-status");
+      var actionStatus = document.getElementById("action-status");
 
       function rowRecord(row) {{
         return {{
           video_id: row.dataset.videoId || "",
           title: row.dataset.videoTitle || "",
           url: row.dataset.videoUrl || "",
-          channel: row.dataset.videoChannel || ""
+          channel: row.dataset.videoChannel || "",
+          view_count: row.dataset.videoViewCount || "",
+          published: row.dataset.videoPublished || "",
+          duration: row.dataset.videoDuration || ""
         }};
       }}
 
       function setStatus(message) {{
-        hideStatus.textContent = message || "";
+        actionStatus.textContent = message || "";
       }}
 
-      if (!hideEndpoint) {{
-        setStatus("Open this report from the GUI to enable Hide buttons.");
+      function removeVideoRows(videoId) {{
+        document.querySelectorAll("tr[data-video-id]").forEach(function (row) {{
+          if (row.dataset.videoId === videoId) {{
+            row.classList.add("saved-by-user");
+          }}
+        }});
       }}
 
-      document.querySelectorAll(".hide-video").forEach(function (button) {{
+      if (!document.querySelector(".save-video:not([disabled])")) {{
+        setStatus("Open this report from the GUI to enable Save buttons.");
+      }}
+
+      document.querySelectorAll(".save-video").forEach(function (button) {{
         button.addEventListener("click", function () {{
+          var saveEndpoint = button.dataset.saveEndpoint || "";
           var row = button.closest("tr[data-video-id]");
           if (!row) {{
             return;
@@ -1306,13 +1450,13 @@ def render_html(
           if (!record.video_id) {{
             return;
           }}
-          if (!hideEndpoint) {{
-            alert("Open this report from the GUI to enable hiding videos.");
+          if (!saveEndpoint) {{
+            alert("Open this report from the GUI to enable saving videos.");
             return;
           }}
           button.disabled = true;
           button.textContent = "Saving...";
-          fetch(hideEndpoint, {{
+          fetch(saveEndpoint, {{
             method: "POST",
             headers: {{"Content-Type": "application/json"}},
             body: JSON.stringify(record)
@@ -1320,19 +1464,19 @@ def render_html(
             .then(function (response) {{
               return response.json().then(function (payload) {{
                 if (!response.ok || !payload.ok) {{
-                  throw new Error(payload.error || "Could not save hidden video.");
+                  throw new Error(payload.error || "Could not save video.");
                 }}
                 return payload;
               }});
             }})
             .then(function (payload) {{
-              row.classList.add("hidden-by-user");
-              setStatus("Saved hidden video to external file. Hidden count: " + payload.count);
+              removeVideoRows(record.video_id);
+              setStatus("Saved video. Saved count: " + payload.count);
             }})
             .catch(function (error) {{
               button.disabled = false;
-              button.textContent = "Hide";
-              alert("Could not save hidden video: " + error.message);
+              button.textContent = "Save";
+              alert("Could not save video: " + error.message);
             }});
         }});
       }});
@@ -1353,9 +1497,16 @@ def apply_arg_overrides(config: Config, args: argparse.Namespace) -> Config:
             config,
             channels=selected_theme.channels,
             report_file=selected_theme.report_file,
-            hidden_videos_file=selected_theme.hidden_videos_file,
+            saved_videos_file=selected_theme.saved_videos_file,
+            recent_saved_videos_file=selected_theme.recent_saved_videos_file,
             theme_name=selected_theme.name,
         )
+    if getattr(args, "recent_min_views", None) is not None:
+        try:
+            recent_min_views = parse_count(args.recent_min_views)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        config = replace(config, recent_min_views=recent_min_views)
     if args.limit is not None:
         if args.limit <= 0:
             raise SystemExit("--limit must be a positive integer.")
@@ -1392,13 +1543,20 @@ def apply_arg_overrides(config: Config, args: argparse.Namespace) -> Config:
     return config
 
 
+def recent_video_sort_key(video: Video) -> tuple[int, int, int, int]:
+    if video.published_sort_value:
+        return (1, video.published_sort_value, video.view_count, -video.source_order)
+    return (0, 0, -video.source_order, video.view_count)
+
+
 def build_report(
     config: Config,
     output_path: Path,
     *,
     auto_install: bool = True,
     update_deps: bool = False,
-    hide_endpoint: str | None = None,
+    save_endpoint: str | None = None,
+    recent_save_endpoint: str | None = None,
     logger: LogFn = print,
 ) -> tuple[Path, list[Video], list[ChannelStats]]:
     if update_deps:
@@ -1408,6 +1566,7 @@ def build_report(
 
     logger(f"Theme: {config.theme_name}")
     logger(f"Minimum views: {format_count(config.min_views)}")
+    logger(f"Recent minimum views: {format_count(config.recent_min_views)}")
     if config.max_videos_per_channel is not None:
         logger(f"Per-channel fetch limit: {format_count(config.max_videos_per_channel)}")
     if config.cookies_file is not None:
@@ -1442,33 +1601,52 @@ def build_report(
         stats.append(channel_stats)
         logger(
             "  "
-            f"Included {format_count(channel_stats.included)} of {format_count(channel_stats.scanned)} "
+            f"Kept {format_count(channel_stats.included)} candidate(s) of {format_count(channel_stats.scanned)} "
             f"videos from {channel_stats.title}"
         )
 
-    all_videos.sort(key=lambda video: video.view_count, reverse=True)
-    hidden_records = load_hidden_video_records(config.hidden_videos_file)
-    if hidden_records:
+    saved_records = load_saved_video_records(config.saved_videos_file)
+    recent_saved_records = load_saved_video_records(config.recent_saved_videos_file)
+    ignored_video_ids = set(saved_records) | set(recent_saved_records)
+    if ignored_video_ids:
         before_count = len(all_videos)
-        hidden_ids = set(hidden_records)
-        all_videos = [video for video in all_videos if video.video_id not in hidden_ids]
+        all_videos = [video for video in all_videos if video.video_id not in ignored_video_ids]
         filtered_count = before_count - len(all_videos)
         if filtered_count:
             logger(
-                f"Filtered out {format_count(filtered_count)} hidden video(s) from "
-                f"{path_text_relative_to(config.hidden_videos_file, config.config_dir)}"
+                f"Filtered out {format_count(filtered_count)} saved video(s) from saved stores."
             )
+
+    videos_by_views = [video for video in all_videos if video.view_count >= config.min_views]
+    videos_by_views.sort(
+        key=lambda video: (video.view_count, video.published_sort_value, -video.source_order),
+        reverse=True,
+    )
+    recent_videos = [video for video in all_videos if video.view_count >= config.recent_min_views]
+    recent_videos.sort(key=recent_video_sort_key, reverse=True)
 
     output_path = output_path.expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(render_html(all_videos, stats, config, hide_endpoint=hide_endpoint), encoding="utf-8")
+    output_path.write_text(
+        render_html(
+            videos_by_views,
+            recent_videos,
+            stats,
+            config,
+            save_endpoint=save_endpoint,
+            recent_save_endpoint=recent_save_endpoint,
+        ),
+        encoding="utf-8",
+    )
 
     logger(f"Saved report: {output_path}")
     if config.open_browser:
         webbrowser.open(output_path.resolve().as_uri())
         logger("Opened report in browser.")
 
-    return output_path, all_videos, stats
+    report_video_ids = {video.video_id for video in [*videos_by_views, *recent_videos]}
+    report_videos = [video for video in all_videos if video.video_id in report_video_ids]
+    return output_path, report_videos, stats
 
 
 def parse_args() -> argparse.Namespace:
@@ -1500,6 +1678,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Temporarily limit the number of videos fetched per channel for this run.",
+    )
+    parser.add_argument(
+        "--recent-min-views",
+        default=None,
+        help="Temporarily override the minimum view count for the Recent Videos section, e.g. 10000, 10k, or 1.2m.",
     )
     parser.add_argument(
         "--no-open",
@@ -1580,15 +1763,18 @@ def launch_gui(args: argparse.Namespace) -> int:
             self.current_theme_name = DEFAULT_THEME_NAME
             self.loading_theme = False
             self.worker: threading.Thread | None = None
-            self.hide_server: ThreadingHTTPServer | None = None
-            self.hide_endpoint: str | None = None
+            self.save_server: ThreadingHTTPServer | None = None
+            self.save_endpoint: str | None = None
+            self.recent_save_endpoint: str | None = None
             self.messages: queue.Queue[tuple[str, Any]] = queue.Queue()
 
             self.config_var = tk.StringVar(value=str(self.config_path))
             self.theme_var = tk.StringVar(value=DEFAULT_THEME_NAME)
             self.output_var = tk.StringVar(value=str(self.output_path))
-            self.hidden_file_var = tk.StringVar(value=DEFAULT_HIDDEN_VIDEOS_FILENAME)
+            self.saved_file_var = tk.StringVar(value=DEFAULT_SAVED_VIDEOS_FILENAME)
+            self.recent_saved_file_var = tk.StringVar(value=DEFAULT_RECENT_SAVED_VIDEOS_FILENAME)
             self.min_views_var = tk.StringVar(value="50k")
+            self.recent_min_views_var = tk.StringVar(value="10k")
             self.max_videos_var = tk.StringVar(value="")
             self.cookies_browser_var = tk.StringVar(value="")
             self.browser_profile_var = tk.StringVar(value="")
@@ -1637,10 +1823,15 @@ def launch_gui(args: argparse.Namespace) -> int:
             ttk.Button(files, text="Browse", command=self.browse_output).grid(row=2, column=2, padx=(8, 0), pady=3)
             ttk.Button(files, text="Open", command=self.open_report).grid(row=2, column=3, padx=(8, 0), pady=3)
 
-            ttk.Label(files, text="Hidden list").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
-            ttk.Entry(files, textvariable=self.hidden_file_var).grid(row=3, column=1, sticky="ew", pady=3)
-            ttk.Button(files, text="Browse", command=self.browse_hidden_file).grid(row=3, column=2, padx=(8, 0), pady=3)
-            ttk.Button(files, text="Open", command=self.open_hidden_file).grid(row=3, column=3, padx=(8, 0), pady=3)
+            ttk.Label(files, text="Most viewed saved").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
+            ttk.Entry(files, textvariable=self.saved_file_var).grid(row=3, column=1, sticky="ew", pady=3)
+            ttk.Button(files, text="Browse", command=self.browse_saved_file).grid(row=3, column=2, padx=(8, 0), pady=3)
+            ttk.Button(files, text="Open", command=self.open_saved_file).grid(row=3, column=3, padx=(8, 0), pady=3)
+
+            ttk.Label(files, text="Recent saved").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=3)
+            ttk.Entry(files, textvariable=self.recent_saved_file_var).grid(row=4, column=1, sticky="ew", pady=3)
+            ttk.Button(files, text="Browse", command=self.browse_recent_saved_file).grid(row=4, column=2, padx=(8, 0), pady=3)
+            ttk.Button(files, text="Open", command=self.open_recent_saved_file).grid(row=4, column=3, padx=(8, 0), pady=3)
 
             settings = ttk.Frame(outer)
             settings.grid(row=2, column=0, sticky="ew", pady=(0, 10))
@@ -1649,11 +1840,10 @@ def launch_gui(args: argparse.Namespace) -> int:
 
             ttk.Label(settings, text="Min views").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
             ttk.Entry(settings, textvariable=self.min_views_var, width=12).grid(row=0, column=1, sticky="ew", pady=3)
-            ttk.Label(settings, text="Max/channel").grid(row=0, column=2, sticky="w", padx=(14, 8), pady=3)
-            ttk.Entry(settings, textvariable=self.max_videos_var, width=12).grid(row=0, column=3, sticky="ew", pady=3)
-            ttk.Checkbutton(settings, text="Open browser after fetch", variable=self.open_browser_var).grid(
-                row=0, column=4, columnspan=2, sticky="w", padx=(14, 0), pady=3
-            )
+            ttk.Label(settings, text="Recent min").grid(row=0, column=2, sticky="w", padx=(14, 8), pady=3)
+            ttk.Entry(settings, textvariable=self.recent_min_views_var, width=12).grid(row=0, column=3, sticky="ew", pady=3)
+            ttk.Label(settings, text="Max/channel").grid(row=0, column=4, sticky="w", padx=(14, 8), pady=3)
+            ttk.Entry(settings, textvariable=self.max_videos_var, width=12).grid(row=0, column=5, sticky="ew", pady=3)
 
             ttk.Label(settings, text="Cookies browser").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
             cookie_values = ["", *sorted(SUPPORTED_COOKIE_BROWSERS)]
@@ -1672,6 +1862,9 @@ def launch_gui(args: argparse.Namespace) -> int:
             cookie_file_frame.columnconfigure(0, weight=1)
             ttk.Entry(cookie_file_frame, textvariable=self.cookies_file_var).grid(row=0, column=0, sticky="ew")
             ttk.Button(cookie_file_frame, text="Browse", command=self.browse_cookies_file).grid(row=0, column=1, padx=(8, 0))
+            ttk.Checkbutton(settings, text="Open browser after fetch", variable=self.open_browser_var).grid(
+                row=2, column=0, columnspan=6, sticky="w", pady=3
+            )
 
             channels_frame = ttk.LabelFrame(outer, text="Channels")
             channels_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
@@ -1709,6 +1902,7 @@ def launch_gui(args: argparse.Namespace) -> int:
             buttons.grid(row=4, column=0, sticky="ew", pady=(0, 10))
             self.fetch_button = ttk.Button(buttons, text="Fetch Videos", command=self.start_fetch)
             self.fetch_button.pack(side="left")
+            ttk.Button(buttons, text="Open Report in Browser", command=self.open_report).pack(side="left", padx=(8, 0))
             ttk.Button(buttons, text="Save Config", command=self.save_config).pack(side="left", padx=(8, 0))
             ttk.Button(buttons, text="Reload Config", command=self.reload_config).pack(side="left", padx=(8, 0))
             ttk.Button(buttons, text="Clear Log", command=self.clear_log).pack(side="right")
@@ -1750,20 +1944,35 @@ def launch_gui(args: argparse.Namespace) -> int:
                 self.output_path = Path(chosen).expanduser()
                 self.output_var.set(path_text_relative_to(self.output_path, config_dir))
 
-        def browse_hidden_file(self) -> None:
+        def browse_saved_file(self) -> None:
             config_dir = Path(self.config_var.get()).expanduser().parent
-            path = optional_path(self.hidden_file_var.get(), config_dir) or (
-                default_hidden_videos_file_for_theme(self.current_theme_name, config_dir)
+            path = optional_path(self.saved_file_var.get(), config_dir) or (
+                default_saved_videos_file_for_theme(self.current_theme_name, config_dir)
             )
             chosen = filedialog.asksaveasfilename(
-                title="Choose hidden videos JSON",
+                title="Choose saved videos JSON",
                 initialdir=str(path.parent),
                 initialfile=path.name,
                 defaultextension=".json",
                 filetypes=[("JSON files", "*.json"), ("All files", "*")],
             )
             if chosen:
-                self.hidden_file_var.set(path_text_relative_to(Path(chosen), config_dir))
+                self.saved_file_var.set(path_text_relative_to(Path(chosen), config_dir))
+
+        def browse_recent_saved_file(self) -> None:
+            config_dir = Path(self.config_var.get()).expanduser().parent
+            path = optional_path(self.recent_saved_file_var.get(), config_dir) or (
+                default_recent_saved_videos_file_for_theme(self.current_theme_name, config_dir)
+            )
+            chosen = filedialog.asksaveasfilename(
+                title="Choose recent saved videos JSON",
+                initialdir=str(path.parent),
+                initialfile=path.name,
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*")],
+            )
+            if chosen:
+                self.recent_saved_file_var.set(path_text_relative_to(Path(chosen), config_dir))
 
         def browse_cookies_file(self) -> None:
             chosen = filedialog.askopenfilename(
@@ -1793,29 +2002,51 @@ def launch_gui(args: argparse.Namespace) -> int:
                 return
             webbrowser.open(path.resolve().as_uri())
 
-        def open_hidden_file(self) -> None:
+        def open_saved_file(self) -> None:
             config_dir = Path(self.config_var.get()).expanduser().parent
-            path = optional_path(self.hidden_file_var.get(), config_dir) or (
-                default_hidden_videos_file_for_theme(self.current_theme_name, config_dir)
+            path = optional_path(self.saved_file_var.get(), config_dir) or (
+                default_saved_videos_file_for_theme(self.current_theme_name, config_dir)
             )
             if not path.exists():
-                write_hidden_video_records(path, {})
+                write_saved_video_records(path, {})
             subprocess.run(["open", str(path)], check=False)
 
-        def ensure_hide_endpoint(self, hidden_videos_file: Path, base_dir: Path) -> str:
-            hidden_videos_file = hidden_videos_file.expanduser()
-            if self.hide_server is None:
-                self.hide_server, self.hide_endpoint = start_hide_video_server(hidden_videos_file, base_dir)
-                self.append_log(f"Started hide-button helper: {self.hide_endpoint}")
+        def open_recent_saved_file(self) -> None:
+            config_dir = Path(self.config_var.get()).expanduser().parent
+            path = optional_path(self.recent_saved_file_var.get(), config_dir) or (
+                default_recent_saved_videos_file_for_theme(self.current_theme_name, config_dir)
+            )
+            if not path.exists():
+                write_saved_video_records(path, {})
+            subprocess.run(["open", str(path)], check=False)
+
+        def ensure_save_endpoints(
+            self,
+            saved_videos_file: Path,
+            recent_saved_videos_file: Path,
+            base_dir: Path,
+        ) -> tuple[str, str]:
+            saved_videos_file = saved_videos_file.expanduser()
+            recent_saved_videos_file = recent_saved_videos_file.expanduser()
+            if self.save_server is None:
+                self.save_server, endpoints = start_save_video_server(
+                    saved_videos_file,
+                    recent_saved_videos_file,
+                    base_dir,
+                )
+                self.save_endpoint = endpoints["saved"]
+                self.recent_save_endpoint = endpoints["recent_saved"]
+                self.append_log(f"Started save-button helper: {self.save_endpoint}")
             else:
-                self.hide_server.hidden_videos_file = hidden_videos_file  # type: ignore[attr-defined]
-                self.hide_server.hidden_videos_base_dir = base_dir.expanduser()  # type: ignore[attr-defined]
-            return self.hide_endpoint or ""
+                self.save_server.saved_videos_file = saved_videos_file  # type: ignore[attr-defined]
+                self.save_server.recent_saved_videos_file = recent_saved_videos_file  # type: ignore[attr-defined]
+                self.save_server.video_records_base_dir = base_dir.expanduser()  # type: ignore[attr-defined]
+            return self.save_endpoint or "", self.recent_save_endpoint or ""
 
         def on_close(self) -> None:
-            if self.hide_server is not None:
-                self.hide_server.shutdown()
-                self.hide_server.server_close()
+            if self.save_server is not None:
+                self.save_server.shutdown()
+                self.save_server.server_close()
             self.root.destroy()
 
         def clear_log(self) -> None:
@@ -1850,15 +2081,20 @@ def launch_gui(args: argparse.Namespace) -> int:
                 name,
                 config_dir,
             )
-            hidden_videos_file = optional_path(
-                self.hidden_file_var.get(),
+            saved_videos_file = optional_path(
+                self.saved_file_var.get(),
                 config_dir,
-            ) or default_hidden_videos_file_for_theme(name, config_dir)
+            ) or default_saved_videos_file_for_theme(name, config_dir)
+            recent_saved_videos_file = optional_path(
+                self.recent_saved_file_var.get(),
+                config_dir,
+            ) or default_recent_saved_videos_file_for_theme(name, config_dir)
             return ThemeConfig(
                 name=name,
                 channels=[channel for channel in self.get_channels() if channel.url],
                 report_file=report_file,
-                hidden_videos_file=hidden_videos_file,
+                saved_videos_file=saved_videos_file,
+                recent_saved_videos_file=recent_saved_videos_file,
             )
 
         def capture_current_theme(self) -> None:
@@ -1884,7 +2120,8 @@ def launch_gui(args: argparse.Namespace) -> int:
                 self.theme_var.set(theme.name)
                 self.output_path = theme.report_file
                 self.output_var.set(path_text_relative_to(theme.report_file, config_dir))
-                self.hidden_file_var.set(path_text_relative_to(theme.hidden_videos_file, config_dir))
+                self.saved_file_var.set(path_text_relative_to(theme.saved_videos_file, config_dir))
+                self.recent_saved_file_var.set(path_text_relative_to(theme.recent_saved_videos_file, config_dir))
                 self.set_channels(theme.channels)
             finally:
                 self.loading_theme = False
@@ -1917,7 +2154,8 @@ def launch_gui(args: argparse.Namespace) -> int:
                 name=name,
                 channels=[],
                 report_file=default_report_file_for_theme(name, config_dir),
-                hidden_videos_file=default_hidden_videos_file_for_theme(name, config_dir),
+                saved_videos_file=default_saved_videos_file_for_theme(name, config_dir),
+                recent_saved_videos_file=default_recent_saved_videos_file_for_theme(name, config_dir),
             )
             self.themes.append(theme)
             self.current_theme_name = name
@@ -1947,7 +2185,8 @@ def launch_gui(args: argparse.Namespace) -> int:
                 name=name,
                 channels=old_theme.channels,
                 report_file=old_theme.report_file,
-                hidden_videos_file=old_theme.hidden_videos_file,
+                saved_videos_file=old_theme.saved_videos_file,
+                recent_saved_videos_file=old_theme.recent_saved_videos_file,
             )
             self.themes[index] = renamed
             self.current_theme_name = name
@@ -2068,6 +2307,7 @@ def launch_gui(args: argparse.Namespace) -> int:
                 return
 
             self.min_views_var.set(format_count(config.min_views).replace(",", ""))
+            self.recent_min_views_var.set(format_count(config.recent_min_views).replace(",", ""))
             self.max_videos_var.set("" if config.max_videos_per_channel is None else str(config.max_videos_per_channel))
             self.cookies_browser_var.set(config.cookies_from_browser or "")
             self.browser_profile_var.set(config.browser_profile or "")
@@ -2080,7 +2320,8 @@ def launch_gui(args: argparse.Namespace) -> int:
                     name=config.theme_name,
                     channels=config.channels,
                     report_file=config.report_file,
-                    hidden_videos_file=config.hidden_videos_file,
+                    saved_videos_file=config.saved_videos_file,
+                    recent_saved_videos_file=config.recent_saved_videos_file,
                 )
             ]
             self.current_theme_name = config.theme_name
@@ -2090,7 +2331,8 @@ def launch_gui(args: argparse.Namespace) -> int:
                     name=config.theme_name,
                     channels=config.channels,
                     report_file=config.report_file,
-                    hidden_videos_file=config.hidden_videos_file,
+                    saved_videos_file=config.saved_videos_file,
+                    recent_saved_videos_file=config.recent_saved_videos_file,
                 )
             )
             if show_status:
@@ -2098,6 +2340,7 @@ def launch_gui(args: argparse.Namespace) -> int:
 
         def form_config(self, *, require_enabled: bool = False) -> Config:
             min_views_text = self.min_views_var.get().strip()
+            recent_min_views_text = self.recent_min_views_var.get().strip()
             max_videos_text = self.max_videos_var.get().strip()
             config_dir = Path(self.config_var.get()).expanduser().parent
             self.capture_current_theme()
@@ -2107,7 +2350,8 @@ def launch_gui(args: argparse.Namespace) -> int:
                         name=DEFAULT_THEME_NAME,
                         channels=[],
                         report_file=default_report_file_for_theme(DEFAULT_THEME_NAME, config_dir),
-                        hidden_videos_file=default_hidden_videos_file_for_theme(DEFAULT_THEME_NAME, config_dir),
+                        saved_videos_file=default_saved_videos_file_for_theme(DEFAULT_THEME_NAME, config_dir),
+                        recent_saved_videos_file=default_recent_saved_videos_file_for_theme(DEFAULT_THEME_NAME, config_dir),
                     )
                 ]
                 self.current_theme_name = DEFAULT_THEME_NAME
@@ -2124,6 +2368,7 @@ def launch_gui(args: argparse.Namespace) -> int:
 
             return Config(
                 min_views=parse_count(min_views_text),
+                recent_min_views=parse_count(recent_min_views_text or min_views_text),
                 channels=selected_theme.channels,
                 max_videos_per_channel=optional_positive_int(max_videos_text, "Max videos/channel"),
                 fetch_missing_view_counts=True,
@@ -2132,7 +2377,8 @@ def launch_gui(args: argparse.Namespace) -> int:
                 browser_profile=optional_string(self.browser_profile_var.get()),
                 cookies_file=cookies_file,
                 report_file=selected_theme.report_file,
-                hidden_videos_file=selected_theme.hidden_videos_file,
+                saved_videos_file=selected_theme.saved_videos_file,
+                recent_saved_videos_file=selected_theme.recent_saved_videos_file,
                 config_dir=config_dir,
                 theme_name=selected_theme.name,
                 themes=tuple(self.themes),
@@ -2146,6 +2392,7 @@ def launch_gui(args: argparse.Namespace) -> int:
 
             return {
                 "min_views": self.min_views_var.get().strip() or str(config.min_views),
+                "recent_min_views": self.recent_min_views_var.get().strip() or str(config.recent_min_views),
                 "max_videos_per_channel": config.max_videos_per_channel,
                 "cookies_from_browser": config.cookies_from_browser,
                 "browser_profile": config.browser_profile,
@@ -2175,7 +2422,11 @@ def launch_gui(args: argparse.Namespace) -> int:
             try:
                 config = self.form_config(require_enabled=True)
                 output_path = config.report_file
-                hide_endpoint = self.ensure_hide_endpoint(config.hidden_videos_file, config.config_dir)
+                save_endpoint, recent_save_endpoint = self.ensure_save_endpoints(
+                    config.saved_videos_file,
+                    config.recent_saved_videos_file,
+                    config.config_dir,
+                )
             except Exception as exc:
                 messagebox.showerror("Cannot fetch", str(exc))
                 return
@@ -2186,19 +2437,26 @@ def launch_gui(args: argparse.Namespace) -> int:
             self.append_log("Fetch started.")
             self.worker = threading.Thread(
                 target=self._fetch_worker,
-                args=(config, output_path, hide_endpoint),
+                args=(config, output_path, save_endpoint, recent_save_endpoint),
                 daemon=True,
             )
             self.worker.start()
 
-        def _fetch_worker(self, config: Config, output_path: Path, hide_endpoint: str) -> None:
+        def _fetch_worker(
+            self,
+            config: Config,
+            output_path: Path,
+            save_endpoint: str,
+            recent_save_endpoint: str,
+        ) -> None:
             try:
                 report_path, videos, stats = build_report(
                     config,
                     output_path,
                     auto_install=not args.no_auto_install,
                     update_deps=args.update_deps,
-                    hide_endpoint=hide_endpoint,
+                    save_endpoint=save_endpoint,
+                    recent_save_endpoint=recent_save_endpoint,
                     logger=self.queue_log,
                 )
             except SystemExit as exc:

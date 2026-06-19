@@ -1,5 +1,6 @@
 {
   "min_views": "50000",
+  "recent_min_views": "5000",
   "max_videos_per_channel": null,
   "cookies_from_browser": "chrome",
   "browser_profile": null,
@@ -10,7 +11,8 @@
     {
       "name": "books",
       "report_file": "youtube_channel_views_books_report.html",
-      "hidden_videos_file": "youtube_channel_views_books_hidden_videos.json",
+      "saved_videos_file": "youtube_channel_views_books_saved_videos.json",
+      "recent_saved_videos_file": "youtube_channel_views_books_recent_saved_videos.json",
       "channels": [
         {
           "enabled": true,
