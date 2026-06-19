@@ -4,7 +4,7 @@
   "cookies_from_browser": "chrome",
   "browser_profile": null,
   "cookies_file": null,
-  "hidden_videos_file": "/Users/omar/Documents/scripts/youtube_channel_views_hidden_videos.json",
+  "hidden_videos_file": "youtube_channel_views_hidden_videos.json",
   "open_browser": true,
   "channels": [
     {

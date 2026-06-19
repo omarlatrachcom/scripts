@@ -43,7 +43,8 @@ except AttributeError:
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "youtube_channel_views_config.json"
 DEFAULT_OUTPUT_PATH = SCRIPT_DIR / "youtube_channel_views_report.html"
-DEFAULT_HIDDEN_VIDEOS_PATH = SCRIPT_DIR / "youtube_channel_views_hidden_videos.json"
+DEFAULT_HIDDEN_VIDEOS_FILENAME = "youtube_channel_views_hidden_videos.json"
+DEFAULT_HIDDEN_VIDEOS_PATH = SCRIPT_DIR / DEFAULT_HIDDEN_VIDEOS_FILENAME
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "YouTubeChannelViewsBrowser"
 VENV_DIR = APP_SUPPORT_DIR / "venv"
 VENV_PYTHON = VENV_DIR / "bin" / "python"
@@ -56,7 +57,7 @@ DEFAULT_CONFIG = {
     "cookies_from_browser": "chrome",
     "browser_profile": None,
     "cookies_file": None,
-    "hidden_videos_file": str(DEFAULT_HIDDEN_VIDEOS_PATH),
+    "hidden_videos_file": DEFAULT_HIDDEN_VIDEOS_FILENAME,
     "channels": [
         {"enabled": True, "url": "https://www.youtube.com/@audiobookbelaraby/videos"},
         {"enabled": True, "url": "https://www.youtube.com/@EslamAdel/videos"},
@@ -99,6 +100,7 @@ class Config:
     browser_container: str | None = None
     cookies_file: Path | None = None
     hidden_videos_file: Path = DEFAULT_HIDDEN_VIDEOS_PATH
+    config_dir: Path = SCRIPT_DIR
 
 
 @dataclass(frozen=True)
@@ -207,6 +209,20 @@ def optional_path(value: Any, config_dir: Path) -> Path | None:
 
 def optional_cookie_file(value: Any, config_dir: Path) -> Path | None:
     return optional_path(value, config_dir)
+
+
+def path_text_relative_to(path: Path, base_dir: Path) -> str:
+    path = path.expanduser()
+    if not path.is_absolute():
+        return str(path)
+
+    try:
+        return os.path.relpath(
+            path.resolve(strict=False),
+            base_dir.expanduser().resolve(strict=False),
+        )
+    except (OSError, ValueError):
+        return str(path)
 
 
 def optional_cookie_browser(value: Any) -> str | None:
@@ -375,7 +391,7 @@ class HideVideoRequestHandler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "video_id": record["video_id"],
-                "hidden_videos_file": str(hidden_file),
+                "hidden_videos_file": path_text_relative_to(hidden_file, SCRIPT_DIR),
                 "count": len(records),
             },
         )
@@ -397,6 +413,7 @@ def ensure_default_config(path: Path) -> None:
 
 
 def load_config(path: Path) -> Config:
+    path = path.expanduser()
     ensure_default_config(path)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -427,9 +444,9 @@ def load_config(path: Path) -> Config:
         browser_container = optional_string(raw.get("browser_container"))
         cookies_file = optional_cookie_file(raw.get("cookies_file"), path.parent)
         hidden_videos_file = optional_path(
-            raw.get("hidden_videos_file", str(DEFAULT_HIDDEN_VIDEOS_PATH)),
+            raw.get("hidden_videos_file", DEFAULT_CONFIG["hidden_videos_file"]),
             path.parent,
-        ) or DEFAULT_HIDDEN_VIDEOS_PATH
+        ) or (path.parent / DEFAULT_HIDDEN_VIDEOS_FILENAME)
         if cookies_from_browser and cookies_file:
             raise ValueError("Use either cookies_from_browser or cookies_file, not both.")
     except ValueError as exc:
@@ -447,6 +464,7 @@ def load_config(path: Path) -> Config:
         browser_container=browser_container,
         cookies_file=cookies_file,
         hidden_videos_file=hidden_videos_file,
+        config_dir=path.parent,
     )
 
 
@@ -909,7 +927,7 @@ def render_html(
     scanned_count = sum(stat.scanned for stat in stats)
     error_count = sum(1 for stat in stats if stat.error)
     hide_endpoint_js = json.dumps(hide_endpoint or "")
-    hidden_file_text = escape(str(config.hidden_videos_file.expanduser()))
+    hidden_file_text = escape(path_text_relative_to(config.hidden_videos_file, config.config_dir))
 
     return f"""<!doctype html>
 <html lang="en">
@@ -1291,7 +1309,7 @@ def build_report(
         if filtered_count:
             logger(
                 f"Filtered out {format_count(filtered_count)} hidden video(s) from "
-                f"{config.hidden_videos_file.expanduser()}"
+                f"{path_text_relative_to(config.hidden_videos_file, config.config_dir)}"
             )
 
     output_path = output_path.expanduser()
@@ -1413,7 +1431,7 @@ def launch_gui(args: argparse.Namespace) -> int:
 
             self.config_var = tk.StringVar(value=str(self.config_path))
             self.output_var = tk.StringVar(value=str(self.output_path))
-            self.hidden_file_var = tk.StringVar(value=str(DEFAULT_HIDDEN_VIDEOS_PATH))
+            self.hidden_file_var = tk.StringVar(value=DEFAULT_HIDDEN_VIDEOS_FILENAME)
             self.min_views_var = tk.StringVar(value="50k")
             self.max_videos_var = tk.StringVar(value="")
             self.cookies_browser_var = tk.StringVar(value="")
@@ -1564,7 +1582,10 @@ def launch_gui(args: argparse.Namespace) -> int:
                 self.output_var.set(str(self.output_path))
 
         def browse_hidden_file(self) -> None:
-            path = Path(self.hidden_file_var.get()).expanduser()
+            config_dir = Path(self.config_var.get()).expanduser().parent
+            path = optional_path(self.hidden_file_var.get(), config_dir) or (
+                config_dir / DEFAULT_HIDDEN_VIDEOS_FILENAME
+            )
             chosen = filedialog.asksaveasfilename(
                 title="Choose hidden videos JSON",
                 initialdir=str(path.parent),
@@ -1573,7 +1594,7 @@ def launch_gui(args: argparse.Namespace) -> int:
                 filetypes=[("JSON files", "*.json"), ("All files", "*")],
             )
             if chosen:
-                self.hidden_file_var.set(chosen)
+                self.hidden_file_var.set(path_text_relative_to(Path(chosen), config_dir))
 
         def browse_cookies_file(self) -> None:
             chosen = filedialog.askopenfilename(
@@ -1581,7 +1602,8 @@ def launch_gui(args: argparse.Namespace) -> int:
                 filetypes=[("Cookie files", "*.txt"), ("All files", "*")],
             )
             if chosen:
-                self.cookies_file_var.set(chosen)
+                config_dir = Path(self.config_var.get()).expanduser().parent
+                self.cookies_file_var.set(path_text_relative_to(Path(chosen), config_dir))
                 self.cookies_browser_var.set("")
 
         def open_config(self) -> None:
@@ -1599,7 +1621,10 @@ def launch_gui(args: argparse.Namespace) -> int:
             webbrowser.open(path.resolve().as_uri())
 
         def open_hidden_file(self) -> None:
-            path = Path(self.hidden_file_var.get()).expanduser()
+            config_dir = Path(self.config_var.get()).expanduser().parent
+            path = optional_path(self.hidden_file_var.get(), config_dir) or (
+                config_dir / DEFAULT_HIDDEN_VIDEOS_FILENAME
+            )
             if not path.exists():
                 write_hidden_video_records(path, {})
             subprocess.run(["open", str(path)], check=False)
@@ -1732,8 +1757,10 @@ def launch_gui(args: argparse.Namespace) -> int:
             self.max_videos_var.set("" if config.max_videos_per_channel is None else str(config.max_videos_per_channel))
             self.cookies_browser_var.set(config.cookies_from_browser or "")
             self.browser_profile_var.set(config.browser_profile or "")
-            self.cookies_file_var.set("" if config.cookies_file is None else str(config.cookies_file))
-            self.hidden_file_var.set(str(config.hidden_videos_file))
+            self.cookies_file_var.set(
+                "" if config.cookies_file is None else path_text_relative_to(config.cookies_file, config.config_dir)
+            )
+            self.hidden_file_var.set(path_text_relative_to(config.hidden_videos_file, config.config_dir))
             self.open_browser_var.set(config.open_browser)
             self.set_channels(config.channels)
             if show_status:
@@ -1742,6 +1769,7 @@ def launch_gui(args: argparse.Namespace) -> int:
         def form_config(self, *, require_enabled: bool = False) -> Config:
             min_views_text = self.min_views_var.get().strip()
             max_videos_text = self.max_videos_var.get().strip()
+            config_dir = Path(self.config_var.get()).expanduser().parent
             channels = [channel for channel in self.get_channels() if channel.url]
             if not channels:
                 raise ValueError("Add at least one channel URL.")
@@ -1749,11 +1777,11 @@ def launch_gui(args: argparse.Namespace) -> int:
                 raise ValueError("Enable at least one channel before fetching.")
 
             cookies_browser = optional_cookie_browser(self.cookies_browser_var.get())
-            cookies_file = optional_cookie_file(self.cookies_file_var.get(), Path(self.config_var.get()).expanduser().parent)
+            cookies_file = optional_cookie_file(self.cookies_file_var.get(), config_dir)
             hidden_videos_file = optional_path(
                 self.hidden_file_var.get(),
-                Path(self.config_var.get()).expanduser().parent,
-            ) or DEFAULT_HIDDEN_VIDEOS_PATH
+                config_dir,
+            ) or (config_dir / DEFAULT_HIDDEN_VIDEOS_FILENAME)
             if cookies_browser and cookies_file:
                 raise ValueError("Use either a cookies browser or a cookies file, not both.")
 
@@ -1767,16 +1795,22 @@ def launch_gui(args: argparse.Namespace) -> int:
                 browser_profile=optional_string(self.browser_profile_var.get()),
                 cookies_file=cookies_file,
                 hidden_videos_file=hidden_videos_file,
+                config_dir=config_dir,
             )
 
         def config_json(self, config: Config) -> dict[str, Any]:
+            config_dir = Path(self.config_var.get()).expanduser().parent
+            cookies_file = None
+            if config.cookies_file is not None:
+                cookies_file = path_text_relative_to(config.cookies_file, config_dir)
+
             return {
                 "min_views": self.min_views_var.get().strip() or str(config.min_views),
                 "max_videos_per_channel": config.max_videos_per_channel,
                 "cookies_from_browser": config.cookies_from_browser,
                 "browser_profile": config.browser_profile,
-                "cookies_file": None if config.cookies_file is None else str(config.cookies_file),
-                "hidden_videos_file": str(config.hidden_videos_file),
+                "cookies_file": cookies_file,
+                "hidden_videos_file": path_text_relative_to(config.hidden_videos_file, config_dir),
                 "open_browser": config.open_browser,
                 "channels": [channel_config_to_json(channel) for channel in config.channels],
             }
