@@ -4,28 +4,35 @@
   "cookies_from_browser": "chrome",
   "browser_profile": null,
   "cookies_file": null,
-  "hidden_videos_file": "youtube_channel_views_hidden_videos.json",
   "open_browser": true,
-  "channels": [
+  "active_theme": "books",
+  "themes": [
     {
-      "enabled": true,
-      "url": "https://www.youtube.com/@audiobookbelaraby/videos"
-    },
-    {
-      "enabled": true,
-      "url": "https://www.youtube.com/@EslamAdel/videos"
-    },
-    {
-      "enabled": true,
-      "url": "https://www.youtube.com/@arabinglish/videos"
-    },
-    {
-      "enabled": true,
-      "url": "https://www.youtube.com/@%D9%85%D8%AC%D9%84%D8%A9-%D8%A7%D9%84%D9%83%D8%AA%D8%A8-%D8%A7%D9%84%D8%B5%D9%88%D8%AA%D9%8A%D8%A9/videos"
-    },
-    {
-      "enabled": true,
-      "url": "https://www.youtube.com/@PsalmsOfMeem/videos"
+      "name": "books",
+      "report_file": "youtube_channel_views_books_report.html",
+      "hidden_videos_file": "youtube_channel_views_books_hidden_videos.json",
+      "channels": [
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@audiobookbelaraby/videos"
+        },
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@EslamAdel/videos"
+        },
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@arabinglish/videos"
+        },
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@%D9%85%D8%AC%D9%84%D8%A9-%D8%A7%D9%84%D9%83%D8%AA%D8%A8-%D8%A7%D9%84%D8%B5%D9%88%D8%AA%D9%8A%D8%A9/videos"
+        },
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@PsalmsOfMeem/videos"
+        }
+      ]
     }
   ]
 }

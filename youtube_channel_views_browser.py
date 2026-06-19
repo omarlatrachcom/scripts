@@ -42,9 +42,11 @@ except AttributeError:
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "youtube_channel_views_config.json"
-DEFAULT_OUTPUT_PATH = SCRIPT_DIR / "youtube_channel_views_report.html"
+DEFAULT_REPORT_FILENAME = "youtube_channel_views_report.html"
+DEFAULT_OUTPUT_PATH = SCRIPT_DIR / DEFAULT_REPORT_FILENAME
 DEFAULT_HIDDEN_VIDEOS_FILENAME = "youtube_channel_views_hidden_videos.json"
 DEFAULT_HIDDEN_VIDEOS_PATH = SCRIPT_DIR / DEFAULT_HIDDEN_VIDEOS_FILENAME
+DEFAULT_THEME_NAME = "Default"
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "YouTubeChannelViewsBrowser"
 VENV_DIR = APP_SUPPORT_DIR / "venv"
 VENV_PYTHON = VENV_DIR / "bin" / "python"
@@ -57,16 +59,24 @@ DEFAULT_CONFIG = {
     "cookies_from_browser": "chrome",
     "browser_profile": None,
     "cookies_file": None,
-    "hidden_videos_file": DEFAULT_HIDDEN_VIDEOS_FILENAME,
-    "channels": [
-        {"enabled": True, "url": "https://www.youtube.com/@audiobookbelaraby/videos"},
-        {"enabled": True, "url": "https://www.youtube.com/@EslamAdel/videos"},
-        {"enabled": True, "url": "https://www.youtube.com/@arabinglish/videos"},
+    "open_browser": True,
+    "active_theme": DEFAULT_THEME_NAME,
+    "themes": [
         {
-            "enabled": True,
-            "url": "https://www.youtube.com/@%D9%85%D8%AC%D9%84%D8%A9-%D8%A7%D9%84%D9%83%D8%AA%D8%A8-%D8%A7%D9%84%D8%B5%D9%88%D8%AA%D9%8A%D8%A9/videos",
+            "name": DEFAULT_THEME_NAME,
+            "report_file": DEFAULT_REPORT_FILENAME,
+            "hidden_videos_file": DEFAULT_HIDDEN_VIDEOS_FILENAME,
+            "channels": [
+                {"enabled": True, "url": "https://www.youtube.com/@audiobookbelaraby/videos"},
+                {"enabled": True, "url": "https://www.youtube.com/@EslamAdel/videos"},
+                {"enabled": True, "url": "https://www.youtube.com/@arabinglish/videos"},
+                {
+                    "enabled": True,
+                    "url": "https://www.youtube.com/@%D9%85%D8%AC%D9%84%D8%A9-%D8%A7%D9%84%D9%83%D8%AA%D8%A8-%D8%A7%D9%84%D8%B5%D9%88%D8%AA%D9%8A%D8%A9/videos",
+                },
+                {"enabled": True, "url": "https://www.youtube.com/@PsalmsOfMeem/videos"},
+            ],
         },
-        {"enabled": True, "url": "https://www.youtube.com/@PsalmsOfMeem/videos"},
     ],
 }
 
@@ -88,6 +98,14 @@ class ChannelConfig:
 
 
 @dataclass(frozen=True)
+class ThemeConfig:
+    name: str
+    channels: list[ChannelConfig]
+    report_file: Path
+    hidden_videos_file: Path
+
+
+@dataclass(frozen=True)
 class Config:
     min_views: int
     channels: list[ChannelConfig]
@@ -99,8 +117,11 @@ class Config:
     browser_keyring: str | None = None
     browser_container: str | None = None
     cookies_file: Path | None = None
+    report_file: Path = DEFAULT_OUTPUT_PATH
     hidden_videos_file: Path = DEFAULT_HIDDEN_VIDEOS_PATH
     config_dir: Path = SCRIPT_DIR
+    theme_name: str = DEFAULT_THEME_NAME
+    themes: tuple[ThemeConfig, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -268,14 +289,109 @@ def parse_channel_config(value: Any, index: int) -> ChannelConfig:
     return ChannelConfig(url=url, enabled=enabled)
 
 
+def parse_channel_configs(value: Any, field_name: str = "channels") -> list[ChannelConfig]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a JSON list.")
+    return [
+        parse_channel_config(channel, index)
+        for index, channel in enumerate(value)
+        if not (isinstance(channel, str) and not channel.strip())
+    ]
+
+
+def parse_theme_config(value: Any, index: int, config_dir: Path, fallback_name: str | None = None) -> ThemeConfig:
+    if not isinstance(value, dict):
+        raise ValueError(f"themes[{index}] must be an object.")
+
+    name = optional_string(value.get("name")) or fallback_name or f"Theme {index + 1}"
+    channels = parse_channel_configs(value.get("channels", []), f"themes[{index}].channels")
+    report_file = optional_path(
+        value.get("report_file") or value.get("output_file"),
+        config_dir,
+    ) or default_report_file_for_theme(name, config_dir)
+    hidden_videos_file = optional_path(
+        value.get("hidden_videos_file"),
+        config_dir,
+    ) or default_hidden_videos_file_for_theme(name, config_dir)
+
+    return ThemeConfig(
+        name=name,
+        channels=channels,
+        report_file=report_file,
+        hidden_videos_file=hidden_videos_file,
+    )
+
+
+def parse_theme_configs(raw: Any, config_dir: Path) -> list[ThemeConfig]:
+    if raw is None:
+        return []
+
+    if isinstance(raw, dict):
+        themes = [
+            parse_theme_config(value, index, config_dir, fallback_name=str(name))
+            for index, (name, value) in enumerate(raw.items())
+        ]
+    elif isinstance(raw, list):
+        themes = [parse_theme_config(value, index, config_dir) for index, value in enumerate(raw)]
+    else:
+        raise ValueError("themes must be a JSON list or object.")
+
+    seen: set[str] = set()
+    for theme in themes:
+        if theme.name in seen:
+            raise ValueError(f"Duplicate theme name: {theme.name}")
+        seen.add(theme.name)
+    return themes
+
+
+def select_theme(themes: list[ThemeConfig] | tuple[ThemeConfig, ...], theme_name: str | None) -> ThemeConfig:
+    if not themes:
+        raise ValueError("themes cannot be empty.")
+    if theme_name:
+        for theme in themes:
+            if theme.name == theme_name:
+                return theme
+        available = ", ".join(theme.name for theme in themes)
+        raise ValueError(f"Theme not found: {theme_name}. Available themes: {available}")
+    return themes[0]
+
+
 def enabled_channel_urls(config: Config) -> list[str]:
     return [channel.url for channel in config.channels if channel.enabled]
+
+
+def slugify_theme_name(name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", name.strip().lower()).strip("_")
+    return slug or "theme"
+
+
+def default_report_file_for_theme(name: str, config_dir: Path) -> Path:
+    if name == DEFAULT_THEME_NAME:
+        return config_dir / DEFAULT_REPORT_FILENAME
+    return config_dir / f"youtube_channel_views_{slugify_theme_name(name)}_report.html"
+
+
+def default_hidden_videos_file_for_theme(name: str, config_dir: Path) -> Path:
+    if name == DEFAULT_THEME_NAME:
+        return config_dir / DEFAULT_HIDDEN_VIDEOS_FILENAME
+    return config_dir / f"youtube_channel_views_{slugify_theme_name(name)}_hidden_videos.json"
 
 
 def channel_config_to_json(channel: ChannelConfig) -> dict[str, Any]:
     return {
         "enabled": channel.enabled,
         "url": channel.url,
+    }
+
+
+def theme_config_to_json(theme: ThemeConfig, config_dir: Path) -> dict[str, Any]:
+    return {
+        "name": theme.name,
+        "report_file": path_text_relative_to(theme.report_file, config_dir),
+        "hidden_videos_file": path_text_relative_to(theme.hidden_videos_file, config_dir),
+        "channels": [channel_config_to_json(channel) for channel in theme.channels],
     }
 
 
@@ -386,20 +502,22 @@ class HideVideoRequestHandler(BaseHTTPRequestHandler):
             self.send_json(400, {"ok": False, "error": str(exc)})
             return
 
+        base_dir = Path(getattr(self.server, "hidden_videos_base_dir", SCRIPT_DIR))
         self.send_json(
             200,
             {
                 "ok": True,
                 "video_id": record["video_id"],
-                "hidden_videos_file": path_text_relative_to(hidden_file, SCRIPT_DIR),
+                "hidden_videos_file": path_text_relative_to(hidden_file, base_dir),
                 "count": len(records),
             },
         )
 
 
-def start_hide_video_server(hidden_videos_file: Path) -> tuple[ThreadingHTTPServer, str]:
+def start_hide_video_server(hidden_videos_file: Path, base_dir: Path = SCRIPT_DIR) -> tuple[ThreadingHTTPServer, str]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), HideVideoRequestHandler)
     server.hidden_videos_file = hidden_videos_file.expanduser()  # type: ignore[attr-defined]
+    server.hidden_videos_base_dir = base_dir.expanduser()  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, f"http://127.0.0.1:{server.server_port}/hide-video"
@@ -422,16 +540,6 @@ def load_config(path: Path) -> Config:
 
     try:
         min_views = parse_count(raw.get("min_views", DEFAULT_CONFIG["min_views"]))
-        raw_channels = raw.get("channels", [])
-        if not isinstance(raw_channels, list):
-            raise ValueError("channels must be a JSON list.")
-        channels = [
-            parse_channel_config(channel, index)
-            for index, channel in enumerate(raw_channels)
-            if not (isinstance(channel, str) and not channel.strip())
-        ]
-        if not channels:
-            raise ValueError("channels cannot be empty.")
         max_videos_per_channel = optional_positive_int(
             raw.get("max_videos_per_channel"),
             "max_videos_per_channel",
@@ -443,10 +551,30 @@ def load_config(path: Path) -> Config:
         browser_keyring = optional_string(raw.get("browser_keyring"))
         browser_container = optional_string(raw.get("browser_container"))
         cookies_file = optional_cookie_file(raw.get("cookies_file"), path.parent)
-        hidden_videos_file = optional_path(
-            raw.get("hidden_videos_file", DEFAULT_CONFIG["hidden_videos_file"]),
-            path.parent,
-        ) or (path.parent / DEFAULT_HIDDEN_VIDEOS_FILENAME)
+        themes = parse_theme_configs(raw.get("themes"), path.parent)
+        if not themes:
+            legacy_channels = parse_channel_configs(raw.get("channels", []))
+            if not legacy_channels:
+                raise ValueError("channels cannot be empty.")
+            legacy_theme_name = optional_string(raw.get("active_theme") or raw.get("theme")) or DEFAULT_THEME_NAME
+            themes = [
+                ThemeConfig(
+                    name=legacy_theme_name,
+                    channels=legacy_channels,
+                    report_file=optional_path(
+                        raw.get("report_file") or raw.get("output_file"),
+                        path.parent,
+                    )
+                    or default_report_file_for_theme(legacy_theme_name, path.parent),
+                    hidden_videos_file=optional_path(
+                        raw.get("hidden_videos_file"),
+                        path.parent,
+                    )
+                    or default_hidden_videos_file_for_theme(legacy_theme_name, path.parent),
+                )
+            ]
+        active_theme_name = optional_string(raw.get("active_theme") or raw.get("theme"))
+        selected_theme = select_theme(themes, active_theme_name)
         if cookies_from_browser and cookies_file:
             raise ValueError("Use either cookies_from_browser or cookies_file, not both.")
     except ValueError as exc:
@@ -454,7 +582,7 @@ def load_config(path: Path) -> Config:
 
     return Config(
         min_views=min_views,
-        channels=channels,
+        channels=selected_theme.channels,
         max_videos_per_channel=max_videos_per_channel,
         fetch_missing_view_counts=fetch_missing_view_counts,
         open_browser=open_browser,
@@ -463,8 +591,11 @@ def load_config(path: Path) -> Config:
         browser_keyring=browser_keyring,
         browser_container=browser_container,
         cookies_file=cookies_file,
-        hidden_videos_file=hidden_videos_file,
+        report_file=selected_theme.report_file,
+        hidden_videos_file=selected_theme.hidden_videos_file,
         config_dir=path.parent,
+        theme_name=selected_theme.name,
+        themes=tuple(themes),
     )
 
 
@@ -928,6 +1059,7 @@ def render_html(
     error_count = sum(1 for stat in stats if stat.error)
     hide_endpoint_js = json.dumps(hide_endpoint or "")
     hidden_file_text = escape(path_text_relative_to(config.hidden_videos_file, config.config_dir))
+    theme_name = escape(config.theme_name)
 
     return f"""<!doctype html>
 <html lang="en">
@@ -1019,10 +1151,10 @@ def render_html(
     a {{ color: var(--accent); text-decoration: none; }}
     a:hover {{ text-decoration: underline; }}
     .rank {{ width: 54px; color: var(--muted); }}
-    .thumb {{ width: 138px; }}
+    .thumb {{ width: 660px; }}
     .thumb img {{
       display: block;
-      width: 120px;
+      width: 640px;
       aspect-ratio: 16 / 9;
       object-fit: cover;
       border-radius: 6px;
@@ -1085,14 +1217,14 @@ def render_html(
       tr {{ border-bottom: 1px solid var(--border); padding: 10px 0; }}
       td {{ border-bottom: 0; padding: 6px 12px; }}
       .rank, .thumb {{ width: auto; }}
-      .thumb img {{ width: 100%; max-width: 260px; }}
+      .thumb img {{ width: 100%; max-width: 720px; }}
     }}
   </style>
 </head>
 <body>
   <header>
     <h1>YouTube Channel Videos by Views</h1>
-    <p>Generated {escape(generated_at)}. Minimum views: {format_count(config.min_views)}.</p>
+    <p>Theme: {theme_name}. Generated {escape(generated_at)}. Minimum views: {format_count(config.min_views)}.</p>
   </header>
   <main>
     <div class="stats">
@@ -1212,6 +1344,18 @@ def render_html(
 
 
 def apply_arg_overrides(config: Config, args: argparse.Namespace) -> Config:
+    if getattr(args, "theme", None):
+        try:
+            selected_theme = select_theme(config.themes, args.theme)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        config = replace(
+            config,
+            channels=selected_theme.channels,
+            report_file=selected_theme.report_file,
+            hidden_videos_file=selected_theme.hidden_videos_file,
+            theme_name=selected_theme.name,
+        )
     if args.limit is not None:
         if args.limit <= 0:
             raise SystemExit("--limit must be a positive integer.")
@@ -1243,6 +1387,8 @@ def apply_arg_overrides(config: Config, args: argparse.Namespace) -> Config:
         )
     if args.no_open:
         config = replace(config, open_browser=False)
+    if getattr(args, "output", None) is not None:
+        config = replace(config, report_file=args.output.expanduser())
     return config
 
 
@@ -1260,6 +1406,7 @@ def build_report(
 
     YoutubeDL = import_youtube_dl(auto_install=auto_install)
 
+    logger(f"Theme: {config.theme_name}")
     logger(f"Minimum views: {format_count(config.min_views)}")
     if config.max_videos_per_channel is not None:
         logger(f"Per-channel fetch limit: {format_count(config.max_videos_per_channel)}")
@@ -1335,13 +1482,18 @@ def parse_args() -> argparse.Namespace:
         "--config",
         type=Path,
         default=DEFAULT_CONFIG_PATH,
-        help=f"Config JSON path. Default: {DEFAULT_CONFIG_PATH}",
+        help="Config JSON path. Default: youtube_channel_views_config.json beside this script.",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=DEFAULT_OUTPUT_PATH,
-        help=f"HTML output path. Default: {DEFAULT_OUTPUT_PATH}",
+        default=None,
+        help="Override the selected theme's HTML report path.",
+    )
+    parser.add_argument(
+        "--theme",
+        default=None,
+        help="Theme name to fetch from the config. Defaults to active_theme or the first configured theme.",
     )
     parser.add_argument(
         "--limit",
@@ -1394,7 +1546,7 @@ def run_cli(args: argparse.Namespace) -> int:
     config = apply_arg_overrides(config, args)
     build_report(
         config,
-        args.output,
+        config.report_file,
         auto_install=not args.no_auto_install,
         update_deps=args.update_deps,
     )
@@ -1423,13 +1575,17 @@ def launch_gui(args: argparse.Namespace) -> int:
             self.root.minsize(860, 620)
 
             self.config_path = args.config.expanduser()
-            self.output_path = args.output.expanduser()
+            self.output_path = args.output.expanduser() if args.output is not None else DEFAULT_OUTPUT_PATH
+            self.themes: list[ThemeConfig] = []
+            self.current_theme_name = DEFAULT_THEME_NAME
+            self.loading_theme = False
             self.worker: threading.Thread | None = None
             self.hide_server: ThreadingHTTPServer | None = None
             self.hide_endpoint: str | None = None
             self.messages: queue.Queue[tuple[str, Any]] = queue.Queue()
 
             self.config_var = tk.StringVar(value=str(self.config_path))
+            self.theme_var = tk.StringVar(value=DEFAULT_THEME_NAME)
             self.output_var = tk.StringVar(value=str(self.output_path))
             self.hidden_file_var = tk.StringVar(value=DEFAULT_HIDDEN_VIDEOS_FILENAME)
             self.min_views_var = tk.StringVar(value="50k")
@@ -1463,20 +1619,28 @@ def launch_gui(args: argparse.Namespace) -> int:
             files.grid(row=1, column=0, sticky="ew", pady=(0, 10))
             files.columnconfigure(1, weight=1)
 
-            ttk.Label(files, text="Config").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
-            ttk.Entry(files, textvariable=self.config_var).grid(row=0, column=1, sticky="ew", pady=3)
-            ttk.Button(files, text="Browse", command=self.browse_config).grid(row=0, column=2, padx=(8, 0), pady=3)
-            ttk.Button(files, text="Open", command=self.open_config).grid(row=0, column=3, padx=(8, 0), pady=3)
+            ttk.Label(files, text="Theme").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+            self.theme_combo = ttk.Combobox(files, textvariable=self.theme_var, state="readonly")
+            self.theme_combo.grid(row=0, column=1, sticky="ew", pady=3)
+            self.theme_combo.bind("<<ComboboxSelected>>", self.on_theme_selected)
+            ttk.Button(files, text="Add", command=self.add_theme).grid(row=0, column=2, padx=(8, 0), pady=3)
+            ttk.Button(files, text="Rename", command=self.rename_theme).grid(row=0, column=3, padx=(8, 0), pady=3)
+            ttk.Button(files, text="Remove", command=self.remove_theme).grid(row=0, column=4, padx=(8, 0), pady=3)
 
-            ttk.Label(files, text="Report").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
-            ttk.Entry(files, textvariable=self.output_var).grid(row=1, column=1, sticky="ew", pady=3)
-            ttk.Button(files, text="Browse", command=self.browse_output).grid(row=1, column=2, padx=(8, 0), pady=3)
-            ttk.Button(files, text="Open", command=self.open_report).grid(row=1, column=3, padx=(8, 0), pady=3)
+            ttk.Label(files, text="Config").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+            ttk.Entry(files, textvariable=self.config_var).grid(row=1, column=1, sticky="ew", pady=3)
+            ttk.Button(files, text="Browse", command=self.browse_config).grid(row=1, column=2, padx=(8, 0), pady=3)
+            ttk.Button(files, text="Open", command=self.open_config).grid(row=1, column=3, padx=(8, 0), pady=3)
 
-            ttk.Label(files, text="Hidden list").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=3)
-            ttk.Entry(files, textvariable=self.hidden_file_var).grid(row=2, column=1, sticky="ew", pady=3)
-            ttk.Button(files, text="Browse", command=self.browse_hidden_file).grid(row=2, column=2, padx=(8, 0), pady=3)
-            ttk.Button(files, text="Open", command=self.open_hidden_file).grid(row=2, column=3, padx=(8, 0), pady=3)
+            ttk.Label(files, text="Report").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=3)
+            ttk.Entry(files, textvariable=self.output_var).grid(row=2, column=1, sticky="ew", pady=3)
+            ttk.Button(files, text="Browse", command=self.browse_output).grid(row=2, column=2, padx=(8, 0), pady=3)
+            ttk.Button(files, text="Open", command=self.open_report).grid(row=2, column=3, padx=(8, 0), pady=3)
+
+            ttk.Label(files, text="Hidden list").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
+            ttk.Entry(files, textvariable=self.hidden_file_var).grid(row=3, column=1, sticky="ew", pady=3)
+            ttk.Button(files, text="Browse", command=self.browse_hidden_file).grid(row=3, column=2, padx=(8, 0), pady=3)
+            ttk.Button(files, text="Open", command=self.open_hidden_file).grid(row=3, column=3, padx=(8, 0), pady=3)
 
             settings = ttk.Frame(outer)
             settings.grid(row=2, column=0, sticky="ew", pady=(0, 10))
@@ -1570,21 +1734,26 @@ def launch_gui(args: argparse.Namespace) -> int:
                 self.reload_config()
 
         def browse_output(self) -> None:
+            config_dir = Path(self.config_var.get()).expanduser().parent
+            path = optional_path(self.output_var.get(), config_dir) or default_report_file_for_theme(
+                self.current_theme_name,
+                config_dir,
+            )
             chosen = filedialog.asksaveasfilename(
                 title="Choose report HTML",
-                initialdir=str(self.output_path.parent),
-                initialfile=self.output_path.name,
+                initialdir=str(path.parent),
+                initialfile=path.name,
                 defaultextension=".html",
                 filetypes=[("HTML files", "*.html"), ("All files", "*")],
             )
             if chosen:
                 self.output_path = Path(chosen).expanduser()
-                self.output_var.set(str(self.output_path))
+                self.output_var.set(path_text_relative_to(self.output_path, config_dir))
 
         def browse_hidden_file(self) -> None:
             config_dir = Path(self.config_var.get()).expanduser().parent
             path = optional_path(self.hidden_file_var.get(), config_dir) or (
-                config_dir / DEFAULT_HIDDEN_VIDEOS_FILENAME
+                default_hidden_videos_file_for_theme(self.current_theme_name, config_dir)
             )
             chosen = filedialog.asksaveasfilename(
                 title="Choose hidden videos JSON",
@@ -1614,7 +1783,11 @@ def launch_gui(args: argparse.Namespace) -> int:
             subprocess.run(["open", str(path)], check=False)
 
         def open_report(self) -> None:
-            path = Path(self.output_var.get()).expanduser()
+            config_dir = Path(self.config_var.get()).expanduser().parent
+            path = optional_path(self.output_var.get(), config_dir) or default_report_file_for_theme(
+                self.current_theme_name,
+                config_dir,
+            )
             if not path.exists():
                 messagebox.showwarning("Report not found", f"No report exists at:\n{path}")
                 return
@@ -1623,19 +1796,20 @@ def launch_gui(args: argparse.Namespace) -> int:
         def open_hidden_file(self) -> None:
             config_dir = Path(self.config_var.get()).expanduser().parent
             path = optional_path(self.hidden_file_var.get(), config_dir) or (
-                config_dir / DEFAULT_HIDDEN_VIDEOS_FILENAME
+                default_hidden_videos_file_for_theme(self.current_theme_name, config_dir)
             )
             if not path.exists():
                 write_hidden_video_records(path, {})
             subprocess.run(["open", str(path)], check=False)
 
-        def ensure_hide_endpoint(self, hidden_videos_file: Path) -> str:
+        def ensure_hide_endpoint(self, hidden_videos_file: Path, base_dir: Path) -> str:
             hidden_videos_file = hidden_videos_file.expanduser()
             if self.hide_server is None:
-                self.hide_server, self.hide_endpoint = start_hide_video_server(hidden_videos_file)
+                self.hide_server, self.hide_endpoint = start_hide_video_server(hidden_videos_file, base_dir)
                 self.append_log(f"Started hide-button helper: {self.hide_endpoint}")
             else:
                 self.hide_server.hidden_videos_file = hidden_videos_file  # type: ignore[attr-defined]
+                self.hide_server.hidden_videos_base_dir = base_dir.expanduser()  # type: ignore[attr-defined]
             return self.hide_endpoint or ""
 
         def on_close(self) -> None:
@@ -1657,6 +1831,147 @@ def launch_gui(args: argparse.Namespace) -> int:
 
         def queue_log(self, message: str) -> None:
             self.messages.put(("log", message))
+
+        def config_dir(self) -> Path:
+            return Path(self.config_var.get()).expanduser().parent
+
+        def theme_names(self) -> list[str]:
+            return [theme.name for theme in self.themes]
+
+        def theme_index(self, name: str) -> int | None:
+            for index, theme in enumerate(self.themes):
+                if theme.name == name:
+                    return index
+            return None
+
+        def theme_from_form(self, name: str) -> ThemeConfig:
+            config_dir = self.config_dir()
+            report_file = optional_path(self.output_var.get(), config_dir) or default_report_file_for_theme(
+                name,
+                config_dir,
+            )
+            hidden_videos_file = optional_path(
+                self.hidden_file_var.get(),
+                config_dir,
+            ) or default_hidden_videos_file_for_theme(name, config_dir)
+            return ThemeConfig(
+                name=name,
+                channels=[channel for channel in self.get_channels() if channel.url],
+                report_file=report_file,
+                hidden_videos_file=hidden_videos_file,
+            )
+
+        def capture_current_theme(self) -> None:
+            if self.loading_theme or not self.themes:
+                return
+            index = self.theme_index(self.current_theme_name)
+            if index is None:
+                return
+            self.themes[index] = self.theme_from_form(self.current_theme_name)
+
+        def update_theme_combo(self) -> None:
+            names = self.theme_names()
+            self.theme_combo.configure(values=names)
+            if self.current_theme_name not in names and names:
+                self.current_theme_name = names[0]
+            self.theme_var.set(self.current_theme_name)
+
+        def load_theme_into_form(self, theme: ThemeConfig) -> None:
+            config_dir = self.config_dir()
+            self.loading_theme = True
+            try:
+                self.current_theme_name = theme.name
+                self.theme_var.set(theme.name)
+                self.output_path = theme.report_file
+                self.output_var.set(path_text_relative_to(theme.report_file, config_dir))
+                self.hidden_file_var.set(path_text_relative_to(theme.hidden_videos_file, config_dir))
+                self.set_channels(theme.channels)
+            finally:
+                self.loading_theme = False
+
+        def on_theme_selected(self, event: object | None = None) -> None:
+            if self.loading_theme:
+                return
+            selected_name = self.theme_var.get()
+            self.capture_current_theme()
+            index = self.theme_index(selected_name)
+            if index is None:
+                return
+            self.load_theme_into_form(self.themes[index])
+            self.status_var.set(f"Selected theme: {selected_name}")
+
+        def add_theme(self) -> None:
+            self.capture_current_theme()
+            name = simpledialog.askstring("Add theme", "Theme name:", parent=self.root)
+            if name is None:
+                return
+            name = name.strip()
+            if not name:
+                messagebox.showerror("Add theme", "Theme name cannot be empty.")
+                return
+            if self.theme_index(name) is not None:
+                messagebox.showerror("Add theme", f"A theme named '{name}' already exists.")
+                return
+            config_dir = self.config_dir()
+            theme = ThemeConfig(
+                name=name,
+                channels=[],
+                report_file=default_report_file_for_theme(name, config_dir),
+                hidden_videos_file=default_hidden_videos_file_for_theme(name, config_dir),
+            )
+            self.themes.append(theme)
+            self.current_theme_name = name
+            self.update_theme_combo()
+            self.load_theme_into_form(theme)
+            self.status_var.set(f"Added theme: {name}")
+
+        def rename_theme(self) -> None:
+            self.capture_current_theme()
+            old_name = self.current_theme_name
+            name = simpledialog.askstring("Rename theme", "Theme name:", initialvalue=old_name, parent=self.root)
+            if name is None:
+                return
+            name = name.strip()
+            if not name:
+                messagebox.showerror("Rename theme", "Theme name cannot be empty.")
+                return
+            existing_index = self.theme_index(name)
+            if existing_index is not None and name != old_name:
+                messagebox.showerror("Rename theme", f"A theme named '{name}' already exists.")
+                return
+            index = self.theme_index(old_name)
+            if index is None:
+                return
+            old_theme = self.themes[index]
+            renamed = ThemeConfig(
+                name=name,
+                channels=old_theme.channels,
+                report_file=old_theme.report_file,
+                hidden_videos_file=old_theme.hidden_videos_file,
+            )
+            self.themes[index] = renamed
+            self.current_theme_name = name
+            self.update_theme_combo()
+            self.load_theme_into_form(renamed)
+            self.status_var.set(f"Renamed theme: {old_name} -> {name}")
+
+        def remove_theme(self) -> None:
+            if len(self.themes) <= 1:
+                messagebox.showinfo("Remove theme", "At least one theme is required.")
+                return
+            name = self.current_theme_name
+            if not messagebox.askyesno("Remove theme", f"Remove theme '{name}'?"):
+                return
+            index = self.theme_index(name)
+            if index is None:
+                return
+            del self.themes[index]
+            next_index = min(index, len(self.themes) - 1)
+            next_theme = self.themes[next_index]
+            self.current_theme_name = next_theme.name
+            self.update_theme_combo()
+            self.load_theme_into_form(next_theme)
+            self.status_var.set(f"Removed theme: {name}")
 
         def enabled_label(self, enabled: bool) -> str:
             return "Yes" if enabled else "No"
@@ -1752,7 +2067,6 @@ def launch_gui(args: argparse.Namespace) -> int:
                 messagebox.showerror("Config error", str(exc))
                 return
 
-            self.output_path = Path(self.output_var.get()).expanduser()
             self.min_views_var.set(format_count(config.min_views).replace(",", ""))
             self.max_videos_var.set("" if config.max_videos_per_channel is None else str(config.max_videos_per_channel))
             self.cookies_browser_var.set(config.cookies_from_browser or "")
@@ -1760,9 +2074,25 @@ def launch_gui(args: argparse.Namespace) -> int:
             self.cookies_file_var.set(
                 "" if config.cookies_file is None else path_text_relative_to(config.cookies_file, config.config_dir)
             )
-            self.hidden_file_var.set(path_text_relative_to(config.hidden_videos_file, config.config_dir))
             self.open_browser_var.set(config.open_browser)
-            self.set_channels(config.channels)
+            self.themes = list(config.themes) or [
+                ThemeConfig(
+                    name=config.theme_name,
+                    channels=config.channels,
+                    report_file=config.report_file,
+                    hidden_videos_file=config.hidden_videos_file,
+                )
+            ]
+            self.current_theme_name = config.theme_name
+            self.update_theme_combo()
+            self.load_theme_into_form(
+                ThemeConfig(
+                    name=config.theme_name,
+                    channels=config.channels,
+                    report_file=config.report_file,
+                    hidden_videos_file=config.hidden_videos_file,
+                )
+            )
             if show_status:
                 self.status_var.set(f"Loaded config: {self.config_path}")
 
@@ -1770,32 +2100,42 @@ def launch_gui(args: argparse.Namespace) -> int:
             min_views_text = self.min_views_var.get().strip()
             max_videos_text = self.max_videos_var.get().strip()
             config_dir = Path(self.config_var.get()).expanduser().parent
-            channels = [channel for channel in self.get_channels() if channel.url]
-            if not channels:
-                raise ValueError("Add at least one channel URL.")
-            if require_enabled and not any(channel.enabled for channel in channels):
+            self.capture_current_theme()
+            if not self.themes:
+                self.themes = [
+                    ThemeConfig(
+                        name=DEFAULT_THEME_NAME,
+                        channels=[],
+                        report_file=default_report_file_for_theme(DEFAULT_THEME_NAME, config_dir),
+                        hidden_videos_file=default_hidden_videos_file_for_theme(DEFAULT_THEME_NAME, config_dir),
+                    )
+                ]
+                self.current_theme_name = DEFAULT_THEME_NAME
+                self.update_theme_combo()
+
+            selected_theme = select_theme(self.themes, self.current_theme_name)
+            if require_enabled and not any(channel.enabled for channel in selected_theme.channels):
                 raise ValueError("Enable at least one channel before fetching.")
 
             cookies_browser = optional_cookie_browser(self.cookies_browser_var.get())
             cookies_file = optional_cookie_file(self.cookies_file_var.get(), config_dir)
-            hidden_videos_file = optional_path(
-                self.hidden_file_var.get(),
-                config_dir,
-            ) or (config_dir / DEFAULT_HIDDEN_VIDEOS_FILENAME)
             if cookies_browser and cookies_file:
                 raise ValueError("Use either a cookies browser or a cookies file, not both.")
 
             return Config(
                 min_views=parse_count(min_views_text),
-                channels=channels,
+                channels=selected_theme.channels,
                 max_videos_per_channel=optional_positive_int(max_videos_text, "Max videos/channel"),
                 fetch_missing_view_counts=True,
                 open_browser=bool(self.open_browser_var.get()),
                 cookies_from_browser=cookies_browser,
                 browser_profile=optional_string(self.browser_profile_var.get()),
                 cookies_file=cookies_file,
-                hidden_videos_file=hidden_videos_file,
+                report_file=selected_theme.report_file,
+                hidden_videos_file=selected_theme.hidden_videos_file,
                 config_dir=config_dir,
+                theme_name=selected_theme.name,
+                themes=tuple(self.themes),
             )
 
         def config_json(self, config: Config) -> dict[str, Any]:
@@ -1810,9 +2150,9 @@ def launch_gui(args: argparse.Namespace) -> int:
                 "cookies_from_browser": config.cookies_from_browser,
                 "browser_profile": config.browser_profile,
                 "cookies_file": cookies_file,
-                "hidden_videos_file": path_text_relative_to(config.hidden_videos_file, config_dir),
                 "open_browser": config.open_browser,
-                "channels": [channel_config_to_json(channel) for channel in config.channels],
+                "active_theme": config.theme_name,
+                "themes": [theme_config_to_json(theme, config_dir) for theme in config.themes],
             }
 
         def save_config(self) -> None:
@@ -1834,8 +2174,8 @@ def launch_gui(args: argparse.Namespace) -> int:
                 return
             try:
                 config = self.form_config(require_enabled=True)
-                output_path = Path(self.output_var.get()).expanduser()
-                hide_endpoint = self.ensure_hide_endpoint(config.hidden_videos_file)
+                output_path = config.report_file
+                hide_endpoint = self.ensure_hide_endpoint(config.hidden_videos_file, config.config_dir)
             except Exception as exc:
                 messagebox.showerror("Cannot fetch", str(exc))
                 return

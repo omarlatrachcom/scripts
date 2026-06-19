@@ -98,20 +98,21 @@ typing long `yt-dlp` commands.
 
 ### `youtube_channel_views_browser.py`
 
-YouTube Channel Views Browser builds a local HTML report from channels listed in
-`youtube_channel_views_config.json`.
+YouTube Channel Views Browser builds local HTML reports from themed channel
+groups listed in `youtube_channel_views_config.json`.
 
 What it does:
 
-- Reads `min_views` and `channels` from the JSON config file.
-- Lets you enable or disable individual channels from the GUI before fetching.
+- Reads `min_views` and the selected theme from the JSON config file.
+- Lets you add themes, then enable or disable individual channels per theme
+  from the GUI before fetching.
 - Fetches channel video metadata with `yt-dlp`.
 - Filters out videos below the configured minimum view count.
 - Sorts matching videos by view count, highest first.
-- Writes `youtube_channel_views_report.html` and opens it in the browser.
+- Writes the selected theme's report HTML and opens it in the browser.
 - Adds a `Hide` button beside each video in the report. Hidden-video records
-  are stored in `youtube_channel_views_hidden_videos.json` and are filtered out
-  of future reports.
+  are stored in the selected theme's hidden-video JSON file and are filtered
+  out of future reports for that theme.
 - Auto-installs `yt-dlp` and `yt-dlp-ejs` on first run if they are missing.
   Dependencies are kept in a private environment at
   `~/Library/Application Support/YouTubeChannelViewsBrowser/venv`.
@@ -125,8 +126,10 @@ python3 youtube_channel_views_browser.py
 ```
 
 Or double-click `YouTube Channel Views Browser.command` from Finder.
-In the Channels table, select one or more rows and use `Enable`, `Disable`, or
-`Toggle`. Disabled channels stay in the config but are skipped during fetching.
+Use the Theme dropdown to switch between themed channel groups. Each theme has
+its own channel list, report file, and hidden-video file. In the Channels table,
+select one or more rows and use `Enable`, `Disable`, or `Toggle`. Disabled
+channels stay in the config but are skipped during fetching.
 In the generated report, click `Hide` beside any video to keep it from appearing
 in future reports. This writes to the external hidden-video JSON file shown in
 the GUI and report. Edit that JSON file or remove entries from it if you need to
@@ -151,6 +154,12 @@ For a quick test run, limit how many videos are scanned per channel:
 
 ```bash
 python3 youtube_channel_views_browser.py --cli --limit 25
+```
+
+Fetch a specific theme from the command line:
+
+```bash
+python3 youtube_channel_views_browser.py --cli --theme "Default"
 ```
 
 `min_views` accepts values like `50000`, `50k`, or `1.2m`.
