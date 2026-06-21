@@ -108,11 +108,14 @@ What it does:
   from the GUI before fetching.
 - Fetches channel video metadata with `yt-dlp`.
 - Filters out videos below the configured minimum view count.
+- Optionally limits fetches by max videos per channel and published-date range.
 - Sorts matching videos by view count, highest first.
 - Writes the selected theme's report HTML and opens it in the browser.
+- Creates a timestamped key-events fetch log under `logs/` for each fetch.
 - Adds a `Hide` button beside each video in the report. Hidden-video records
-  are stored in the selected theme's hidden-video JSON file and are filtered
-  out of future reports for that theme.
+  are stored in the selected theme's hidden-video JSON file, and future reports
+  filter against all `youtube_channel_views*saved_videos.json` stores beside the
+  config file.
 - Auto-installs `yt-dlp` and `yt-dlp-ejs` on first run if they are missing.
   Dependencies are kept in a private environment at
   `~/Library/Application Support/YouTubeChannelViewsBrowser/venv`.
@@ -130,10 +133,17 @@ Use the Theme dropdown to switch between themed channel groups. Each theme has
 its own channel list, report file, and hidden-video file. In the Channels table,
 select one or more rows and use `Enable`, `Disable`, or `Toggle`. Disabled
 channels stay in the config but are skipped during fetching.
+Use `Max/channel` for a quick partial scan. Use `Published after` and
+`Published before` to restrict results to an inclusive published-date range in
+`YYYY-MM-DD` format.
+Click `Preview Channels` to get a brief summary of the enabled active channels,
+including current video counts and how many newest videos the fetch cap will
+scan. The preview uses the GUI log pane and avoids detailed view-count lookups.
 In the generated report, click `Hide` beside any video to keep it from appearing
 in future reports. This writes to the external hidden-video JSON file shown in
-the GUI and report. Edit that JSON file or remove entries from it if you need to
-reverse a hide. Keep the GUI open while clicking `Hide`; the report writes to
+the GUI and report. Existing saved-video stores beside the config file are also
+used as filters. Edit those JSON files or remove entries from them if you need
+to reverse a hide. Keep the GUI open while clicking `Hide`; the report writes to
 the file through the GUI's local helper.
 
 If YouTube shows `Sign in to confirm you're not a bot`, keep
@@ -155,6 +165,16 @@ For a quick test run, limit how many videos are scanned per channel:
 ```bash
 python3 youtube_channel_views_browser.py --cli --limit 25
 ```
+
+Limit by published date:
+
+```bash
+python3 youtube_channel_views_browser.py --cli --published-after 2026-01-01 --published-before 2026-06-21
+```
+
+Each fetch writes a compact timestamped trace to `logs/` beside the config file.
+The file includes key setup, channel, filter, and report events, but skips the
+repeated detailed lookup progress lines.
 
 Fetch a specific theme from the command line:
 

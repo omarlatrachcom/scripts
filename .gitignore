@@ -3,3 +3,4 @@ __pycache__/
 *.py[cod]
 youtube_channel_views*_report.html
 youtube_channel_views*_saved_videos.json
+logs/

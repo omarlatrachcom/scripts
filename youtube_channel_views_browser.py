@@ -29,7 +29,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TextIO
 from urllib.parse import parse_qs, urlparse
 
 
@@ -48,6 +48,9 @@ DEFAULT_SAVED_VIDEOS_FILENAME = "youtube_channel_views_saved_videos.json"
 DEFAULT_SAVED_VIDEOS_PATH = SCRIPT_DIR / DEFAULT_SAVED_VIDEOS_FILENAME
 DEFAULT_RECENT_SAVED_VIDEOS_FILENAME = "youtube_channel_views_recent_saved_videos.json"
 DEFAULT_RECENT_SAVED_VIDEOS_PATH = SCRIPT_DIR / DEFAULT_RECENT_SAVED_VIDEOS_FILENAME
+SAVED_VIDEO_STORE_GLOB = "youtube_channel_views*saved_videos.json"
+FETCH_LOG_DIRNAME = "logs"
+FETCH_LOG_FILENAME_PREFIX = "youtube_channel_views_fetch"
 DEFAULT_THEME_NAME = "Default"
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "YouTubeChannelViewsBrowser"
 VENV_DIR = APP_SUPPORT_DIR / "venv"
@@ -59,6 +62,8 @@ DEFAULT_CONFIG = {
     "min_views": "50k",
     "recent_min_views": "10k",
     "max_videos_per_channel": None,
+    "published_after": None,
+    "published_before": None,
     "cookies_from_browser": "chrome",
     "browser_profile": None,
     "cookies_file": None,
@@ -117,6 +122,8 @@ class Config:
     recent_min_views: int
     channels: list[ChannelConfig]
     max_videos_per_channel: int | None = None
+    published_after: int | None = None
+    published_before: int | None = None
     fetch_missing_view_counts: bool = True
     open_browser: bool = True
     cookies_from_browser: str | None = None
@@ -155,8 +162,17 @@ class ChannelStats:
     scanned: int = 0
     included: int = 0
     missing_view_count: int = 0
+    date_filtered: int = 0
     detail_lookup_failed: int = 0
     auth_failed: int = 0
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class ChannelPreview:
+    channel_url: str
+    title: str
+    video_count: int | None = None
     error: str = ""
 
 
@@ -217,6 +233,34 @@ def optional_positive_int(value: Any, field_name: str) -> int | None:
     if parsed <= 0:
         raise ValueError(f"{field_name} must be a positive integer or null.")
     return parsed
+
+
+def optional_date_limit(value: Any, field_name: str) -> int | None:
+    text = optional_string(value)
+    if text is None:
+        return None
+
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        return int(parsed.strftime("%Y%m%d"))
+    raise ValueError(f"{field_name} must be a date like 2026-06-21.")
+
+
+def format_date_limit(value: int | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if not re.fullmatch(r"\d{8}", text):
+        return None
+    return f"{text[0:4]}-{text[4:6]}-{text[6:8]}"
+
+
+def validate_date_range(published_after: int | None, published_before: int | None) -> None:
+    if published_after is not None and published_before is not None and published_after > published_before:
+        raise ValueError("published_after cannot be later than published_before.")
 
 
 def optional_string(value: Any) -> str | None:
@@ -410,6 +454,67 @@ def slugify_theme_name(name: str) -> str:
     return slug or "theme"
 
 
+def fetch_log_directory(config: Config) -> Path:
+    return config.config_dir / FETCH_LOG_DIRNAME
+
+
+def next_fetch_log_path(config: Config) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    theme_slug = slugify_theme_name(config.theme_name)
+    directory = fetch_log_directory(config)
+    base_name = f"{FETCH_LOG_FILENAME_PREFIX}_{theme_slug}_{timestamp}"
+    path = directory / f"{base_name}.log"
+    counter = 2
+    while path.exists():
+        path = directory / f"{base_name}_{counter}.log"
+        counter += 1
+    return path
+
+
+def is_key_fetch_log_message(message: str) -> bool:
+    text = message.strip()
+    if not text:
+        return False
+    skipped_fragments = (
+        "Fetching detailed view counts for entries missing counts...",
+    )
+    return not any(fragment in text for fragment in skipped_fragments)
+
+
+class FetchRunLogger:
+    def __init__(self, config: Config, ui_logger: LogFn) -> None:
+        self.ui_logger = ui_logger
+        self.path = next_fetch_log_path(config)
+        self.handle: TextIO | None = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.handle = self.path.open("a", encoding="utf-8")
+        except OSError as exc:
+            self.ui_logger(f"Could not create fetch log: {exc}")
+            return
+
+        self.ui_logger(f"Fetch log: {self.path}")
+        self.write_key("Fetch started.")
+
+    def __call__(self, message: str) -> None:
+        self.ui_logger(message)
+        if is_key_fetch_log_message(message):
+            self.write_key(message)
+
+    def write_key(self, message: str) -> None:
+        if self.handle is None:
+            return
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.handle.write(f"[{timestamp}] {message.rstrip()}\n")
+        self.handle.flush()
+
+    def close(self) -> None:
+        if self.handle is None:
+            return
+        self.handle.close()
+        self.handle = None
+
+
 def default_report_file_for_theme(name: str, config_dir: Path) -> Path:
     if name == DEFAULT_THEME_NAME:
         return config_dir / DEFAULT_REPORT_FILENAME
@@ -543,12 +648,52 @@ def unique_video_store_paths(paths: tuple[Path, ...]) -> tuple[Path, ...]:
     return tuple(unique_paths)
 
 
+def theme_video_store_paths(theme: ThemeConfig) -> tuple[Path, ...]:
+    return (
+        theme.saved_videos_file,
+        theme.recent_saved_videos_file,
+        *theme.extra_saved_videos_files,
+    )
+
+
+def config_video_store_paths(config: Config) -> tuple[Path, ...]:
+    return (
+        config.saved_videos_file,
+        config.recent_saved_videos_file,
+        *config.extra_saved_videos_files,
+    )
+
+
+def discovered_saved_video_store_paths(config: Config) -> tuple[Path, ...]:
+    try:
+        candidates = sorted(
+            config.config_dir.expanduser().glob(SAVED_VIDEO_STORE_GLOB),
+            key=lambda path: path.name,
+        )
+    except OSError:
+        return ()
+
+    stores: list[Path] = []
+    for path in candidates:
+        try:
+            if path.is_file():
+                stores.append(path)
+        except OSError:
+            continue
+    return tuple(stores)
+
+
 def saved_video_filter_files(config: Config) -> tuple[Path, ...]:
+    theme_store_files = [
+        store_path
+        for theme in config.themes
+        for store_path in theme_video_store_paths(theme)
+    ]
     return unique_video_store_paths(
         (
-            config.saved_videos_file,
-            config.recent_saved_videos_file,
-            *config.extra_saved_videos_files,
+            *config_video_store_paths(config),
+            *theme_store_files,
+            *discovered_saved_video_store_paths(config),
         )
     )
 
@@ -674,6 +819,15 @@ def load_config(path: Path) -> Config:
             raw.get("max_videos_per_channel"),
             "max_videos_per_channel",
         )
+        published_after = optional_date_limit(
+            raw.get("published_after", raw.get("date_after", raw.get("uploaded_after"))),
+            "published_after",
+        )
+        published_before = optional_date_limit(
+            raw.get("published_before", raw.get("date_before", raw.get("uploaded_before"))),
+            "published_before",
+        )
+        validate_date_range(published_after, published_before)
         fetch_missing_view_counts = bool(raw.get("fetch_missing_view_counts", True))
         open_browser = bool(raw.get("open_browser", True))
         cookies_from_browser = optional_cookie_browser(raw.get("cookies_from_browser"))
@@ -719,6 +873,8 @@ def load_config(path: Path) -> Config:
         recent_min_views=recent_min_views,
         channels=selected_theme.channels,
         max_videos_per_channel=max_videos_per_channel,
+        published_after=published_after,
+        published_before=published_before,
         fetch_missing_view_counts=fetch_missing_view_counts,
         open_browser=open_browser,
         cookies_from_browser=cookies_from_browser,
@@ -960,6 +1116,30 @@ def published_sort_value(entry: dict[str, Any]) -> int:
     return 0
 
 
+def has_published_date_filter(config: Config) -> bool:
+    return config.published_after is not None or config.published_before is not None
+
+
+def published_date_in_range(value: int, config: Config, *, unknown_matches: bool) -> bool:
+    if not has_published_date_filter(config):
+        return True
+    if not value:
+        return unknown_matches
+    if config.published_after is not None and value < config.published_after:
+        return False
+    if config.published_before is not None and value > config.published_before:
+        return False
+    return True
+
+
+def entry_matches_published_date_range(entry: dict[str, Any], config: Config, *, unknown_matches: bool) -> bool:
+    return published_date_in_range(published_sort_value(entry), config, unknown_matches=unknown_matches)
+
+
+def video_matches_published_date_range(video: Video, config: Config) -> bool:
+    return published_date_in_range(video.published_sort_value, config, unknown_matches=False)
+
+
 def video_from_entry(entry: dict[str, Any], channel_title: str, channel_url: str, source_order: int) -> Video | None:
     view_count = coerce_optional_count(entry.get("view_count"))
     if view_count is None:
@@ -1067,6 +1247,15 @@ def fetch_channel_videos(
     channel_title = str(info.get("channel") or info.get("uploader") or info.get("title") or channel_url)
     raw_entries = info.get("entries") or []
     entries = [entry for entry in raw_entries if isinstance(entry, dict)]
+    scanned_count = len(entries)
+    date_filtered = 0
+    if has_published_date_filter(config):
+        before_count = len(entries)
+        entries = [
+            entry for entry in entries
+            if entry_matches_published_date_range(entry, config, unknown_matches=True)
+        ]
+        date_filtered += before_count - len(entries)
     missing_view_indexes = [
         index for index, entry in enumerate(entries)
         if coerce_optional_count(entry.get("view_count")) is None
@@ -1097,22 +1286,122 @@ def fetch_channel_videos(
         if video is None:
             missing_view_count += 1
             continue
+        if not video_matches_published_date_range(video, config):
+            date_filtered += 1
+            continue
         if video.view_count >= candidate_min_views:
             videos.append(video)
 
     return videos, ChannelStats(
         channel_url=channel_url,
         title=channel_title,
-        scanned=len(entries),
+        scanned=scanned_count,
         included=len(videos),
         missing_view_count=missing_view_count,
+        date_filtered=date_filtered,
         detail_lookup_failed=detail_stats.failed,
         auth_failed=detail_stats.auth_failed,
     )
 
 
+def channel_video_count_from_info(info: dict[str, Any]) -> int | None:
+    raw_entries = info.get("entries")
+    if isinstance(raw_entries, list):
+        return sum(1 for entry in raw_entries if isinstance(entry, dict))
+
+    for key in ("playlist_count", "n_entries", "playlist_n_entries"):
+        value = coerce_optional_count(info.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def scan_limit_text(config: Config, video_count: int | None) -> str:
+    if config.max_videos_per_channel is None:
+        return "all current videos" if video_count is not None else "all available videos"
+    if video_count is None:
+        return f"up to {format_count(config.max_videos_per_channel)} newest videos"
+    return f"{format_count(min(config.max_videos_per_channel, video_count))} newest videos"
+
+
+def render_channel_preview_lines(
+    preview: ChannelPreview,
+    config: Config,
+    index: int,
+    total: int,
+) -> list[str]:
+    title = preview.title or preview.channel_url
+    if preview.error:
+        return [
+            f"[{index}/{total}] {title}",
+            f"ERROR: {preview.error}",
+        ]
+
+    count_text = "unknown" if preview.video_count is None else format_count(preview.video_count)
+    return [
+        f"[{index}/{total}] {title}",
+        f"Current videos: {count_text}; will scan: {scan_limit_text(config, preview.video_count)}",
+        f"URL: {preview.channel_url}",
+    ]
+
+
+def preview_active_channels(
+    config: Config,
+    *,
+    auto_install: bool = True,
+    logger: LogFn = print,
+) -> list[ChannelPreview]:
+    YoutubeDL = import_youtube_dl(auto_install=auto_install)
+    channel_urls = enabled_channel_urls(config)
+    if not channel_urls:
+        raise ValueError("No enabled channels. Enable at least one channel before previewing.")
+
+    logger(f"Preview: theme {config.theme_name}; {format_count(len(channel_urls))} enabled active channel(s).")
+    logger(f"Max/channel: {scan_limit_text(config, None)}. Published date: {format_published_date_range(config)}.")
+
+    previews: list[ChannelPreview] = []
+    count_config = replace(config, max_videos_per_channel=None)
+    with YoutubeDL(ytdlp_options(count_config, flat=True)) as ydl:
+        for index, channel_url in enumerate(channel_urls, start=1):
+            try:
+                info = ydl.extract_info(channel_url, download=False)
+            except Exception as exc:
+                message = str(exc).strip() or exc.__class__.__name__
+                preview = ChannelPreview(channel_url=channel_url, title=channel_url, error=message)
+            else:
+                if isinstance(info, dict):
+                    title = str(info.get("channel") or info.get("uploader") or info.get("title") or channel_url)
+                    preview = ChannelPreview(
+                        channel_url=channel_url,
+                        title=title,
+                        video_count=channel_video_count_from_info(info),
+                    )
+                else:
+                    preview = ChannelPreview(
+                        channel_url=channel_url,
+                        title=channel_url,
+                        error="No channel metadata returned.",
+                    )
+            previews.append(preview)
+            for line in render_channel_preview_lines(preview, config, index, len(channel_urls)):
+                logger(line)
+    return previews
+
+
 def format_count(value: int) -> str:
     return f"{value:,}"
+
+
+def format_published_date_range(config: Config) -> str:
+    after = format_date_limit(config.published_after)
+    before = format_date_limit(config.published_before)
+    if after and before:
+        return f"{after} to {before}"
+    if after:
+        return f"from {after}"
+    if before:
+        return f"through {before}"
+    return "any date"
 
 
 def escape(value: str) -> str:
@@ -1131,6 +1420,8 @@ def render_channel_stats(stats: list[ChannelStats]) -> str:
                 f"{format_count(stat.included)} candidates / {format_count(stat.scanned)} scanned"
                 f" / {format_count(stat.missing_view_count)} missing views",
             ]
+            if stat.date_filtered:
+                parts.append(f"{format_count(stat.date_filtered)} outside date range")
             if stat.auth_failed:
                 parts.append(f"<span class=\"error\">{format_count(stat.auth_failed)} blocked by YouTube auth/bot check</span>")
             elif stat.detail_lookup_failed:
@@ -1264,6 +1555,11 @@ def render_html(
         f"<span>Extra saved store: <code>{escape(path_text_relative_to(path, config.config_dir))}</code></span>"
         for path in config.extra_saved_videos_files
     )
+    filter_store_files = saved_video_filter_files(config)
+    filter_store_title = escape(
+        "\n".join(path_text_relative_to(path, config.config_dir) for path in filter_store_files)
+    )
+    published_date_range = escape(format_published_date_range(config))
     theme_name = escape(config.theme_name)
 
     return f"""<!doctype html>
@@ -1429,7 +1725,7 @@ def render_html(
 <body>
   <header>
     <h1>YouTube Channel Videos by Views</h1>
-    <p>Theme: {theme_name}. Generated {escape(generated_at)}. Minimum views: {format_count(config.min_views)}. Recent minimum views: {format_count(config.recent_min_views)}.</p>
+    <p>Theme: {theme_name}. Generated {escape(generated_at)}. Minimum views: {format_count(config.min_views)}. Recent minimum views: {format_count(config.recent_min_views)}. Published date: {published_date_range}.</p>
   </header>
   <main>
     <div class="stats">
@@ -1447,6 +1743,7 @@ def render_html(
         <span>Most-viewed saved videos: <code>{saved_file_text}</code></span>
         <span>Recent saved videos: <code>{recent_saved_file_text}</code></span>
         {extra_saved_file_html}
+        <span title="{filter_store_title}">Filtering saved stores: <code>{format_count(len(filter_store_files))}</code></span>
         <span id="action-status"></span>
       </div>
       {render_video_table(
@@ -1585,6 +1882,23 @@ def apply_arg_overrides(config: Config, args: argparse.Namespace) -> Config:
         if args.limit <= 0:
             raise SystemExit("--limit must be a positive integer.")
         config = replace(config, max_videos_per_channel=args.limit)
+    published_after = config.published_after
+    published_before = config.published_before
+    if getattr(args, "published_after", None) is not None:
+        try:
+            published_after = optional_date_limit(args.published_after, "--published-after")
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+    if getattr(args, "published_before", None) is not None:
+        try:
+            published_before = optional_date_limit(args.published_before, "--published-before")
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+    try:
+        validate_date_range(published_after, published_before)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    config = replace(config, published_after=published_after, published_before=published_before)
     if args.no_cookies:
         config = replace(
             config,
@@ -1637,92 +1951,104 @@ def build_report(
         install_dependencies()
 
     YoutubeDL = import_youtube_dl(auto_install=auto_install)
+    fetch_logger = FetchRunLogger(config, logger)
+    logger = fetch_logger
 
-    logger(f"Theme: {config.theme_name}")
-    logger(f"Minimum views: {format_count(config.min_views)}")
-    logger(f"Recent minimum views: {format_count(config.recent_min_views)}")
-    if config.max_videos_per_channel is not None:
-        logger(f"Per-channel fetch limit: {format_count(config.max_videos_per_channel)}")
-    if config.cookies_file is not None:
-        logger(f"Using cookies file: {config.cookies_file}")
-    elif config.cookies_from_browser is not None:
-        profile_note = f" profile={config.browser_profile}" if config.browser_profile else ""
-        logger(f"Using cookies from browser: {config.cookies_from_browser}{profile_note}")
-    else:
-        logger("No cookies configured; YouTube may block detail lookups.")
+    try:
+        logger(f"Theme: {config.theme_name}")
+        logger(f"Minimum views: {format_count(config.min_views)}")
+        logger(f"Recent minimum views: {format_count(config.recent_min_views)}")
+        if has_published_date_filter(config):
+            logger(f"Published date range: {format_published_date_range(config)}")
+        if config.max_videos_per_channel is not None:
+            logger(f"Per-channel fetch limit: {format_count(config.max_videos_per_channel)}")
+        if config.cookies_file is not None:
+            logger(f"Using cookies file: {config.cookies_file}")
+        elif config.cookies_from_browser is not None:
+            profile_note = f" profile={config.browser_profile}" if config.browser_profile else ""
+            logger(f"Using cookies from browser: {config.cookies_from_browser}{profile_note}")
+        else:
+            logger("No cookies configured; YouTube may block detail lookups.")
 
-    channel_urls = enabled_channel_urls(config)
-    if not channel_urls:
-        raise ValueError("No enabled channels. Enable at least one channel before fetching.")
+        channel_urls = enabled_channel_urls(config)
+        if not channel_urls:
+            raise ValueError("No enabled channels. Enable at least one channel before fetching.")
 
-    all_videos: list[Video] = []
-    stats: list[ChannelStats] = []
-    disabled_count = len(config.channels) - len(channel_urls)
-    if disabled_count:
-        logger(f"Skipping {format_count(disabled_count)} disabled channel(s).")
+        all_videos: list[Video] = []
+        stats: list[ChannelStats] = []
+        disabled_count = len(config.channels) - len(channel_urls)
+        if disabled_count:
+            logger(f"Skipping {format_count(disabled_count)} disabled channel(s).")
 
-    for index, channel_url in enumerate(channel_urls, start=1):
-        logger(f"[{index}/{len(channel_urls)}] Fetching {channel_url}")
-        try:
-            videos, channel_stats = fetch_channel_videos(YoutubeDL, channel_url, config, logger)
-        except Exception as exc:
-            message = str(exc).strip() or exc.__class__.__name__
-            logger(f"  ERROR: {message}")
-            stats.append(ChannelStats(channel_url=channel_url, title=channel_url, error=message))
-            continue
+        for index, channel_url in enumerate(channel_urls, start=1):
+            logger(f"[{index}/{len(channel_urls)}] Fetching {channel_url}")
+            try:
+                videos, channel_stats = fetch_channel_videos(YoutubeDL, channel_url, config, logger)
+            except Exception as exc:
+                message = str(exc).strip() or exc.__class__.__name__
+                logger(f"  ERROR: {message}")
+                stats.append(ChannelStats(channel_url=channel_url, title=channel_url, error=message))
+                continue
 
-        all_videos.extend(videos)
-        stats.append(channel_stats)
-        logger(
-            "  "
-            f"Kept {format_count(channel_stats.included)} candidate(s) of {format_count(channel_stats.scanned)} "
-            f"videos from {channel_stats.title}"
-        )
-
-    saved_store_files = saved_video_filter_files(config)
-    ignored_video_ids: set[str] = set()
-    for store_file in saved_store_files:
-        ignored_video_ids.update(load_saved_video_records(store_file))
-    if ignored_video_ids:
-        before_count = len(all_videos)
-        all_videos = [video for video in all_videos if video.video_id not in ignored_video_ids]
-        filtered_count = before_count - len(all_videos)
-        if filtered_count:
+            all_videos.extend(videos)
+            stats.append(channel_stats)
             logger(
-                f"Filtered out {format_count(filtered_count)} saved video(s) from "
-                f"{format_count(len(saved_store_files))} saved store(s)."
+                "  "
+                f"Kept {format_count(channel_stats.included)} candidate(s) of {format_count(channel_stats.scanned)} "
+                f"videos from {channel_stats.title}"
             )
 
-    videos_by_views = [video for video in all_videos if video.view_count >= config.min_views]
-    videos_by_views.sort(
-        key=lambda video: (video.view_count, video.published_sort_value, -video.source_order),
-        reverse=True,
-    )
-    recent_videos = [video for video in all_videos if video.view_count >= config.recent_min_views]
-    recent_videos.sort(key=recent_video_sort_key, reverse=True)
+        saved_store_files = saved_video_filter_files(config)
+        ignored_video_ids: set[str] = set()
+        for store_file in saved_store_files:
+            ignored_video_ids.update(load_saved_video_records(store_file))
+        if ignored_video_ids:
+            before_count = len(all_videos)
+            all_videos = [video for video in all_videos if video.video_id not in ignored_video_ids]
+            filtered_count = before_count - len(all_videos)
+            if filtered_count:
+                logger(
+                    f"Filtered out {format_count(filtered_count)} saved video(s) from "
+                    f"{format_count(len(saved_store_files))} saved store(s)."
+                )
 
-    output_path = output_path.expanduser()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        render_html(
-            videos_by_views,
-            recent_videos,
-            stats,
-            config,
-            save_endpoint=save_endpoint,
-            recent_save_endpoint=recent_save_endpoint,
-        ),
-        encoding="utf-8",
-    )
+        videos_by_views = [video for video in all_videos if video.view_count >= config.min_views]
+        videos_by_views.sort(
+            key=lambda video: (video.view_count, video.published_sort_value, -video.source_order),
+            reverse=True,
+        )
+        recent_videos = [video for video in all_videos if video.view_count >= config.recent_min_views]
+        recent_videos.sort(key=recent_video_sort_key, reverse=True)
 
-    logger(f"Saved report: {output_path}")
-    if config.open_browser:
-        webbrowser.open(output_path.resolve().as_uri())
-        logger("Opened report in browser.")
+        output_path = output_path.expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            render_html(
+                videos_by_views,
+                recent_videos,
+                stats,
+                config,
+                save_endpoint=save_endpoint,
+                recent_save_endpoint=recent_save_endpoint,
+            ),
+            encoding="utf-8",
+        )
 
-    report_video_ids = {video.video_id for video in [*videos_by_views, *recent_videos]}
-    report_videos = [video for video in all_videos if video.video_id in report_video_ids]
-    return output_path, report_videos, stats
+        logger(f"Saved report: {output_path}")
+        if config.open_browser:
+            webbrowser.open(output_path.resolve().as_uri())
+            logger("Opened report in browser.")
+
+        logger("Fetch completed.")
+        report_video_ids = {video.video_id for video in [*videos_by_views, *recent_videos]}
+        report_videos = [video for video in all_videos if video.video_id in report_video_ids]
+        return output_path, report_videos, stats
+    except BaseException as exc:
+        message = str(exc).strip() or exc.__class__.__name__
+        fetch_logger.write_key(f"Fetch failed: {message}")
+        raise
+    finally:
+        fetch_logger.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -1759,6 +2085,16 @@ def parse_args() -> argparse.Namespace:
         "--recent-min-views",
         default=None,
         help="Temporarily override the minimum view count for the Recent Videos section, e.g. 10000, 10k, or 1.2m.",
+    )
+    parser.add_argument(
+        "--published-after",
+        default=None,
+        help="Only include videos published on or after this date, e.g. 2026-01-01.",
+    )
+    parser.add_argument(
+        "--published-before",
+        default=None,
+        help="Only include videos published on or before this date, e.g. 2026-06-21.",
     )
     parser.add_argument(
         "--no-open",
@@ -1852,6 +2188,8 @@ def launch_gui(args: argparse.Namespace) -> int:
             self.min_views_var = tk.StringVar(value="50k")
             self.recent_min_views_var = tk.StringVar(value="10k")
             self.max_videos_var = tk.StringVar(value="")
+            self.published_after_var = tk.StringVar(value="")
+            self.published_before_var = tk.StringVar(value="")
             self.cookies_browser_var = tk.StringVar(value="")
             self.browser_profile_var = tk.StringVar(value="")
             self.cookies_file_var = tk.StringVar(value="")
@@ -1921,7 +2259,13 @@ def launch_gui(args: argparse.Namespace) -> int:
             ttk.Label(settings, text="Max/channel").grid(row=0, column=4, sticky="w", padx=(14, 8), pady=3)
             ttk.Entry(settings, textvariable=self.max_videos_var, width=12).grid(row=0, column=5, sticky="ew", pady=3)
 
-            ttk.Label(settings, text="Cookies browser").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+            ttk.Label(settings, text="Published after").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+            ttk.Entry(settings, textvariable=self.published_after_var, width=12).grid(row=1, column=1, sticky="ew", pady=3)
+            ttk.Label(settings, text="Published before").grid(row=1, column=2, sticky="w", padx=(14, 8), pady=3)
+            ttk.Entry(settings, textvariable=self.published_before_var, width=12).grid(row=1, column=3, sticky="ew", pady=3)
+            ttk.Label(settings, text="YYYY-MM-DD").grid(row=1, column=4, columnspan=2, sticky="w", padx=(14, 0), pady=3)
+
+            ttk.Label(settings, text="Cookies browser").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=3)
             cookie_values = ["", *sorted(SUPPORTED_COOKIE_BROWSERS)]
             ttk.Combobox(
                 settings,
@@ -1929,17 +2273,17 @@ def launch_gui(args: argparse.Namespace) -> int:
                 values=cookie_values,
                 state="readonly",
                 width=16,
-            ).grid(row=1, column=1, sticky="ew", pady=3)
-            ttk.Label(settings, text="Profile").grid(row=1, column=2, sticky="w", padx=(14, 8), pady=3)
-            ttk.Entry(settings, textvariable=self.browser_profile_var).grid(row=1, column=3, sticky="ew", pady=3)
-            ttk.Label(settings, text="Cookies file").grid(row=1, column=4, sticky="w", padx=(14, 8), pady=3)
+            ).grid(row=2, column=1, sticky="ew", pady=3)
+            ttk.Label(settings, text="Profile").grid(row=2, column=2, sticky="w", padx=(14, 8), pady=3)
+            ttk.Entry(settings, textvariable=self.browser_profile_var).grid(row=2, column=3, sticky="ew", pady=3)
+            ttk.Label(settings, text="Cookies file").grid(row=2, column=4, sticky="w", padx=(14, 8), pady=3)
             cookie_file_frame = ttk.Frame(settings)
-            cookie_file_frame.grid(row=1, column=5, sticky="ew", pady=3)
+            cookie_file_frame.grid(row=2, column=5, sticky="ew", pady=3)
             cookie_file_frame.columnconfigure(0, weight=1)
             ttk.Entry(cookie_file_frame, textvariable=self.cookies_file_var).grid(row=0, column=0, sticky="ew")
             ttk.Button(cookie_file_frame, text="Browse", command=self.browse_cookies_file).grid(row=0, column=1, padx=(8, 0))
             ttk.Checkbutton(settings, text="Open browser after fetch", variable=self.open_browser_var).grid(
-                row=2, column=0, columnspan=6, sticky="w", pady=3
+                row=3, column=0, columnspan=6, sticky="w", pady=3
             )
 
             channels_frame = ttk.LabelFrame(outer, text="Channels")
@@ -1978,6 +2322,8 @@ def launch_gui(args: argparse.Namespace) -> int:
             buttons.grid(row=4, column=0, sticky="ew", pady=(0, 10))
             self.fetch_button = ttk.Button(buttons, text="Fetch Videos", command=self.start_fetch)
             self.fetch_button.pack(side="left")
+            self.preview_button = ttk.Button(buttons, text="Preview Channels", command=self.start_preview)
+            self.preview_button.pack(side="left", padx=(8, 0))
             ttk.Button(buttons, text="Open Report in Browser", command=self.open_report).pack(side="left", padx=(8, 0))
             ttk.Button(buttons, text="Save Config", command=self.save_config).pack(side="left", padx=(8, 0))
             ttk.Button(buttons, text="Reload Config", command=self.reload_config).pack(side="left", padx=(8, 0))
@@ -2394,6 +2740,8 @@ def launch_gui(args: argparse.Namespace) -> int:
             self.min_views_var.set(format_count(config.min_views).replace(",", ""))
             self.recent_min_views_var.set(format_count(config.recent_min_views).replace(",", ""))
             self.max_videos_var.set("" if config.max_videos_per_channel is None else str(config.max_videos_per_channel))
+            self.published_after_var.set(format_date_limit(config.published_after) or "")
+            self.published_before_var.set(format_date_limit(config.published_before) or "")
             self.cookies_browser_var.set(config.cookies_from_browser or "")
             self.browser_profile_var.set(config.browser_profile or "")
             self.cookies_file_var.set(
@@ -2429,6 +2777,9 @@ def launch_gui(args: argparse.Namespace) -> int:
             min_views_text = self.min_views_var.get().strip()
             recent_min_views_text = self.recent_min_views_var.get().strip()
             max_videos_text = self.max_videos_var.get().strip()
+            published_after = optional_date_limit(self.published_after_var.get(), "Published after")
+            published_before = optional_date_limit(self.published_before_var.get(), "Published before")
+            validate_date_range(published_after, published_before)
             config_dir = Path(self.config_var.get()).expanduser().parent
             self.capture_current_theme()
             if not self.themes:
@@ -2459,6 +2810,8 @@ def launch_gui(args: argparse.Namespace) -> int:
                 recent_min_views=parse_count(recent_min_views_text or min_views_text),
                 channels=selected_theme.channels,
                 max_videos_per_channel=optional_positive_int(max_videos_text, "Max videos/channel"),
+                published_after=published_after,
+                published_before=published_before,
                 fetch_missing_view_counts=True,
                 open_browser=bool(self.open_browser_var.get()),
                 cookies_from_browser=cookies_browser,
@@ -2483,6 +2836,8 @@ def launch_gui(args: argparse.Namespace) -> int:
                 "min_views": self.min_views_var.get().strip() or str(config.min_views),
                 "recent_min_views": self.recent_min_views_var.get().strip() or str(config.recent_min_views),
                 "max_videos_per_channel": config.max_videos_per_channel,
+                "published_after": format_date_limit(config.published_after),
+                "published_before": format_date_limit(config.published_before),
                 "cookies_from_browser": config.cookies_from_browser,
                 "browser_profile": config.browser_profile,
                 "cookies_file": cookies_file,
@@ -2505,6 +2860,45 @@ def launch_gui(args: argparse.Namespace) -> int:
                 return
             self.status_var.set(f"Saved config: {self.config_path}")
 
+        def set_action_buttons_enabled(self, enabled: bool) -> None:
+            state = "normal" if enabled else "disabled"
+            self.fetch_button.configure(state=state)
+            self.preview_button.configure(state=state)
+
+        def start_preview(self) -> None:
+            if self.worker and self.worker.is_alive():
+                return
+            try:
+                config = self.form_config(require_enabled=True)
+            except Exception as exc:
+                messagebox.showerror("Cannot preview", str(exc))
+                return
+
+            self.clear_log()
+            self.set_action_buttons_enabled(False)
+            self.status_var.set("Previewing enabled channels...")
+            self.append_log("Preview started.")
+            self.worker = threading.Thread(
+                target=self._preview_worker,
+                args=(config,),
+                daemon=True,
+            )
+            self.worker.start()
+
+        def _preview_worker(self, config: Config) -> None:
+            try:
+                previews = preview_active_channels(
+                    config,
+                    auto_install=not args.no_auto_install,
+                    logger=self.queue_log,
+                )
+            except SystemExit as exc:
+                self.messages.put(("error", str(exc)))
+            except Exception as exc:
+                self.messages.put(("error", str(exc)))
+            else:
+                self.messages.put(("preview_done", len(previews)))
+
         def start_fetch(self) -> None:
             if self.worker and self.worker.is_alive():
                 return
@@ -2521,7 +2915,7 @@ def launch_gui(args: argparse.Namespace) -> int:
                 return
 
             self.clear_log()
-            self.fetch_button.configure(state="disabled")
+            self.set_action_buttons_enabled(False)
             self.status_var.set("Fetching videos...")
             self.append_log("Fetch started.")
             self.worker = threading.Thread(
@@ -2563,13 +2957,18 @@ def launch_gui(args: argparse.Namespace) -> int:
                     if kind == "log":
                         self.append_log(str(payload[0]))
                     elif kind == "error":
-                        self.fetch_button.configure(state="normal")
-                        self.status_var.set("Fetch failed.")
+                        self.set_action_buttons_enabled(True)
+                        self.status_var.set("Operation failed.")
                         self.append_log("ERROR: " + str(payload[0]))
-                        messagebox.showerror("Fetch failed", str(payload[0]))
+                        messagebox.showerror("Operation failed", str(payload[0]))
+                    elif kind == "preview_done":
+                        count = int(payload[0])
+                        self.set_action_buttons_enabled(True)
+                        self.status_var.set(f"Preview done. {count} enabled channel(s).")
+                        self.append_log("Preview done.")
                     elif kind == "done":
                         report_path, included, scanned = payload
-                        self.fetch_button.configure(state="normal")
+                        self.set_action_buttons_enabled(True)
                         self.status_var.set(f"Done. {included} videos included from {scanned} scanned.")
                         self.append_log(f"Done. Report: {report_path}")
             except queue.Empty:
