@@ -96,5 +96,27 @@ class TextCleanerPageNumberTests(unittest.TestCase):
         self.assertIn("Second body line.", cleaned)
 
 
+class EpubPDFConversionTests(unittest.TestCase):
+    def test_unique_epub_pdf_output_path_adds_counter(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            epub_path = folder / "book.epub"
+            existing_pdf = folder / "book.pdf"
+            epub_path.write_text("placeholder", encoding="utf-8")
+            existing_pdf.write_text("placeholder", encoding="utf-8")
+
+            output_path = book_utils.unique_epub_pdf_output_path(epub_path)
+
+            self.assertEqual(output_path, folder / "book_2.pdf")
+
+    def test_convert_epub_to_pdf_rejects_non_epub_before_converter_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            txt_path = Path(temp_dir) / "book.txt"
+            txt_path.write_text("placeholder", encoding="utf-8")
+
+            with self.assertRaises(book_utils.EpubPDFConversionError):
+                book_utils.convert_epub_to_pdf(txt_path)
+
+
 if __name__ == "__main__":
     unittest.main()

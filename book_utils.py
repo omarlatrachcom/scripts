@@ -25,7 +25,12 @@ Features:
    - Converts it to PDF beside the original document.
    - Uses LibreOffice headless conversion.
 
-5. TXT Cleaner
+5. EPUB to PDF
+   - Select one EPUB document.
+   - Converts it to PDF beside the original document.
+   - Uses Calibre's ebook-convert for image/CSS/code-block preservation.
+
+6. TXT Cleaner
    - Select a folder containing TXT files.
    - Removes metadata lines containing configured markers.
    - Removes printed page numbers around generated page markers.
@@ -66,6 +71,8 @@ PDF_TEXT_OUTPUT_PREFIX = "chatgpt_pdf"
 PDF_TEXT_ERRORS_FILENAME = "chatgpt_pdf_errors.txt"
 PDF_TEXT_MANIFEST_FILENAME = "chatgpt_pdf_manifest.json"
 WORD_TO_PDF_TIMEOUT_SECONDS = 600
+EPUB_TO_PDF_TIMEOUT_SECONDS = 1_200
+CALIBRE_INSTALL_TIMEOUT_SECONDS = 1_800
 WORD_DOCUMENT_EXTENSIONS = {
     ".doc",
     ".docx",
@@ -74,6 +81,7 @@ WORD_DOCUMENT_EXTENSIONS = {
     ".dotx",
     ".dotm",
 }
+EPUB_DOCUMENT_EXTENSIONS = {".epub"}
 TXT_CLEAN_METADATA_LINE_RE = re.compile(
     r"^\s*###\s+(?:Source|Page)\b.*$",
     re.IGNORECASE,
@@ -355,6 +363,13 @@ class WordPDFResult:
 
 
 @dataclass(frozen=True)
+class EpubPDFResult:
+    source_document: Path
+    output_pdf: Path
+    converter: str
+
+
+@dataclass(frozen=True)
 class TextCleanResult:
     cleaned_files: list[Path]
     scanned_files: int
@@ -382,6 +397,10 @@ class PDFTextExtractionError(BookUtilsError):
 
 class WordPDFConversionError(BookUtilsError):
     """Raised for user-facing Word to PDF conversion failures."""
+
+
+class EpubPDFConversionError(BookUtilsError):
+    """Raised for user-facing EPUB to PDF conversion failures."""
 
 
 class TextCleanerError(BookUtilsError):
@@ -3669,6 +3688,22 @@ def unique_word_pdf_output_path(word_path: Path) -> Path:
     )
 
 
+def unique_epub_pdf_output_path(epub_path: Path) -> Path:
+    """Return a non-existing PDF path beside the selected EPUB document."""
+    output_path = epub_path.with_suffix(".pdf")
+    if not output_path.exists():
+        return output_path
+
+    for counter in range(2, 10_000):
+        candidate = output_path.with_name(f"{output_path.stem}_{counter}.pdf")
+        if not candidate.exists():
+            return candidate
+
+    raise EpubPDFConversionError(
+        f"Could not create a unique PDF output name for {epub_path.name}."
+    )
+
+
 def process_error_details(result: subprocess.CompletedProcess[str]) -> str:
     """Return useful stdout/stderr details for a failed converter process."""
     details = "\n".join(
@@ -3712,6 +3747,83 @@ def find_libreoffice_executable() -> Path | None:
             return path
 
     return None
+
+
+def find_ebook_convert_executable() -> Path | None:
+    """Return Calibre's ebook-convert executable when installed."""
+    candidates = [
+        shutil.which("ebook-convert"),
+        "/Applications/calibre.app/Contents/MacOS/ebook-convert",
+        str(Path.home() / "Applications/calibre.app/Contents/MacOS/ebook-convert"),
+        "/opt/homebrew/bin/ebook-convert",
+        "/usr/local/bin/ebook-convert",
+    ]
+    seen: set[str] = set()
+
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+
+        seen.add(candidate)
+        path = Path(candidate)
+        if path.exists() and path.is_file():
+            return path
+
+    return None
+
+
+def install_calibre_with_homebrew(
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> Path | None:
+    """Install Calibre with Homebrew when possible and return ebook-convert."""
+    if platform.system() != "Darwin":
+        return None
+
+    brew_path = shutil.which("brew")
+    if brew_path is None:
+        return None
+
+    if progress_callback:
+        progress_callback("Installing Calibre with Homebrew...", 0, 1)
+
+    try:
+        result = subprocess.run(
+            [brew_path, "install", "--cask", "calibre"],
+            capture_output=True,
+            text=True,
+            timeout=CALIBRE_INSTALL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise EpubPDFConversionError(
+            "Homebrew timed out while installing Calibre."
+        ) from exc
+    except OSError as exc:
+        raise EpubPDFConversionError(f"Could not run Homebrew: {exc}") from exc
+
+    if result.returncode != 0:
+        raise EpubPDFConversionError(
+            f"Homebrew could not install Calibre: {process_error_details(result)}"
+        )
+
+    ebook_convert_path = find_ebook_convert_executable()
+    if ebook_convert_path is None:
+        raise EpubPDFConversionError(
+            "Homebrew finished installing Calibre, but ebook-convert was not found."
+        )
+
+    return ebook_convert_path
+
+
+def ensure_ebook_convert_executable(
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> Path | None:
+    """Find Calibre's converter, installing Calibre with Homebrew if missing."""
+    ebook_convert_path = find_ebook_convert_executable()
+    if ebook_convert_path is not None:
+        return ebook_convert_path
+
+    return install_calibre_with_homebrew(progress_callback=progress_callback)
 
 
 def convert_word_to_pdf_with_libreoffice(
@@ -3819,6 +3931,100 @@ def convert_word_to_pdf(
     )
 
 
+def convert_epub_to_pdf_with_calibre(
+    epub_path: Path,
+    output_path: Path,
+    ebook_convert_path: Path,
+) -> None:
+    """Convert an EPUB document with Calibre's ebook-convert."""
+    command = [
+        str(ebook_convert_path),
+        str(epub_path),
+        str(output_path),
+        "--pdf-use-document-margins",
+        "--preserve-cover-aspect-ratio",
+        "--pdf-add-toc",
+        "--embed-all-fonts",
+        "--subset-embedded-fonts",
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=EPUB_TO_PDF_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise EpubPDFConversionError(
+            "Calibre timed out while converting the EPUB document."
+        ) from exc
+    except OSError as exc:
+        raise EpubPDFConversionError(
+            f"Could not run Calibre ebook-convert: {exc}"
+        ) from exc
+
+    if result.returncode != 0:
+        raise EpubPDFConversionError(
+            f"Calibre conversion failed: {process_error_details(result)}"
+        )
+
+    if not output_path.exists():
+        raise EpubPDFConversionError(
+            "Calibre finished but did not create a PDF."
+        )
+
+
+def convert_epub_to_pdf(
+    epub_path: Path,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> EpubPDFResult:
+    """Convert one EPUB document to PDF beside the source file."""
+    if not epub_path.exists() or not epub_path.is_file():
+        raise EpubPDFConversionError("Select a valid EPUB document first.")
+
+    if epub_path.suffix.lower() not in EPUB_DOCUMENT_EXTENSIONS:
+        raise EpubPDFConversionError("The selected file must be an EPUB document.")
+
+    ebook_convert_path = ensure_ebook_convert_executable(
+        progress_callback=progress_callback,
+    )
+    if ebook_convert_path is None:
+        raise EpubPDFConversionError(
+            "Calibre is required for EPUB to PDF conversion. Install Calibre "
+            "or Homebrew, then try again. If Homebrew is available, this app "
+            "will install Calibre automatically."
+        )
+
+    if progress_callback:
+        progress_callback("Converting EPUB document with Calibre...", 0, 1)
+
+    output_path = unique_epub_pdf_output_path(epub_path)
+
+    try:
+        convert_epub_to_pdf_with_calibre(
+            epub_path=epub_path,
+            output_path=output_path,
+            ebook_convert_path=ebook_convert_path,
+        )
+    except EpubPDFConversionError as exc:
+        remove_partial_output(output_path)
+        raise EpubPDFConversionError(
+            "Could not convert the EPUB document to PDF with Calibre.\n\n"
+            f"Details:\n- {exc}"
+        ) from exc
+
+    if progress_callback:
+        progress_callback("Done.", 1, 1)
+
+    return EpubPDFResult(
+        source_document=epub_path,
+        output_pdf=output_path,
+        converter="Calibre ebook-convert",
+    )
+
+
 class BookUtilsApp:
     """Tkinter GUI application."""
 
@@ -3833,6 +4039,7 @@ class BookUtilsApp:
         self.selected_text_clean_folder: Path | None = None
         self.selected_pdf: Path | None = None
         self.selected_word_doc: Path | None = None
+        self.selected_epub_doc: Path | None = None
         self.custom_clean_text = None
         self.running_header_title_entry = None
         self.pdf_part_rows: list[tuple[object, object, object]] = []
@@ -3849,6 +4056,7 @@ class BookUtilsApp:
         self.text_clean_folder_var = tk.StringVar(value="No TXT folder selected")
         self.pdf_var = tk.StringVar(value="No PDF selected")
         self.word_doc_var = tk.StringVar(value="No Word document selected")
+        self.epub_doc_var = tk.StringVar(value="No EPUB document selected")
         self.pdf_pages_var = tk.StringVar(value="")
         self.capacity_var = tk.StringVar(value=str(DEFAULT_MODEL_TOKEN_CAPACITY))
         self.running_header_title_var = tk.StringVar(value="")
@@ -3871,7 +4079,7 @@ class BookUtilsApp:
             text=(
                 "Convert JPG images or PDFs to ChatGPT-safe text chunks, clean TXT "
                 "metadata markers, split a selected PDF into page ranges, or convert "
-                "a Word document to PDF beside the original file."
+                "a Word/EPUB document to PDF beside the original file."
             ),
             wraplength=700,
         )
@@ -3885,17 +4093,20 @@ class BookUtilsApp:
         text_clean_tab = self.ttk.Frame(notebook, padding=12)
         pdf_tab = self.ttk.Frame(notebook, padding=12)
         word_pdf_tab = self.ttk.Frame(notebook, padding=12)
+        epub_pdf_tab = self.ttk.Frame(notebook, padding=12)
         notebook.add(ocr_tab, text="JPG to TXT")
         notebook.add(pdf_text_tab, text="PDF to TXT")
         notebook.add(text_clean_tab, text="Clean TXT")
         notebook.add(pdf_tab, text="Split PDF")
         notebook.add(word_pdf_tab, text="Word to PDF")
+        notebook.add(epub_pdf_tab, text="EPUB to PDF")
 
         self._build_ocr_tab(ocr_tab)
         self._build_pdf_text_tab(pdf_text_tab)
         self._build_text_clean_tab(text_clean_tab)
         self._build_pdf_tab(pdf_tab)
         self._build_word_pdf_tab(word_pdf_tab)
+        self._build_epub_pdf_tab(epub_pdf_tab)
 
         self.progress_bar = self.ttk.Progressbar(
             frame,
@@ -4272,6 +4483,53 @@ class BookUtilsApp:
         )
         self.word_pdf_button.pack(anchor="w")
 
+    def _build_epub_pdf_tab(self, parent) -> None:
+        description = self.ttk.Label(
+            parent,
+            text=(
+                "Select an EPUB document. The app converts it to PDF and saves "
+                "the PDF in the same folder as the selected document."
+            ),
+            wraplength=660,
+        )
+        description.pack(anchor="w", pady=(0, 14))
+
+        doc_row = self.ttk.Frame(parent)
+        doc_row.pack(fill="x", pady=(0, 12))
+
+        self.select_epub_doc_button = self.ttk.Button(
+            doc_row,
+            text="Select EPUB File",
+            command=self.select_epub_doc,
+        )
+        self.select_epub_doc_button.pack(side="left")
+
+        doc_label = self.ttk.Label(
+            doc_row,
+            textvariable=self.epub_doc_var,
+            wraplength=500,
+        )
+        doc_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
+
+        hint = self.ttk.Label(
+            parent,
+            text=(
+                "Supported files: .epub. Uses Calibre ebook-convert for robust "
+                "EPUB layout, image, font, and code-block handling. If Calibre "
+                "is missing and Homebrew is installed, the app will install "
+                "Calibre automatically."
+            ),
+            wraplength=660,
+        )
+        hint.pack(anchor="w", pady=(0, 12))
+
+        self.epub_pdf_button = self.ttk.Button(
+            parent,
+            text="Convert to PDF",
+            command=self.start_epub_pdf_conversion,
+        )
+        self.epub_pdf_button.pack(anchor="w")
+
     def _on_pdf_parts_frame_configure(self, _event=None) -> None:
         """Update the PDF parts scrollable region after rows are added/removed."""
         if not hasattr(self, "pdf_parts_canvas"):
@@ -4428,6 +4686,26 @@ class BookUtilsApp:
         self.selected_word_doc = word_path
         self.word_doc_var.set(str(word_path))
         self.status_var.set("Word document selected. Click Convert to PDF to start.")
+
+    def select_epub_doc(self) -> None:
+        from tkinter import filedialog
+
+        file_name = filedialog.askopenfilename(
+            parent=self.root,
+            title="Select EPUB document to convert",
+            filetypes=[
+                ("EPUB documents", "*.epub"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        if not file_name:
+            return
+
+        epub_path = Path(file_name)
+        self.selected_epub_doc = epub_path
+        self.epub_doc_var.set(str(epub_path))
+        self.status_var.set("EPUB document selected. Click Convert to PDF to start.")
 
     def add_pdf_part_row(self, default_start: str = "", default_end: str = "") -> None:
         row_frame = self.ttk.Frame(self.parts_frame)
@@ -4754,6 +5032,41 @@ class BookUtilsApp:
 
         self.root.after(0, self._show_word_pdf_success, result)
 
+    def start_epub_pdf_conversion(self) -> None:
+        from tkinter import messagebox
+
+        if self.is_running:
+            return
+
+        if self.selected_epub_doc is None:
+            messagebox.showwarning(
+                title="No EPUB document selected",
+                message="Please click Select EPUB File first.",
+                parent=self.root,
+            )
+            return
+
+        self._set_running_state(True, "Starting EPUB to PDF conversion...")
+
+        worker = threading.Thread(
+            target=self._run_epub_pdf_worker,
+            args=(self.selected_epub_doc,),
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_epub_pdf_worker(self, epub_path: Path) -> None:
+        try:
+            result = convert_epub_to_pdf(
+                epub_path=epub_path,
+                progress_callback=self._thread_safe_progress,
+            )
+        except Exception as exc:
+            self.root.after(0, self._show_error, exc)
+            return
+
+        self.root.after(0, self._show_epub_pdf_success, result)
+
     def _thread_safe_progress(self, message: str, value: int, maximum: int) -> None:
         self.root.after(0, self._update_progress, message, value, maximum)
 
@@ -4842,6 +5155,23 @@ class BookUtilsApp:
         )
 
 
+    def _show_epub_pdf_success(self, result: EpubPDFResult) -> None:
+        from tkinter import messagebox
+
+        self._update_progress("Done.", 1, 1)
+        self._set_running_state(False)
+
+        messagebox.showinfo(
+            title="Done",
+            message=(
+                "Converted EPUB document to PDF.\n"
+                f"Converter: {result.converter}\n\n"
+                f"Saved as:\n{result.output_pdf}"
+            ),
+            parent=self.root,
+        )
+
+
     def _show_pdf_success(self, result: PDFSplitResult) -> None:
         from tkinter import messagebox
 
@@ -4893,6 +5223,8 @@ class BookUtilsApp:
         self.split_pdf_button.configure(state=state)
         self.select_word_doc_button.configure(state=state)
         self.word_pdf_button.configure(state=state)
+        self.select_epub_doc_button.configure(state=state)
+        self.epub_pdf_button.configure(state=state)
 
         for frame, _start_var, _end_var in self.pdf_part_rows:
             for child in frame.winfo_children():

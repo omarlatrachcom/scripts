@@ -1,7 +1,9 @@
 {
-  "min_views": "45000",
+  "min_views": "15000",
   "recent_min_views": "5000",
   "max_videos_per_channel": null,
+  "published_after": null,
+  "published_before": null,
   "cookies_from_browser": "chrome",
   "browser_profile": null,
   "cookies_file": null,
@@ -21,10 +23,6 @@
         {
           "enabled": true,
           "url": "https://www.youtube.com/@EslamAdel/videos"
-        },
-        {
-          "enabled": true,
-          "url": "https://www.youtube.com/@arabinglish/videos"
         },
         {
           "enabled": true,
