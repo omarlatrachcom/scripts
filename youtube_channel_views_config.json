@@ -18,10 +18,6 @@
       "channels": [
         {
           "enabled": true,
-          "url": "https://www.youtube.com/@audiobookbelaraby/videos"
-        },
-        {
-          "enabled": true,
           "url": "https://www.youtube.com/@EslamAdel/videos"
         },
         {
