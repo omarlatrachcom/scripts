@@ -487,6 +487,18 @@ def render_prompt_template(prompt_text: str, variable_values: dict[str, str]) ->
     return VARIABLE_PATTERN.sub(replace_match, prompt_text or "")
 
 
+def clean_pasted_text(text: str) -> str:
+    """Remove Markdown code-fence markers from text pasted into editable fields."""
+    cleaned_lines: list[str] = []
+    for line in (text or "").splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        line_ending = line[len(body):]
+        if body.strip() == "```":
+            continue
+        cleaned_lines.append(body.replace("```", "") + line_ending)
+    return "".join(cleaned_lines)
+
+
 # ---------------------------------------------------------------------------
 # Theme and reusable widgets
 # ---------------------------------------------------------------------------
@@ -737,6 +749,27 @@ class AccessibleText(tk.Text):
             pady=10,
             **kwargs,
         )
+        self.bind("<<Paste>>", self._paste_cleaned_text)
+
+    def _paste_cleaned_text(self, _event: tk.Event | None = None) -> str:
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            return "break"
+
+        cleaned = clean_pasted_text(text)
+        try:
+            self.edit_separator()
+        except tk.TclError:
+            pass
+        if self.tag_ranges(tk.SEL):
+            self.delete(tk.SEL_FIRST, tk.SEL_LAST)
+        self.insert(tk.INSERT, cleaned)
+        try:
+            self.edit_separator()
+        except tk.TclError:
+            pass
+        return "break"
 
 
 class AccessibleEntry(tk.Entry):
@@ -755,6 +788,22 @@ class AccessibleEntry(tk.Entry):
             font=theme.fonts.base,
             **kwargs,
         )
+        self.bind("<<Paste>>", self._paste_cleaned_text)
+
+    def _paste_cleaned_text(self, _event: tk.Event | None = None) -> str:
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            return "break"
+
+        cleaned = clean_pasted_text(text)
+        try:
+            if self.selection_present():
+                self.delete(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            pass
+        self.insert(tk.INSERT, cleaned)
+        return "break"
 
 
 class TextAreaWithScrollbar(tk.Frame):
