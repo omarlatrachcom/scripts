@@ -96,6 +96,41 @@ class TextCleanerPageNumberTests(unittest.TestCase):
         self.assertIn("Second body line.", cleaned)
 
 
+class PDFColumnExtractionTests(unittest.TestCase):
+    def test_two_column_text_reads_left_column_before_right(self) -> None:
+        lines = [
+            book_utils.PDFTextLine("Report header", 24, 20, 180, 32),
+            book_utils.PDFTextLine("Document title", 220, 50, 392, 64),
+            book_utils.PDFTextLine("January 2013", 520, 72, 590, 84),
+            book_utils.PDFTextLine("Introduction:", 24, 110, 110, 122),
+            book_utils.PDFTextLine("Left line one.", 24, 126, 280, 138),
+            book_utils.PDFTextLine("Left line two continues", 24, 142, 280, 154),
+            book_utils.PDFTextLine("rolled into a", 24, 158, 210, 170),
+            book_utils.PDFTextLine("cigarette and smoked.", 310, 110, 570, 122),
+            book_utils.PDFTextLine("User Population:", 310, 142, 430, 154),
+            book_utils.PDFTextLine("Right body one", 310, 158, 570, 170),
+            book_utils.PDFTextLine("Right body two.", 310, 174, 570, 186),
+        ]
+
+        text = book_utils.extract_two_column_text_from_pdf_lines(lines, page_width=612)
+
+        self.assertIn("rolled into a cigarette and smoked.", text)
+        self.assertLess(text.index("Left line one."), text.index("cigarette and smoked."))
+        self.assertLess(text.index("cigarette and smoked."), text.index("User Population:"))
+
+    def test_single_column_text_does_not_trigger_two_column_path(self) -> None:
+        lines = [
+            book_utils.PDFTextLine("Heading", 72, 40, 180, 52),
+            book_utils.PDFTextLine("First body line", 72, 70, 500, 82),
+            book_utils.PDFTextLine("Second body line", 72, 86, 500, 98),
+            book_utils.PDFTextLine("Third body line.", 72, 102, 500, 114),
+        ]
+
+        text = book_utils.extract_two_column_text_from_pdf_lines(lines, page_width=612)
+
+        self.assertEqual(text, "")
+
+
 class EpubPDFConversionTests(unittest.TestCase):
     def test_unique_epub_pdf_output_path_adds_counter(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

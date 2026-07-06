@@ -294,6 +294,10 @@ LAYOUT_MARGIN_X_GAP = 0.045
 LAYOUT_MARGIN_MIN_MAIN_TEXT_CHARS = 24
 LAYOUT_BLOCK_VERTICAL_GAP_FACTOR = 1.65
 LAYOUT_MARGIN_VERTICAL_GAP_FACTOR = 3.25
+PDF_TWO_COLUMN_MIN_LINES_PER_COLUMN = 3
+PDF_TWO_COLUMN_MAX_COLUMN_LINE_WIDTH_RATIO = 0.58
+PDF_TWO_COLUMN_FULL_WIDTH_LINE_RATIO = 0.68
+PDF_TWO_COLUMN_BODY_ROW_TOLERANCE_FACTOR = 0.90
 
 # Side captions/marginalia in illustrated books often contain cue words such as
 # "opposite" or "overleaf". They should be kept, but they must not interrupt a
@@ -319,6 +323,15 @@ class OCRLine:
     top: float
     bottom: float
     height: float
+
+
+@dataclass(frozen=True)
+class PDFTextLine:
+    text: str
+    x0: float
+    y0: float
+    x1: float
+    y1: float
 
 
 @dataclass(frozen=True)
@@ -2928,6 +2941,253 @@ def normalize_pdf_text(text: str) -> str:
     return "\n\n".join(cleaned).strip()
 
 
+def extract_pdf_text_lines(fitz_page) -> list[PDFTextLine]:
+    """Return normalized PyMuPDF text lines with page coordinates."""
+    try:
+        page_dict = fitz_page.get_text("dict")
+    except Exception:
+        return []
+
+    lines: list[PDFTextLine] = []
+
+    for block in page_dict.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            raw_text = "".join(str(span.get("text", "")) for span in spans)
+            text = normalize_extracted_line_text(raw_text)
+            if not text:
+                continue
+
+            bbox = line.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+
+            try:
+                x0, y0, x1, y1 = (float(value) for value in bbox)
+            except (TypeError, ValueError):
+                continue
+
+            lines.append(
+                PDFTextLine(
+                    text=text,
+                    x0=x0,
+                    y0=y0,
+                    x1=x1,
+                    y1=y1,
+                )
+            )
+
+    return lines
+
+
+def pdf_text_line_is_top_running_header(
+    line: PDFTextLine,
+    page_height: float,
+) -> bool:
+    """Return True for a small running header near the top of a PDF page."""
+    text = normalize_clean_paragraph_text(line.text)
+    if not text:
+        return False
+
+    if line.y1 > max(32.0, page_height * 0.07):
+        return False
+
+    return numbered_running_header_parts(text) is not None
+
+
+def pdf_text_line_width(line: PDFTextLine) -> float:
+    """Return the visual width of one PDF text line."""
+    return max(0.0, line.x1 - line.x0)
+
+
+def pdf_text_line_height(line: PDFTextLine) -> float:
+    """Return the visual height of one PDF text line."""
+    return max(0.0, line.y1 - line.y0)
+
+
+def pdf_text_line_center_x(line: PDFTextLine) -> float:
+    """Return the horizontal center of one PDF text line."""
+    return (line.x0 + line.x1) / 2
+
+
+def pdf_text_line_center_y(line: PDFTextLine) -> float:
+    """Return the vertical center of one PDF text line."""
+    return (line.y0 + line.y1) / 2
+
+
+def pdf_text_line_column_candidate(
+    line: PDFTextLine,
+    page_width: float,
+) -> str | None:
+    """Classify a line as a likely left/right body-column line."""
+    if page_width <= 0:
+        return None
+
+    width = pdf_text_line_width(line)
+    if (
+        width <= 0
+        or width > page_width * PDF_TWO_COLUMN_MAX_COLUMN_LINE_WIDTH_RATIO
+    ):
+        return None
+
+    center_x = pdf_text_line_center_x(line)
+
+    if line.x1 <= page_width * 0.60 and center_x <= page_width * 0.48:
+        return "left"
+
+    if line.x0 >= page_width * 0.40 and center_x >= page_width * 0.52:
+        return "right"
+
+    return None
+
+
+def pdf_text_line_is_full_width(line: PDFTextLine, page_width: float) -> bool:
+    """Return True for a line that visually spans the page instead of a column."""
+    if page_width <= 0:
+        return False
+
+    width = pdf_text_line_width(line)
+    return (
+        width >= page_width * PDF_TWO_COLUMN_FULL_WIDTH_LINE_RATIO
+        or (line.x0 <= page_width * 0.18 and line.x1 >= page_width * 0.82)
+    )
+
+
+def two_column_body_top(
+    left_lines: list[PDFTextLine],
+    right_lines: list[PDFTextLine],
+    row_tolerance: float,
+) -> float | None:
+    """Find the first row where likely left and right body columns overlap."""
+    candidates: list[float] = []
+
+    for left_line in left_lines:
+        left_center_y = pdf_text_line_center_y(left_line)
+        for right_line in right_lines:
+            if (
+                abs(left_center_y - pdf_text_line_center_y(right_line))
+                <= row_tolerance
+            ):
+                candidates.append(min(left_line.y0, right_line.y0))
+
+    if not candidates:
+        return None
+
+    return min(candidates)
+
+
+def merge_pdf_text_lines(lines: list[PDFTextLine]) -> str:
+    """Merge PDF text lines into paragraph-like text using the normalizer."""
+    if not lines:
+        return ""
+
+    return normalize_pdf_text("\n".join(line.text for line in lines if line.text))
+
+
+def extract_two_column_text_from_pdf_lines(
+    lines: list[PDFTextLine],
+    page_width: float,
+) -> str:
+    """Extract text from clear two-column pages in column reading order.
+
+    A plain visual sort by (y, x) is wrong for two-column documents because it
+    alternates between columns row by row. This detector activates only when
+    there are enough left/right column lines and at least one row where the two
+    columns visually overlap. Header lines before that overlap are preserved in
+    normal visual order, then the left column is emitted top-to-bottom followed
+    by the right column.
+    """
+    if len(lines) < PDF_TWO_COLUMN_MIN_LINES_PER_COLUMN * 2:
+        return ""
+
+    left_candidates: list[PDFTextLine] = []
+    right_candidates: list[PDFTextLine] = []
+
+    for line in lines:
+        column = pdf_text_line_column_candidate(line, page_width)
+        if column == "left":
+            left_candidates.append(line)
+        elif column == "right":
+            right_candidates.append(line)
+
+    if (
+        len(left_candidates) < PDF_TWO_COLUMN_MIN_LINES_PER_COLUMN
+        or len(right_candidates) < PDF_TWO_COLUMN_MIN_LINES_PER_COLUMN
+    ):
+        return ""
+
+    usable_heights = [
+        pdf_text_line_height(line)
+        for line in lines
+        if pdf_text_line_height(line) > 0
+    ]
+    median_height = median_float(usable_heights, fallback=10.0)
+    row_tolerance = max(4.0, median_height * PDF_TWO_COLUMN_BODY_ROW_TOLERANCE_FACTOR)
+    body_top = two_column_body_top(
+        left_lines=left_candidates,
+        right_lines=right_candidates,
+        row_tolerance=row_tolerance,
+    )
+    if body_top is None:
+        return ""
+
+    left_body_candidates = [
+        line for line in left_candidates if line.y1 >= body_top - row_tolerance
+    ]
+    right_body_candidates = [
+        line for line in right_candidates if line.y1 >= body_top - row_tolerance
+    ]
+    if (
+        len(left_body_candidates) < PDF_TWO_COLUMN_MIN_LINES_PER_COLUMN
+        or len(right_body_candidates) < PDF_TWO_COLUMN_MIN_LINES_PER_COLUMN
+    ):
+        return ""
+
+    left_center = median_float(
+        [pdf_text_line_center_x(line) for line in left_body_candidates]
+    )
+    right_center = median_float(
+        [pdf_text_line_center_x(line) for line in right_body_candidates]
+    )
+    if right_center - left_center < page_width * 0.20:
+        return ""
+
+    gutter_center = (left_center + right_center) / 2
+    pre_body_lines: list[PDFTextLine] = []
+    left_column_lines: list[PDFTextLine] = []
+    right_column_lines: list[PDFTextLine] = []
+    full_width_body_lines: list[PDFTextLine] = []
+
+    for line in lines:
+        if line.y1 < body_top - row_tolerance:
+            pre_body_lines.append(line)
+            continue
+
+        if pdf_text_line_is_full_width(line, page_width):
+            full_width_body_lines.append(line)
+        elif pdf_text_line_center_x(line) <= gutter_center:
+            left_column_lines.append(line)
+        else:
+            right_column_lines.append(line)
+
+    if (
+        len(left_column_lines) < PDF_TWO_COLUMN_MIN_LINES_PER_COLUMN
+        or len(right_column_lines) < PDF_TWO_COLUMN_MIN_LINES_PER_COLUMN
+    ):
+        return ""
+
+    visual_order = lambda line: (line.y0, line.x0)
+    reading_order = [
+        *sorted(pre_body_lines, key=visual_order),
+        *sorted(left_column_lines, key=visual_order),
+        *sorted(right_column_lines, key=visual_order),
+        *sorted(full_width_body_lines, key=visual_order),
+    ]
+
+    return merge_pdf_text_lines(reading_order)
 
 def pdf_text_block_text(block: tuple[object, ...]) -> str:
     """Return normalized raw text from one PyMuPDF text block."""
@@ -3067,6 +3327,18 @@ def extract_layout_text_from_pdf_page(fitz_page) -> str:
 
     page_width = float(fitz_page.rect.width)
     page_height = float(fitz_page.rect.height)
+
+    pdf_lines = [
+        line
+        for line in extract_pdf_text_lines(fitz_page)
+        if not pdf_text_line_is_top_running_header(line, page_height)
+    ]
+    two_column_text = extract_two_column_text_from_pdf_lines(
+        lines=pdf_lines,
+        page_width=page_width,
+    )
+    if has_useful_text(two_column_text):
+        return two_column_text
 
     text_blocks = [
         block
