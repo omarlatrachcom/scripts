@@ -6,7 +6,7 @@ What it covers:
 - Pick a folder, list videos, choose one
 - Split mode 1: two-part cut at a chosen time (part1 / part2)
 - Split mode 2: window split with overlap (vsplit / vsplit_srt style)
-- Optionally split one or two external SRT files alongside the video
+- Optionally split one or two external SRT or ASS files alongside the video
 - Optionally convert split SRT outputs to ASS using styling compatible with the
   user's earlier subtitle GUI workflow
 
@@ -147,7 +147,9 @@ def apply_theme(root: tk.Tk) -> dict:
 HMS_RE = re.compile(r"^(\d+):(\d{2})(?::(\d{2}))?$")
 TOKEN_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$", re.IGNORECASE)
 ASS_TIME_RE = re.compile(r"^\s*(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})(?:\s+.*)?$")
+ASS_EVENT_TIME_RE = re.compile(r"^\s*(\d+):(\d{1,2}):(\d{1,2})\.(\d{1,3})\s*$")
 ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
+SUBTITLE_EXTENSIONS = (".srt", ".ass")
 
 
 def read_text_any_encoding(path: str | Path) -> str:
@@ -182,6 +184,15 @@ class SrtBlock:
     start_ms: int
     end_ms: int
     lines: list[str]
+
+
+@dataclass
+class AssDocument:
+    lines: list[str]
+    newline: str
+    trailing_newline: bool
+    encoding: str
+    bom: bytes = b""
 
 
 def parse_duration_seconds(value: str) -> int:
@@ -231,7 +242,7 @@ def list_videos(directory: str | Path) -> list[str]:
     return sorted(files, key=str.lower)
 
 
-def matching_srt_files(directory: str | Path, video_filename: str) -> list[str]:
+def matching_subtitle_files(directory: str | Path, video_filename: str) -> list[str]:
     base = Path(directory).expanduser()
     if not base.is_dir() or not video_filename:
         return []
@@ -240,7 +251,7 @@ def matching_srt_files(directory: str | Path, video_filename: str) -> list[str]:
     prefixed = []
     others = []
     for path in sorted(base.iterdir(), key=lambda p: p.name.lower()):
-        if not path.is_file() or path.suffix.lower() != ".srt":
+        if not path.is_file() or path.suffix.lower() not in SUBTITLE_EXTENSIONS:
             continue
         name = path.name
         if name == f"{stem}.srt":
@@ -250,6 +261,23 @@ def matching_srt_files(directory: str | Path, video_filename: str) -> list[str]:
         else:
             others.append(name)
     return exact + prefixed + others
+
+
+def subtitle_sidecar_output_path(
+    video_output: Path,
+    input_video: Path,
+    input_subtitle: Path,
+    subtitle_index: int,
+) -> Path:
+    video_stem = input_video.stem
+    subtitle_stem = input_subtitle.stem
+    if subtitle_stem == video_stem:
+        label = ""
+    elif subtitle_stem.casefold().startswith((video_stem + ".").casefold()):
+        label = subtitle_stem[len(video_stem) :]
+    else:
+        label = f".subtitle{subtitle_index}"
+    return video_output.with_name(f"{video_output.stem}{label}{input_subtitle.suffix}")
 
 
 def ffprobe_duration_seconds(path: str | Path) -> float:
@@ -378,6 +406,169 @@ def split_srt_cut_file(input_path: str | Path, cut_seconds: float, output_path_1
 
 
 # ----------------------------- ASS helpers ----------------------------- #
+
+
+ASS_EVENT_TYPES = {"dialogue", "comment", "picture", "sound", "movie", "command"}
+DEFAULT_ASS_EVENT_FORMAT = ["Layer", "Start", "End", "Style", "Name", "MarginL", "MarginR", "MarginV", "Effect", "Text"]
+
+
+def ass_ts_to_ms(ts: str) -> int:
+    match = ASS_EVENT_TIME_RE.match(ts)
+    if not match:
+        raise ValueError(f"Invalid ASS timestamp: {ts!r}")
+    hours, minutes, seconds, fraction = match.groups()
+    fraction_ms = int(fraction.ljust(3, "0"))
+    return (int(hours) * 3600 + int(minutes) * 60 + int(seconds)) * 1000 + fraction_ms
+
+
+def read_ass_document(path: str | Path) -> AssDocument:
+    data = Path(path).read_bytes()
+    bom = b""
+    if data.startswith(b"\xef\xbb\xbf"):
+        bom, encoding, payload = b"\xef\xbb\xbf", "utf-8", data[3:]
+    elif data.startswith(b"\xff\xfe"):
+        bom, encoding, payload = b"\xff\xfe", "utf-16-le", data[2:]
+    elif data.startswith(b"\xfe\xff"):
+        bom, encoding, payload = b"\xfe\xff", "utf-16-be", data[2:]
+    else:
+        payload = data
+        try:
+            payload.decode("utf-8")
+            encoding = "utf-8"
+        except UnicodeDecodeError:
+            try:
+                payload.decode("cp1252")
+                encoding = "cp1252"
+            except UnicodeDecodeError:
+                encoding = "latin-1"
+
+    content = payload.decode(encoding)
+    newline_match = re.search(r"\r\n|\n|\r", content)
+    newline = newline_match.group(0) if newline_match else "\n"
+    trailing_newline = content.endswith(("\r\n", "\n", "\r"))
+    return AssDocument(
+        lines=content.splitlines(),
+        newline=newline,
+        trailing_newline=trailing_newline,
+        encoding=encoding,
+        bom=bom,
+    )
+
+
+def write_ass_document(document: AssDocument, lines: list[str], path: str | Path) -> None:
+    content = document.newline.join(lines)
+    if document.trailing_newline:
+        content += document.newline
+    Path(path).write_bytes(document.bom + content.encode(document.encoding))
+
+
+def split_ass_range(document: AssDocument, segment_start_ms: int, segment_end_ms: int) -> tuple[list[str], int, int, int]:
+    if segment_end_ms <= segment_start_ms:
+        raise ValueError("ASS segment end must be greater than its start.")
+
+    output: list[str] = []
+    in_events = False
+    event_format = list(DEFAULT_ASS_EVENT_FORMAT)
+    parsed_events = 0
+    included_events = 0
+    max_event_end_ms = 0
+
+    for line_number, line in enumerate(document.lines, start=1):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_events = stripped.casefold() == "[events]"
+            event_format = list(DEFAULT_ASS_EVENT_FORMAT)
+            output.append(line)
+            continue
+
+        if not in_events:
+            output.append(line)
+            continue
+
+        prefix, separator, remainder = line.partition(":")
+        record_type = prefix.strip().casefold()
+        if separator and record_type == "format":
+            parsed_format = [field.strip() for field in remainder.split(",")]
+            lowered = [field.casefold() for field in parsed_format]
+            if "start" in lowered and "end" in lowered:
+                event_format = parsed_format
+            output.append(line)
+            continue
+
+        if not separator or record_type not in ASS_EVENT_TYPES:
+            output.append(line)
+            continue
+
+        leading_space = remainder[: len(remainder) - len(remainder.lstrip())]
+        payload = remainder[len(leading_space) :]
+        fields = payload.split(",", maxsplit=len(event_format) - 1)
+        lowered_format = [field.casefold() for field in event_format]
+        try:
+            start_index = lowered_format.index("start")
+            end_index = lowered_format.index("end")
+            if len(fields) != len(event_format):
+                raise ValueError(f"expected {len(event_format)} event fields, found {len(fields)}")
+            start_ms = ass_ts_to_ms(fields[start_index])
+            end_ms = ass_ts_to_ms(fields[end_index])
+        except (ValueError, IndexError) as exc:
+            raise RuntimeError(f"Could not parse ASS event on line {line_number}: {exc}") from exc
+
+        parsed_events += 1
+        max_event_end_ms = max(max_event_end_ms, end_ms)
+        if end_ms <= segment_start_ms or start_ms >= segment_end_ms:
+            continue
+
+        new_start = max(start_ms, segment_start_ms) - segment_start_ms
+        new_end = min(end_ms, segment_end_ms) - segment_start_ms
+        if new_end <= new_start:
+            continue
+        fields[start_index] = ms_to_ass_ts(new_start)
+        fields[end_index] = ms_to_ass_ts(new_end)
+        output.append(f"{prefix}:{leading_space}{','.join(fields)}")
+        included_events += 1
+
+    return output, parsed_events, included_events, max_event_end_ms
+
+
+def split_ass_window_file(input_path: str | Path, start_seconds: float, length_seconds: float, output_path: str | Path) -> None:
+    document = read_ass_document(input_path)
+    start_ms = int(round(start_seconds * 1000))
+    end_ms = int(round((start_seconds + length_seconds) * 1000))
+    lines, parsed_events, _included_events, _max_event_end_ms = split_ass_range(document, start_ms, end_ms)
+    if not parsed_events:
+        raise RuntimeError(f"No timed events parsed from ASS file: {input_path}")
+    write_ass_document(document, lines, output_path)
+
+
+def split_ass_cut_file(input_path: str | Path, cut_seconds: float, output_path_1: str | Path, output_path_2: str | Path) -> None:
+    document = read_ass_document(input_path)
+    cut_ms = int(round(cut_seconds * 1000))
+    _all_event_lines, parsed_events, _included_events, max_end_ms = split_ass_range(document, 0, 2**63 - 1)
+    if not parsed_events:
+        raise RuntimeError(f"No timed events parsed from ASS file: {input_path}")
+
+    part1, _parsed1, _included1, _max1 = split_ass_range(document, 0, cut_ms)
+    part2, _parsed2, _included2, _max2 = split_ass_range(document, cut_ms, max(max_end_ms, cut_ms + 1))
+    write_ass_document(document, part1, output_path_1)
+    write_ass_document(document, part2, output_path_2)
+
+
+def split_subtitle_window_file(input_path: Path, start_seconds: float, length_seconds: float, output_path: Path) -> None:
+    if input_path.suffix.lower() == ".srt":
+        split_srt_window_file(input_path, start_seconds, length_seconds, output_path)
+    elif input_path.suffix.lower() == ".ass":
+        split_ass_window_file(input_path, start_seconds, length_seconds, output_path)
+    else:
+        raise RuntimeError(f"Unsupported subtitle type: {input_path.suffix}")
+
+
+def split_subtitle_cut_file(input_path: Path, cut_seconds: float, output_path_1: Path, output_path_2: Path) -> None:
+    if input_path.suffix.lower() == ".srt":
+        split_srt_cut_file(input_path, cut_seconds, output_path_1, output_path_2)
+    elif input_path.suffix.lower() == ".ass":
+        split_ass_cut_file(input_path, cut_seconds, output_path_1, output_path_2)
+    else:
+        raise RuntimeError(f"Unsupported subtitle type: {input_path.suffix}")
 
 
 def parse_srt_blocks_from_file(path: str | Path) -> list[SrtBlock]:
@@ -746,7 +937,7 @@ class VideoSplitGUI:
         ttk.Label(header, text="Video Splitter", style="HeaderTitle.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="Directory picker + video list + optional SRT split + optional ASS conversion, built for your Mac workflow.",
+            text="Directory picker + video list + native SRT/ASS split + optional SRT-to-ASS conversion, built for your Mac workflow.",
             style="HeaderSubtitle.TLabel",
         ).pack(anchor="w", pady=(4, 0))
 
@@ -858,7 +1049,7 @@ class VideoSplitGUI:
         self.subtitle_b_combo = ttk.Combobox(right_bottom, textvariable=self.subtitle_b_var, state="readonly")
         self.subtitle_b_combo.grid(row=1, column=3, sticky="ew", pady=6)
 
-        self.convert_ass_check = ttk.Checkbutton(right_bottom, text="Create ASS after splitting subtitles", variable=self.convert_ass_var, command=self.apply_state_rules, style="Card.TCheckbutton")
+        self.convert_ass_check = ttk.Checkbutton(right_bottom, text="Create ASS from split SRT files", variable=self.convert_ass_var, command=self.apply_state_rules, style="Card.TCheckbutton")
         self.convert_ass_check.grid(row=2, column=0, columnspan=4, sticky="w", pady=6)
 
         ttk.Label(right_bottom, text="ASS tail label:", style="Card.TLabel").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=6)
@@ -867,7 +1058,7 @@ class VideoSplitGUI:
 
         ttk.Label(
             right_bottom,
-            text="If ASS is enabled with 2 subtitles, Subtitle 1 is treated as source and Subtitle 2 as Arabic for bilingual ASS. If only Subtitle 1 is chosen, a single-language ASS is created.",
+            text="Selected ASS files are split directly with styles and override tags preserved. SRT-to-ASS conversion applies only when every selected subtitle is SRT.",
             style="Muted.Card.TLabel",
         ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
 
@@ -1062,12 +1253,12 @@ class VideoSplitGUI:
     def on_video_selected(self) -> None:
         directory = Path(self.directory_var.get().strip()).expanduser()
         video_name = self.selected_video_name()
-        subtitles = matching_srt_files(directory, video_name)
+        subtitles = matching_subtitle_files(directory, video_name)
         self.subtitle_choices = subtitles
         values = [""] + subtitles
         self.subtitle_a_combo["values"] = values
         self.subtitle_b_combo["values"] = values
-        if self.subtitle_a_var.get() not in values:
+        if self.subtitle_a_var.get() not in values or (not self.subtitle_a_var.get() and subtitles):
             self.subtitle_a_var.set(subtitles[0] if subtitles else "")
         if self.subtitle_b_var.get() not in values:
             self.subtitle_b_var.set(subtitles[1] if len(subtitles) > 1 else "")
@@ -1160,6 +1351,12 @@ class VideoSplitGUI:
                 for sub in subtitle_paths:
                     if not sub.is_file():
                         raise RuntimeError(f"Subtitle file not found: {sub}")
+                    if sub.suffix.lower() not in SUBTITLE_EXTENSIONS:
+                        raise RuntimeError(f"Unsupported subtitle type: {sub.suffix}")
+
+            can_convert_srt_to_ass = bool(subtitle_paths) and all(sub.suffix.lower() == ".srt" for sub in subtitle_paths)
+            if config["convert_ass"] and subtitle_paths and not can_convert_srt_to_ass:
+                logger("> Native ASS input selected; preserving and splitting it directly (SRT-to-ASS conversion skipped).")
 
             ass_outputs: list[Path] = []
             model_text = config["model_text"]
@@ -1179,22 +1376,20 @@ class VideoSplitGUI:
                 if subtitle_paths:
                     logger("")
                     logger("> Splitting subtitle files...")
-                    for sub in subtitle_paths:
-                        out1 = output_dir / f"{sub.stem}.part1{sub.suffix}"
-                        out2 = output_dir / f"{sub.stem}.part2{sub.suffix}"
-                        split_srt_cut_file(sub, cut_seconds, out1, out2)
+                    for subtitle_index, sub in enumerate(subtitle_paths, start=1):
+                        out1 = subtitle_sidecar_output_path(video_part1, input_video, sub, subtitle_index)
+                        out2 = subtitle_sidecar_output_path(video_part2, input_video, sub, subtitle_index)
+                        split_subtitle_cut_file(sub, cut_seconds, out1, out2)
                         logger(f"  Done: {sub.name} -> {out1.name} / {out2.name}")
                         segment1.subtitle_paths.append(out1)
                         segment2.subtitle_paths.append(out2)
 
-                if config["convert_ass"] and subtitle_paths:
+                if config["convert_ass"] and can_convert_srt_to_ass:
                     logger("")
                     logger("> Creating ASS files from split subtitles...")
                     if len(subtitle_paths) >= 2 and config["subtitle_b"]:
-                        src1 = output_dir / f"{Path(config['subtitle_a']).stem}.part1.srt"
-                        src2 = output_dir / f"{Path(config['subtitle_a']).stem}.part2.srt"
-                        ar1 = output_dir / f"{Path(config['subtitle_b']).stem}.part1.srt"
-                        ar2 = output_dir / f"{Path(config['subtitle_b']).stem}.part2.srt"
+                        src1, ar1 = segment1.subtitle_paths[:2]
+                        src2, ar2 = segment2.subtitle_paths[:2]
                         ass1 = output_dir / f"{input_video.stem}.part1.bilingual.ass"
                         ass2 = output_dir / f"{input_video.stem}.part2.bilingual.ass"
                         create_bilingual_ass(src1, ar1, ass1, model_text)
@@ -1205,10 +1400,10 @@ class VideoSplitGUI:
                         logger(f"  Created: {ass1.name}")
                         logger(f"  Created: {ass2.name}")
                     else:
-                        srt1 = output_dir / f"{Path(config['subtitle_a']).stem}.part1.srt"
-                        srt2 = output_dir / f"{Path(config['subtitle_a']).stem}.part2.srt"
-                        ass1 = output_dir / f"{Path(config['subtitle_a']).stem}.part1.ass"
-                        ass2 = output_dir / f"{Path(config['subtitle_a']).stem}.part2.ass"
+                        srt1 = segment1.subtitle_paths[0]
+                        srt2 = segment2.subtitle_paths[0]
+                        ass1 = srt1.with_suffix(".ass")
+                        ass2 = srt2.with_suffix(".ass")
                         create_single_ass_from_srt(srt1, ass1, model_text)
                         create_single_ass_from_srt(srt2, ass2, model_text)
                         segment1.ass_paths.append(ass1)
@@ -1231,24 +1426,24 @@ class VideoSplitGUI:
                     logger("")
                     logger("> Splitting subtitle files for each window...")
                     for part_index, (_video_path, start_sec, length_sec) in enumerate(windows, start=1):
-                        for sub in subtitle_paths:
-                            out_srt = output_dir / f"{sub.stem}_part{part_index:03d}.srt"
-                            split_srt_window_file(sub, start_sec, length_sec, out_srt)
-                            created_segments[part_index - 1].subtitle_paths.append(out_srt)
-                            logger(f"  Created: {out_srt.name}")
+                        for subtitle_index, sub in enumerate(subtitle_paths, start=1):
+                            video_output = created_segments[part_index - 1].video_path
+                            out_subtitle = subtitle_sidecar_output_path(video_output, input_video, sub, subtitle_index)
+                            split_subtitle_window_file(sub, start_sec, length_sec, out_subtitle)
+                            created_segments[part_index - 1].subtitle_paths.append(out_subtitle)
+                            logger(f"  Created: {out_subtitle.name}")
 
-                if config["convert_ass"] and subtitle_paths:
+                if config["convert_ass"] and can_convert_srt_to_ass:
                     logger("")
                     logger("> Creating ASS files from split subtitles...")
                     for part_index, segment in enumerate(created_segments, start=1):
                         if len(subtitle_paths) >= 2 and config["subtitle_b"]:
-                            src = output_dir / f"{Path(config['subtitle_a']).stem}_part{part_index:03d}.srt"
-                            ar = output_dir / f"{Path(config['subtitle_b']).stem}_part{part_index:03d}.srt"
+                            src, ar = segment.subtitle_paths[:2]
                             out_ass = output_dir / f"{input_video.stem}_part{part_index:03d}.bilingual.ass"
                             create_bilingual_ass(src, ar, out_ass, model_text)
                         else:
-                            src = output_dir / f"{Path(config['subtitle_a']).stem}_part{part_index:03d}.srt"
-                            out_ass = output_dir / f"{Path(config['subtitle_a']).stem}_part{part_index:03d}.ass"
+                            src = segment.subtitle_paths[0]
+                            out_ass = src.with_suffix(".ass")
                             create_single_ass_from_srt(src, out_ass, model_text)
                         segment.ass_paths.append(out_ass)
                         ass_outputs.append(out_ass)
