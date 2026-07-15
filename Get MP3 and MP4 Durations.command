@@ -1,7 +1,7 @@
 #!/bin/zsh
 
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPORT="$BASE_DIR/mp4_durations_report.txt"
+REPORT="$BASE_DIR/mp3_mp4_durations_report.txt"
 
 format_duration() {
   local total=$1
@@ -16,11 +16,11 @@ format_duration() {
   fi
 }
 
-echo "Scanning MP4 files in:"
+echo "Scanning MP3 and MP4 files in:"
 echo "$BASE_DIR"
 echo
 
-echo "MP4 Duration Report" > "$REPORT"
+echo "MP3 and MP4 Duration Report" > "$REPORT"
 echo "Folder: $BASE_DIR" >> "$REPORT"
 echo "Generated: $(date)" >> "$REPORT"
 echo "----------------------------------------" >> "$REPORT"
@@ -46,14 +46,14 @@ while IFS= read -r -d '' FILE; do
   echo "$DURATION_TEXT  |  $REL_PATH" >> "$REPORT"
 
   COUNT=$(( COUNT + 1 ))
-done < <(find "$BASE_DIR" -type f -iname "*.mp4" -print0)
+done < <(find "$BASE_DIR" -maxdepth 1 -type f \( -iname "*.mp3" -o -iname "*.mp4" \) -print0)
 
 echo
 echo "----------------------------------------" >> "$REPORT"
-echo "Total MP4 files: $COUNT" >> "$REPORT"
+echo "Total MP3/MP4 files: $COUNT" >> "$REPORT"
 echo "Total duration: $(format_duration "$TOTAL_SECONDS")" >> "$REPORT"
 
-echo "Total MP4 files: $COUNT"
+echo "Total MP3/MP4 files: $COUNT"
 echo "Total duration: $(format_duration "$TOTAL_SECONDS")"
 echo
 echo "Report saved to:"
