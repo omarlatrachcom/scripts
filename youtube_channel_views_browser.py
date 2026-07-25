@@ -72,6 +72,8 @@ DEFAULT_CONFIG = {
     "themes": [
         {
             "name": DEFAULT_THEME_NAME,
+            "min_views": "50k",
+            "recent_min_views": "10k",
             "report_file": DEFAULT_REPORT_FILENAME,
             "saved_videos_file": DEFAULT_SAVED_VIDEOS_FILENAME,
             "recent_saved_videos_file": DEFAULT_RECENT_SAVED_VIDEOS_FILENAME,
@@ -109,6 +111,8 @@ class ChannelConfig:
 @dataclass(frozen=True)
 class ThemeConfig:
     name: str
+    min_views: int
+    recent_min_views: int
     channels: list[ChannelConfig]
     report_file: Path
     saved_videos_file: Path
@@ -377,11 +381,20 @@ def parse_channel_configs(value: Any, field_name: str = "channels") -> list[Chan
     ]
 
 
-def parse_theme_config(value: Any, index: int, config_dir: Path, fallback_name: str | None = None) -> ThemeConfig:
+def parse_theme_config(
+    value: Any,
+    index: int,
+    config_dir: Path,
+    fallback_min_views: int,
+    fallback_recent_min_views: int,
+    fallback_name: str | None = None,
+) -> ThemeConfig:
     if not isinstance(value, dict):
         raise ValueError(f"themes[{index}] must be an object.")
 
     name = optional_string(value.get("name")) or fallback_name or f"Theme {index + 1}"
+    min_views = parse_count(value.get("min_views", fallback_min_views))
+    recent_min_views = parse_count(value.get("recent_min_views", fallback_recent_min_views))
     channels = parse_channel_configs(value.get("channels", []), f"themes[{index}].channels")
     report_file = optional_path(
         value.get("report_file") or value.get("output_file"),
@@ -403,6 +416,8 @@ def parse_theme_config(value: Any, index: int, config_dir: Path, fallback_name: 
 
     return ThemeConfig(
         name=name,
+        min_views=min_views,
+        recent_min_views=recent_min_views,
         channels=channels,
         report_file=report_file,
         saved_videos_file=saved_videos_file,
@@ -411,17 +426,28 @@ def parse_theme_config(value: Any, index: int, config_dir: Path, fallback_name: 
     )
 
 
-def parse_theme_configs(raw: Any, config_dir: Path) -> list[ThemeConfig]:
+def parse_theme_configs(
+    raw: Any,
+    config_dir: Path,
+    fallback_min_views: int,
+    fallback_recent_min_views: int,
+) -> list[ThemeConfig]:
     if raw is None:
         return []
 
     if isinstance(raw, dict):
         themes = [
-            parse_theme_config(value, index, config_dir, fallback_name=str(name))
+            parse_theme_config(
+                value, index, config_dir, fallback_min_views, fallback_recent_min_views,
+                fallback_name=str(name),
+            )
             for index, (name, value) in enumerate(raw.items())
         ]
     elif isinstance(raw, list):
-        themes = [parse_theme_config(value, index, config_dir) for index, value in enumerate(raw)]
+        themes = [
+            parse_theme_config(value, index, config_dir, fallback_min_views, fallback_recent_min_views)
+            for index, value in enumerate(raw)
+        ]
     else:
         raise ValueError("themes must be a JSON list or object.")
 
@@ -543,6 +569,8 @@ def channel_config_to_json(channel: ChannelConfig) -> dict[str, Any]:
 def theme_config_to_json(theme: ThemeConfig, config_dir: Path) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "name": theme.name,
+        "min_views": theme.min_views,
+        "recent_min_views": theme.recent_min_views,
         "report_file": path_text_relative_to(theme.report_file, config_dir),
         "saved_videos_file": path_text_relative_to(theme.saved_videos_file, config_dir),
         "recent_saved_videos_file": path_text_relative_to(theme.recent_saved_videos_file, config_dir),
@@ -835,7 +863,9 @@ def load_config(path: Path) -> Config:
         browser_keyring = optional_string(raw.get("browser_keyring"))
         browser_container = optional_string(raw.get("browser_container"))
         cookies_file = optional_cookie_file(raw.get("cookies_file"), path.parent)
-        themes = parse_theme_configs(raw.get("themes"), path.parent)
+        themes = parse_theme_configs(
+            raw.get("themes"), path.parent, min_views, recent_min_views
+        )
         if not themes:
             fallback_channels = parse_channel_configs(raw.get("channels", []))
             if not fallback_channels:
@@ -844,6 +874,8 @@ def load_config(path: Path) -> Config:
             themes = [
                 ThemeConfig(
                     name=fallback_theme_name,
+                    min_views=min_views,
+                    recent_min_views=recent_min_views,
                     channels=fallback_channels,
                     report_file=optional_path(
                         raw.get("report_file") or raw.get("output_file"),
@@ -869,8 +901,8 @@ def load_config(path: Path) -> Config:
         raise SystemExit(f"Config error in {path}: {exc}") from exc
 
     return Config(
-        min_views=min_views,
-        recent_min_views=recent_min_views,
+        min_views=selected_theme.min_views,
+        recent_min_views=selected_theme.recent_min_views,
         channels=selected_theme.channels,
         max_videos_per_channel=max_videos_per_channel,
         published_after=published_after,
@@ -1865,6 +1897,8 @@ def apply_arg_overrides(config: Config, args: argparse.Namespace) -> Config:
             raise SystemExit(str(exc)) from exc
         config = replace(
             config,
+            min_views=selected_theme.min_views,
+            recent_min_views=selected_theme.recent_min_views,
             channels=selected_theme.channels,
             report_file=selected_theme.report_file,
             saved_videos_file=selected_theme.saved_videos_file,
@@ -2519,6 +2553,8 @@ def launch_gui(args: argparse.Namespace) -> int:
             ) or default_recent_saved_videos_file_for_theme(name, config_dir)
             return ThemeConfig(
                 name=name,
+                min_views=parse_count(self.min_views_var.get().strip()),
+                recent_min_views=parse_count(self.recent_min_views_var.get().strip()),
                 channels=[channel for channel in self.get_channels() if channel.url],
                 report_file=report_file,
                 saved_videos_file=saved_videos_file,
@@ -2547,6 +2583,8 @@ def launch_gui(args: argparse.Namespace) -> int:
             try:
                 self.current_theme_name = theme.name
                 self.theme_var.set(theme.name)
+                self.min_views_var.set(format_count(theme.min_views).replace(",", ""))
+                self.recent_min_views_var.set(format_count(theme.recent_min_views).replace(",", ""))
                 self.output_path = theme.report_file
                 self.output_var.set(path_text_relative_to(theme.report_file, config_dir))
                 self.saved_file_var.set(path_text_relative_to(theme.saved_videos_file, config_dir))
@@ -2581,6 +2619,8 @@ def launch_gui(args: argparse.Namespace) -> int:
             config_dir = self.config_dir()
             theme = ThemeConfig(
                 name=name,
+                min_views=parse_count(DEFAULT_CONFIG["min_views"]),
+                recent_min_views=parse_count(DEFAULT_CONFIG["recent_min_views"]),
                 channels=[],
                 report_file=default_report_file_for_theme(name, config_dir),
                 saved_videos_file=default_saved_videos_file_for_theme(name, config_dir),
@@ -2613,6 +2653,8 @@ def launch_gui(args: argparse.Namespace) -> int:
             old_theme = self.themes[index]
             renamed = ThemeConfig(
                 name=name,
+                min_views=old_theme.min_views,
+                recent_min_views=old_theme.recent_min_views,
                 channels=old_theme.channels,
                 report_file=old_theme.report_file,
                 saved_videos_file=old_theme.saved_videos_file,
@@ -2751,6 +2793,8 @@ def launch_gui(args: argparse.Namespace) -> int:
             self.themes = list(config.themes) or [
                 ThemeConfig(
                     name=config.theme_name,
+                    min_views=config.min_views,
+                    recent_min_views=config.recent_min_views,
                     channels=config.channels,
                     report_file=config.report_file,
                     saved_videos_file=config.saved_videos_file,
@@ -2763,6 +2807,8 @@ def launch_gui(args: argparse.Namespace) -> int:
             self.load_theme_into_form(
                 ThemeConfig(
                     name=config.theme_name,
+                    min_views=config.min_views,
+                    recent_min_views=config.recent_min_views,
                     channels=config.channels,
                     report_file=config.report_file,
                     saved_videos_file=config.saved_videos_file,
@@ -2786,6 +2832,8 @@ def launch_gui(args: argparse.Namespace) -> int:
                 self.themes = [
                     ThemeConfig(
                         name=DEFAULT_THEME_NAME,
+                        min_views=parse_count(DEFAULT_CONFIG["min_views"]),
+                        recent_min_views=parse_count(DEFAULT_CONFIG["recent_min_views"]),
                         channels=[],
                         report_file=default_report_file_for_theme(DEFAULT_THEME_NAME, config_dir),
                         saved_videos_file=default_saved_videos_file_for_theme(DEFAULT_THEME_NAME, config_dir),
@@ -2806,8 +2854,8 @@ def launch_gui(args: argparse.Namespace) -> int:
                 raise ValueError("Use either a cookies browser or a cookies file, not both.")
 
             return Config(
-                min_views=parse_count(min_views_text),
-                recent_min_views=parse_count(recent_min_views_text or min_views_text),
+                min_views=selected_theme.min_views,
+                recent_min_views=selected_theme.recent_min_views,
                 channels=selected_theme.channels,
                 max_videos_per_channel=optional_positive_int(max_videos_text, "Max videos/channel"),
                 published_after=published_after,

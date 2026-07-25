@@ -12,6 +12,8 @@
   "themes": [
     {
       "name": "books",
+      "min_views": 15000,
+      "recent_min_views": 5000,
       "report_file": "youtube_channel_views_books_report.html",
       "saved_videos_file": "youtube_channel_views_books_saved_videos.json",
       "recent_saved_videos_file": "youtube_channel_views_books_recent_saved_videos.json",
@@ -31,6 +33,72 @@
         {
           "enabled": true,
           "url": "https://www.youtube.com/@Istami3likitab/videos"
+        }
+      ]
+    },
+    {
+      "name": "Documentary_EN",
+      "min_views": 10000000,
+      "recent_min_views": 1000000,
+      "report_file": "youtube_channel_views_documentary_en_report.html",
+      "saved_videos_file": "youtube_channel_views_documentary_en_saved_videos.json",
+      "recent_saved_videos_file": "youtube_channel_views_documentary_en_recent_saved_videos.json",
+      "channels": [
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@frontline/videos"
+        },
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@ajplus/videos"
+        },
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@novapbs/videos"
+        },
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@bbcideas/videos"
+        },
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@DWShift/videos"
+        }
+      ]
+    },
+    {
+      "name": "Documentary_FR",
+      "min_views": 1000000,
+      "recent_min_views": 100000,
+      "report_file": "youtube_channel_views_documentary_fr_report.html",
+      "saved_videos_file": "youtube_channel_views_documentary_fr_saved_videos.json",
+      "recent_saved_videos_file": "youtube_channel_views_documentary_fr_recent_saved_videos.json",
+      "channels": [
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@arte/videos"
+        },
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@Inasociete/videos"
+        }
+      ]
+    },
+    {
+      "name": "Documentary_عربية",
+      "min_views": 10000000,
+      "recent_min_views": 1000000,
+      "report_file": "youtube_channel_views_documentary_report.html",
+      "saved_videos_file": "youtube_channel_views_documentary_saved_videos.json",
+      "recent_saved_videos_file": "youtube_channel_views_documentary_recent_saved_videos.json",
+      "channels": [
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@aljazeeradocumentary/videos"
+        },
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@dwdocarabia/videos"
         }
       ]
     }
