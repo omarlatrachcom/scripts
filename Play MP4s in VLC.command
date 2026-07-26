@@ -19,11 +19,12 @@ fi
 # Set Mac system volume to 100%
 osascript -e "set volume output volume 100"
 
-setopt EXTENDED_GLOB
-setopt NULL_GLOB
-
-# Find MP4 files recursively, sorted by path/name
-FILES=( "$BASE_DIR"/**/*.(#i)mp4(N) )
+# Preserve the exact filename bytes stored by pCloud. zsh globs can normalize
+# accented Unicode names into visually identical paths that do not exist.
+FILES=()
+while IFS= read -r -d '' DISCOVERED_FILE; do
+  FILES+=( "$DISCOVERED_FILE" )
+done < <(find -s "$BASE_DIR" -type f -iname "*.mp4" -print0)
 
 if [ ${#FILES[@]} -eq 0 ]; then
   echo "No MP4 files found in:"
