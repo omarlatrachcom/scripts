@@ -24,6 +24,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -51,12 +52,17 @@ DEFAULT_RECENT_SAVED_VIDEOS_PATH = SCRIPT_DIR / DEFAULT_RECENT_SAVED_VIDEOS_FILE
 SAVED_VIDEO_STORE_GLOB = "youtube_channel_views*saved_videos.json"
 FETCH_LOG_DIRNAME = "logs"
 FETCH_LOG_FILENAME_PREFIX = "youtube_channel_views_fetch"
+DETAIL_CACHE_FILENAME = "youtube_channel_views_detail_cache.json"
+DETAIL_CACHE_PATH = SCRIPT_DIR / DETAIL_CACHE_FILENAME
+DETAIL_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
+DETAIL_CACHE_CHECKPOINT_SIZE = 100
 DEFAULT_THEME_NAME = "Default"
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "YouTubeChannelViewsBrowser"
 VENV_DIR = APP_SUPPORT_DIR / "venv"
 VENV_PYTHON = VENV_DIR / "bin" / "python"
 DEPENDENCY_PACKAGES = ("yt-dlp", "yt-dlp-ejs")
 SUPPORTED_COOKIE_BROWSERS = {"brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale"}
+DETAIL_LOOKUP_ROUNDS = 3
 
 DEFAULT_CONFIG = {
     "min_views": "50k",
@@ -616,6 +622,86 @@ def load_video_records(path: Path) -> dict[str, dict[str, Any]]:
         record["video_id"] = video_id
         records[video_id] = record
     return records
+
+
+DETAIL_CACHE_METADATA_KEYS = (
+    "id",
+    "title",
+    "webpage_url",
+    "original_url",
+    "view_count",
+    "channel",
+    "channel_url",
+    "uploader",
+    "uploader_url",
+    "duration",
+    "duration_string",
+    "upload_date",
+    "release_date",
+    "timestamp",
+    "release_timestamp",
+    "modified_timestamp",
+    "thumbnail",
+    "thumbnails",
+)
+
+
+def load_detail_cache(path: Path = DETAIL_CACHE_PATH) -> dict[str, dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict) or not isinstance(payload.get("videos"), dict):
+        return {}
+    return {
+        str(video_id): record
+        for video_id, record in payload["videos"].items()
+        if isinstance(record, dict)
+    }
+
+
+def write_detail_cache(
+    records: dict[str, dict[str, Any]],
+    path: Path = DETAIL_CACHE_PATH,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "ttl_hours": DETAIL_CACHE_TTL_SECONDS // 3600,
+        "videos": records,
+    }
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary_path, path)
+
+
+def cached_detail_metadata(
+    record: dict[str, Any] | None,
+    *,
+    now: float,
+) -> dict[str, Any] | None:
+    if not isinstance(record, dict):
+        return None
+    fetched_at = record.get("fetched_at")
+    metadata = record.get("metadata")
+    if not isinstance(fetched_at, (int, float)) or not isinstance(metadata, dict):
+        return None
+    if now - float(fetched_at) > DETAIL_CACHE_TTL_SECONDS:
+        return None
+    if coerce_optional_count(metadata.get("view_count")) is None:
+        return None
+    return metadata
+
+
+def detail_metadata_for_cache(detail: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: detail[key]
+        for key in DETAIL_CACHE_METADATA_KEYS
+        if detail.get(key) not in (None, "", [], {})
+    }
 
 
 def write_video_records(path: Path, records: dict[str, dict[str, Any]]) -> None:
@@ -1228,36 +1314,113 @@ def fetch_detail_for_missing_views(
     if not entries or not config.fetch_missing_view_counts:
         return entries, DetailFetchStats(attempted=0)
 
-    resolved: list[dict[str, Any]] = []
-    failed = 0
-    auth_failed = 0
-    last_error = ""
-    options = ytdlp_options(config, flat=False, ignore_errors=False)
-    with YoutubeDL(options) as ydl:
-        for index, entry in enumerate(entries, start=1):
-            url = video_url_from_entry(entry)
-            if not url:
-                resolved.append(entry)
-                continue
-            if index == 1 or index % 10 == 0 or index == len(entries):
-                logger(f"  Fetching detailed view counts for entries missing counts... {index}/{len(entries)}")
-            try:
-                detail = ydl.extract_info(url, download=False, process=False)
-            except Exception as exc:
-                failed += 1
-                message = str(exc).strip() or exc.__class__.__name__
-                last_error = message
-                if looks_like_auth_error(message):
-                    auth_failed += 1
-                resolved.append(entry)
-                continue
-            if isinstance(detail, dict):
-                resolved.append(merge_metadata(entry, detail))
-            else:
-                failed += 1
-                resolved.append(entry)
+    resolved = [dict(entry) for entry in entries]
+    cache = load_detail_cache()
+    now = time.time()
+    cache_hits = 0
+    for index, entry in enumerate(resolved):
+        video_id = video_id_from_entry(entry)
+        metadata = cached_detail_metadata(cache.get(video_id), now=now)
+        if metadata is None:
+            continue
+        resolved[index] = merge_metadata(entry, metadata)
+        cache_hits += 1
+    if cache_hits:
+        logger(
+            f"  Reused {format_count(cache_hits)} fresh detail result(s) from the "
+            f"{DETAIL_CACHE_TTL_SECONDS // 3600}-hour cache."
+        )
+
+    pending = {
+        index
+        for index, entry in enumerate(resolved)
+        if coerce_optional_count(entry.get("view_count")) is None
+    }
+    attempted = len(pending)
+    last_errors: dict[int, str] = {}
+    successes_since_checkpoint = 0
+
+    def checkpoint_cache() -> None:
+        try:
+            write_detail_cache(cache)
+        except OSError as exc:
+            logger(f"  WARNING: Could not save the detail cache checkpoint: {exc}")
+
+    for round_number in range(1, DETAIL_LOOKUP_ROUNDS + 1):
+        if not pending:
+            break
+
+        round_targets = sorted(pending)
+        if round_number > 1:
+            logger(
+                f"  Targeted detail repair round {round_number - 1}: retrying only "
+                f"{format_count(len(round_targets))} unresolved video(s)."
+            )
+
+        options = ytdlp_options(config, flat=False, ignore_errors=False)
+        if round_number == DETAIL_LOOKUP_ROUNDS and (
+            "cookiefile" in options or "cookiesfrombrowser" in options
+        ):
+            options.pop("cookiefile", None)
+            options.pop("cookiesfrombrowser", None)
+            logger(
+                "  Final targeted repair round will retry unresolved public videos without "
+                "browser cookies."
+            )
+
+        with YoutubeDL(options) as ydl:
+            for position, entry_index in enumerate(round_targets, start=1):
+                entry = resolved[entry_index]
+                url = video_url_from_entry(entry)
+                if not url:
+                    last_errors[entry_index] = "No usable video URL"
+                    continue
+                if position == 1 or position % 10 == 0 or position == len(round_targets):
+                    logger(
+                        "  Fetching detailed view counts for entries missing counts... "
+                        f"{position}/{len(round_targets)}"
+                    )
+                try:
+                    # Fully process the video result. Preliminary process=False
+                    # responses can silently omit view_count without raising.
+                    detail = ydl.extract_info(url, download=False)
+                except Exception as exc:
+                    last_errors[entry_index] = str(exc).strip() or exc.__class__.__name__
+                    continue
+
+                if not isinstance(detail, dict):
+                    last_errors[entry_index] = "No video metadata returned"
+                    continue
+
+                merged = merge_metadata(entry, detail)
+                if coerce_optional_count(merged.get("view_count")) is None:
+                    last_errors[entry_index] = "Detail response did not include view_count"
+                    continue
+
+                resolved[entry_index] = merged
+                pending.discard(entry_index)
+                last_errors.pop(entry_index, None)
+                video_id = video_id_from_entry(merged)
+                if video_id:
+                    cache[video_id] = {
+                        "fetched_at": time.time(),
+                        "metadata": detail_metadata_for_cache(merged),
+                    }
+                    successes_since_checkpoint += 1
+                    if successes_since_checkpoint >= DETAIL_CACHE_CHECKPOINT_SIZE:
+                        checkpoint_cache()
+                        successes_since_checkpoint = 0
+
+    if successes_since_checkpoint:
+        checkpoint_cache()
+
+    failed = len(pending)
+    auth_failed = sum(
+        1 for index in pending if looks_like_auth_error(last_errors.get(index, ""))
+    )
+    last_error = last_errors.get(next(iter(sorted(pending)), -1), "")
     return resolved, DetailFetchStats(
-        attempted=len(entries),
+        attempted=attempted,
         failed=failed,
         auth_failed=auth_failed,
         last_error=last_error,
@@ -1304,11 +1467,14 @@ def fetch_channel_videos(
             entries[index] = resolved_entry
         if detail_stats.auth_failed:
             logger(
-                f"  Auth/bot check blocked {format_count(detail_stats.auth_failed)} detail lookups. "
-                "Using browser cookies is required for those videos."
+                f"  Auth/bot checks still blocked {format_count(detail_stats.auth_failed)} "
+                "detail lookup(s) after targeted repairs."
             )
-        elif detail_stats.failed:
-            logger(f"  Detail lookup failed for {format_count(detail_stats.failed)} videos.")
+        if detail_stats.failed:
+            logger(
+                f"  Detail lookup remains unresolved for {format_count(detail_stats.failed)} "
+                "video(s) after all targeted repair rounds."
+            )
 
     videos: list[Video] = []
     missing_view_count = 0
