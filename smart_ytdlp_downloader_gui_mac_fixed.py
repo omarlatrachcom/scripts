@@ -128,6 +128,7 @@ run_auto_update_before_import()
 
 try:
     from yt_dlp import YoutubeDL  # type: ignore
+    from yt_dlp.utils import sanitize_filename  # type: ignore
     try:
         from yt_dlp.version import __version__ as YTDLP_VERSION  # type: ignore
     except Exception:
@@ -447,6 +448,101 @@ def completed_playlist_indices(
 
 def format_playlist_items(indices: set[int]) -> str:
     return ",".join(str(index) for index in sorted(indices))
+
+
+DOWNLOAD_ARTIFACT_SUFFIX_RE = re.compile(
+    r"(?P<suffix>"
+    r"(?:\.f\d{2,6})?\.(?:mp4|webm|mkv|m4a|mp3|mov|avi|flv|ogg|opus|wav)"
+    r"(?:\.(?:part|ytdl))?"
+    r"|(?:\.[A-Za-z0-9_-]{2,20})?\.(?:srt|ass|vtt)(?:\.part)?"
+    r")$",
+    flags=re.IGNORECASE,
+)
+PLAYLIST_PREFIX_RE = re.compile(r"^(?P<prefix>\d+\s+-\s+)(?P<title>.*)$")
+
+
+def ascii_safe_download_artifact_name(name: str) -> str | None:
+    """Return yt-dlp's ASCII-safe equivalent for a known download artifact."""
+    suffix_match = DOWNLOAD_ARTIFACT_SUFFIX_RE.search(name)
+    if suffix_match is None:
+        return None
+    suffix = suffix_match.group("suffix")
+    base = name[: suffix_match.start()]
+
+    prefix_match = PLAYLIST_PREFIX_RE.match(base)
+    if prefix_match:
+        prefix = prefix_match.group("prefix")
+        title = prefix_match.group("title")
+    else:
+        prefix = ""
+        title = base
+
+    safe_title = sanitize_filename(title, restricted=True)
+    if not safe_title:
+        safe_title = "video"
+    return f"{prefix}{safe_title}{suffix}"
+
+
+def reconcile_ascii_safe_artifact_names(directory: str | Path, logger) -> int:
+    """Rename legacy artifacts to the active ASCII-safe filename policy."""
+    base = Path(directory).expanduser()
+    if not base.exists():
+        return 0
+
+    plan: list[tuple[Path, Path]] = []
+    destinations: dict[Path, list[Path]] = {}
+    for source in base.iterdir():
+        if not source.is_file():
+            continue
+        safe_name = ascii_safe_download_artifact_name(source.name)
+        if not safe_name or safe_name == source.name:
+            continue
+        destination = source.with_name(safe_name)
+        plan.append((source, destination))
+        destinations.setdefault(destination, []).append(source)
+
+    conflicts = {
+        destination
+        for destination, sources in destinations.items()
+        if len(sources) > 1 or (destination.exists() and destination not in sources)
+    }
+    safe_plan = [
+        (source, destination)
+        for source, destination in plan
+        if destination not in conflicts
+    ]
+    for destination in sorted(conflicts):
+        logger(
+            f"WARNING: ASCII-safe rename skipped because the destination already exists "
+            f"or is ambiguous: {destination.name}"
+        )
+
+    if not safe_plan:
+        logger("> Filename reconciliation: existing download artifacts are already ASCII-safe.")
+        return 0
+
+    temporary_moves: list[tuple[Path, Path, Path]] = []
+    try:
+        for index, (source, destination) in enumerate(safe_plan, start=1):
+            temporary = source.with_name(f".ascii-reconcile-{os.getpid()}-{index}.tmp")
+            source.rename(temporary)
+            temporary_moves.append((source, temporary, destination))
+        for source, temporary, destination in temporary_moves:
+            temporary.rename(destination)
+            logger(f"> ASCII-safe rename: {source.name} -> {destination.name}")
+    except Exception:
+        for source, temporary, destination in reversed(temporary_moves):
+            try:
+                if temporary.exists() and not source.exists():
+                    temporary.rename(source)
+                elif destination.exists() and not source.exists():
+                    destination.rename(source)
+            except OSError:
+                pass
+        raise
+
+    logger(f"> Filename reconciliation renamed {len(safe_plan)} existing artifact(s).")
+    return len(safe_plan)
 
 
 def run_download(urls: list[str], ydl_opts: dict, *, retry_without_cookies: bool, logger) -> int:
@@ -1605,6 +1701,7 @@ class DownloaderGUI:
 
             extractor_args = build_youtube_extractor_args(logger)
 
+            reconcile_ascii_safe_artifact_names(config["output_dir"], logger)
             before_files = snapshot_all_files(config["output_dir"])
 
             ytdlp_logger = GuiLogger(logger)
@@ -1616,10 +1713,17 @@ class DownloaderGUI:
                 "concurrent_fragment_downloads": 4,
                 "progress_hooks": [self.make_progress_hook()],
                 "windowsfilenames": True,
+                # Transliterate accents and restrict generated media/subtitle
+                # names to portable ASCII characters from the outset.
+                "restrictfilenames": True,
                 "logger": ytdlp_logger,
                 "paths": {"home": config["output_dir"]},
                 "keepvideo": False,
             }
+            logger(
+                "> Filename policy: portable ASCII-safe names are enabled for "
+                "media, subtitles, and temporary format components."
+            )
             if extractor_args:
                 common_opts["extractor_args"] = extractor_args
             if format_str:
