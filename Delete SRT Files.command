@@ -1,7 +1,11 @@
 #!/bin/zsh
 
-# Folder where this script is located
-BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Use a folder supplied by a portable launcher, otherwise this script's folder.
+if [[ -n "${1:-}" && -d "$1" ]]; then
+  BASE_DIR="${1:A}"
+else
+  BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
 
 echo "Searching for .srt files in:"
 echo "$BASE_DIR"

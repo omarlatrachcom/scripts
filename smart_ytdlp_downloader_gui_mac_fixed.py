@@ -29,6 +29,7 @@ import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 UPDATE_INTERVAL_HOURS = 24
+PLAYLIST_REPAIR_ROUNDS = 3
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "SmartYTDownloader"
 UPDATE_STATE_FILE = APP_SUPPORT_DIR / "last_update.json"
 APP_STATE_FILE = APP_SUPPORT_DIR / "gui_state.json"
@@ -382,6 +383,70 @@ def maybe_get_playlist_length(url: str, extractor_args: dict, cookiesfrombrowser
     except Exception as exc:
         logger(f"NOTE: Could not pre-fetch playlist length; using 2-digit numbering. ({exc})")
     return None
+
+
+def get_playlist_indices(url: str, extractor_args: dict, cookiesfrombrowser, logger) -> set[int] | None:
+    """Fetch the playlist positions that yt-dlp can currently see."""
+    try:
+        info_opts: dict = {
+            "quiet": True,
+            "ignoreerrors": True,
+            "extract_flat": "in_playlist",
+            "windowsfilenames": True,
+        }
+        if extractor_args:
+            info_opts["extractor_args"] = extractor_args
+        if cookiesfrombrowser is not None:
+            info_opts["cookiesfrombrowser"] = cookiesfrombrowser
+
+        with YoutubeDL(info_opts) as ydl_info:
+            info = ydl_info.extract_info(url, download=False)
+        if not info or info.get("_type") != "playlist":
+            return None
+
+        indices: set[int] = set()
+        for fallback_index, entry in enumerate(info.get("entries") or [], start=1):
+            if not entry:
+                continue
+            raw_index = entry.get("playlist_index", fallback_index)
+            try:
+                indices.add(int(raw_index))
+            except (TypeError, ValueError):
+                indices.add(fallback_index)
+        return indices or None
+    except Exception as exc:
+        logger(f"NOTE: Could not build the playlist resume inventory. ({exc})")
+        return None
+
+
+PLAYLIST_FILE_INDEX_RE = re.compile(r"^(?P<index>\d+)\s+-\s+")
+
+
+def completed_playlist_indices(
+    directory: str | Path,
+    *,
+    extensions: set[str],
+) -> set[int]:
+    """Return playlist indices with a non-empty finished artifact."""
+    base = Path(directory).expanduser()
+    if not base.exists():
+        return set()
+
+    normalized_extensions = {extension.lower().lstrip(".") for extension in extensions}
+    completed: set[int] = set()
+    for path in base.iterdir():
+        if not path.is_file() or path.stat().st_size <= 0:
+            continue
+        if path.suffix.lower().lstrip(".") not in normalized_extensions:
+            continue
+        match = PLAYLIST_FILE_INDEX_RE.match(path.name)
+        if match:
+            completed.add(int(match.group("index")))
+    return completed
+
+
+def format_playlist_items(indices: set[int]) -> str:
+    return ",".join(str(index) for index in sorted(indices))
 
 
 def run_download(urls: list[str], ydl_opts: dict, *, retry_without_cookies: bool, logger) -> int:
@@ -1545,6 +1610,7 @@ class DownloaderGUI:
             ytdlp_logger = GuiLogger(logger)
             common_opts: dict = {
                 "continuedl": True,
+                "overwrites": False,
                 "retries": 10,
                 "fragment_retries": 10,
                 "concurrent_fragment_downloads": 4,
@@ -1601,11 +1667,11 @@ class DownloaderGUI:
                 result = run_download([url], ydl_opts, retry_without_cookies=True, logger=logger)
 
                 cleanup_stats = SubtitleCleanupStats()
-                residue_stats = cleanup_new_residue_since(before_files, config["output_dir"], logger)
                 if result != 0:
-                    summary = "Download finished with errors."
-                    if residue_stats.removed_files:
-                        summary += f" Residue cleanup removed {residue_stats.removed_files} file(s)."
+                    logger(
+                        "> Keeping partial yt-dlp files so a later run can continue the interrupted download."
+                    )
+                    summary = "Download finished with errors. Run it again later to resume the unfinished file."
                     self.queue.put(("done", False, summary))
                     return
 
@@ -1618,6 +1684,7 @@ class DownloaderGUI:
                         logger=logger,
                     )
 
+                residue_stats = cleanup_new_residue_since(before_files, config["output_dir"], logger)
                 if media_type == "srt":
                     summary = "All done. Check the output folder for the downloaded .srt subtitles only."
                 else:
@@ -1663,22 +1730,134 @@ class DownloaderGUI:
             if end_idx is not None:
                 ydl_opts["playlistend"] = end_idx
 
-            logger(f"> Starting playlist download... (mode: {mode_label})")
-            self.queue_progress(None, "Starting playlist download...", indeterminate=True)
-            result = run_download([url], ydl_opts, retry_without_cookies=True, logger=logger)
-
             cleanup_stats = SubtitleCleanupStats()
-            residue_stats = cleanup_new_residue_since(before_files, config["output_dir"], logger)
-            if want_subs and subs_langs:
-                cleanup_stats = run_optional_auto_sub_fallback(
-                    [url],
-                    ydl_opts,
-                    output_dir=config["output_dir"],
-                    retry_without_cookies=True,
-                    logger=logger,
+            visible_indices = get_playlist_indices(url, extractor_args, cookiesfrombrowser, logger)
+            if visible_indices is not None:
+                expected_indices = {
+                    index
+                    for index in visible_indices
+                    if (start_idx is None or index >= start_idx) and (end_idx is None or index <= end_idx)
+                }
+            else:
+                expected_indices = set()
+
+            if media_type == "video":
+                media_extensions = {"mp4"}
+            elif media_type == "audio":
+                media_extensions = {"mp3"}
+            else:
+                media_extensions = set()
+
+            def missing_media_indices() -> set[int]:
+                if not media_extensions:
+                    return set()
+                completed = completed_playlist_indices(
+                    config["output_dir"],
+                    extensions=media_extensions,
+                )
+                return expected_indices - completed
+
+            def missing_subtitle_indices() -> set[int]:
+                if not want_subs:
+                    return set()
+                completed = completed_playlist_indices(
+                    config["output_dir"],
+                    extensions={"srt"},
+                )
+                return expected_indices - completed
+
+            result = 0
+            if expected_indices:
+                existing_media = len(expected_indices - missing_media_indices()) if media_extensions else 0
+                existing_subtitles = len(expected_indices - missing_subtitle_indices()) if want_subs else 0
+                logger(
+                    f"> Resume inventory: {len(expected_indices)} visible playlist item(s); "
+                    f"{existing_media} media file(s) and {existing_subtitles} subtitle file(s) already complete."
                 )
 
-            if result == 0:
+                if media_extensions:
+                    for round_number in range(1, PLAYLIST_REPAIR_ROUNDS + 1):
+                        targets = missing_media_indices()
+                        if not targets:
+                            break
+                        label = "initial/resume pass" if round_number == 1 else f"automatic repair pass {round_number - 1}"
+                        logger(
+                            f"> Media {label}: targeting only {len(targets)} missing item(s): "
+                            f"{format_playlist_items(targets)}"
+                        )
+                        self.queue_progress(None, f"Repairing {len(targets)} missing media item(s)...", indeterminate=True)
+                        targeted_opts = {
+                            **ydl_opts,
+                            "playlist_items": format_playlist_items(targets),
+                        }
+                        result = run_download([url], targeted_opts, retry_without_cookies=True, logger=logger) or result
+                else:
+                    logger("> Subtitle-only playlist reconciliation selected.")
+
+                if want_subs and subs_langs:
+                    manual_targets = missing_subtitle_indices()
+                    if manual_targets:
+                        logger(
+                            f"> Manual subtitle repair: targeting only {len(manual_targets)} missing item(s): "
+                            f"{format_playlist_items(manual_targets)}"
+                        )
+                        manual_opts = {
+                            **ydl_opts,
+                            **build_subtitle_opts(langs=subs_langs, auto=False, skip_download=True),
+                            "playlist_items": format_playlist_items(manual_targets),
+                        }
+                        result = run_download(
+                            [url], manual_opts, retry_without_cookies=True, logger=logger
+                        ) or result
+
+                    auto_targets = missing_subtitle_indices()
+                    if auto_targets:
+                        before_srt_files = snapshot_srt_files(config["output_dir"])
+                        logger(
+                            f"> AUTO subtitle repair: manual subtitles are still absent for "
+                            f"{len(auto_targets)} item(s); targeting only: {format_playlist_items(auto_targets)}"
+                        )
+                        auto_opts = {
+                            **ydl_opts,
+                            **build_subtitle_opts(langs=subs_langs, auto=True, skip_download=True),
+                            "playlist_items": format_playlist_items(auto_targets),
+                        }
+                        result = run_download(
+                            [url], auto_opts, retry_without_cookies=True, logger=logger
+                        ) or result
+                        new_auto_srt_files = sorted(
+                            snapshot_srt_files(config["output_dir"]) - before_srt_files
+                        )
+                        cleanup_stats = run_auto_subtitle_cleanup(new_auto_srt_files, logger)
+            else:
+                logger(
+                    "> Playlist inventory was unavailable; using yt-dlp's safe continuation mode. "
+                    "Existing completed files will not be overwritten."
+                )
+                self.queue_progress(None, "Starting resumable playlist download...", indeterminate=True)
+                result = run_download([url], ydl_opts, retry_without_cookies=True, logger=logger)
+                if want_subs and subs_langs:
+                    cleanup_stats = run_optional_auto_sub_fallback(
+                        [url],
+                        ydl_opts,
+                        output_dir=config["output_dir"],
+                        retry_without_cookies=True,
+                        logger=logger,
+                    )
+
+            remaining_media = missing_media_indices() if expected_indices else set()
+            remaining_subtitles = missing_subtitle_indices() if expected_indices else set()
+            reconciled = bool(expected_indices) and not remaining_media and not remaining_subtitles
+            if expected_indices and (remaining_media or remaining_subtitles):
+                residue_stats = ResidueCleanupStats()
+                logger(
+                    "> Keeping partial yt-dlp files for the next run so interrupted downloads can "
+                    "continue instead of restarting their current files."
+                )
+            else:
+                residue_stats = cleanup_new_residue_since(before_files, config["output_dir"], logger)
+
+            if reconciled or (not expected_indices and result == 0):
                 if media_type == "video":
                     summary = f"All done. Check the output folder for the downloaded episodes (video){' and .srt subtitles' if want_subs else ''}."
                 elif media_type == "audio":
@@ -1692,7 +1871,16 @@ class DownloaderGUI:
                 logger(summary)
                 self.queue.put(("done", True, summary))
             else:
-                summary = "Finished, but yt-dlp reported one or more failures. Some items may have downloaded, and some may have been skipped."
+                parts = []
+                if remaining_media:
+                    parts.append(f"media indices {format_playlist_items(remaining_media)}")
+                if remaining_subtitles:
+                    parts.append(f"subtitle indices {format_playlist_items(remaining_subtitles)}")
+                detail = "; ".join(parts) if parts else "one or more yt-dlp items"
+                summary = (
+                    f"Finished after automatic targeted repairs, but these are still missing: {detail}. "
+                    "Run again later to retry only those parts."
+                )
                 if residue_stats.removed_files:
                     summary += f" Residue cleanup removed {residue_stats.removed_files} file(s)."
                 logger(summary)

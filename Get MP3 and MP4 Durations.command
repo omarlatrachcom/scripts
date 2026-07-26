@@ -1,6 +1,27 @@
 #!/bin/zsh
 
-BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [[ -n "${1:-}" && -d "$1" ]]; then
+  BASE_DIR="${1:A}"
+else
+  CHOSEN_DIR=$(osascript <<'APPLESCRIPT'
+try
+  set chosenFolder to choose folder with prompt "Choose the folder containing the MP3 and MP4 files:"
+  return POSIX path of chosenFolder
+on error number -128
+  return ""
+end try
+APPLESCRIPT
+)
+  BASE_DIR="${CHOSEN_DIR%/}"
+fi
+
+if [[ -z "$BASE_DIR" || ! -d "$BASE_DIR" ]]; then
+  echo "No folder was selected."
+  exit 0
+fi
+
 REPORT="$BASE_DIR/mp3_mp4_durations_report.txt"
 
 format_duration() {
@@ -30,9 +51,14 @@ COUNT=0
 TOTAL_SECONDS=0
 
 while IFS= read -r -d '' FILE; do
-  DURATION_RAW=$(mdls -raw -name kMDItemDurationSeconds "$FILE" 2>/dev/null)
+  if command -v ffprobe >/dev/null 2>&1; then
+    DURATION_RAW=$(ffprobe -v error -show_entries format=duration \
+      -of default=noprint_wrappers=1:nokey=1 "$FILE" 2>/dev/null)
+  else
+    DURATION_RAW=$(mdls -raw -name kMDItemDurationSeconds "$FILE" 2>/dev/null)
+  fi
 
-  if [[ "$DURATION_RAW" == "(null)" || -z "$DURATION_RAW" ]]; then
+  if [[ ! "$DURATION_RAW" =~ '^[0-9]+([.][0-9]+)?$' ]]; then
     DURATION_TEXT="Unknown duration"
   else
     DURATION_SECONDS=$(printf "%.0f" "$DURATION_RAW")
@@ -60,4 +86,6 @@ echo "Report saved to:"
 echo "$REPORT"
 echo
 
-read -k 1 "?Press any key to close..."
+if [[ -t 0 ]]; then
+  read -k 1 "?Press any key to close..."
+fi

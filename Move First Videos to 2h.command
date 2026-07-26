@@ -1,8 +1,24 @@
 #!/bin/zsh
 
-BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
-TARGET_DIR="$BASE_DIR/2h"
+if [[ -n "${1:-}" && -d "$1" ]]; then
+  BASE_DIR="${1:A}"
+else
+  BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
 MAX_SECONDS=$((2 * 60 * 60))
+
+LAST_BATCH_NUMBER=0
+while IFS= read -r -d '' EXISTING_BATCH_DIR; do
+  BATCH_BASENAME="${EXISTING_BATCH_DIR:t}"
+  if [[ "$BATCH_BASENAME" =~ '^p([0-9]+)$' ]]; then
+    BATCH_NUMBER=$(( 10#${match[1]} ))
+    (( BATCH_NUMBER > LAST_BATCH_NUMBER )) && LAST_BATCH_NUMBER=$BATCH_NUMBER
+  fi
+done < <(find "$BASE_DIR" -mindepth 1 -maxdepth 1 -type d -name "p[0-9]*" -print0)
+
+NEXT_BATCH_NUMBER=$(( LAST_BATCH_NUMBER + 1 ))
+printf -v BATCH_NAME "p%02d" "$NEXT_BATCH_NUMBER"
+TARGET_DIR="$BASE_DIR/$BATCH_NAME"
 
 format_duration() {
   local total=$1
@@ -35,19 +51,25 @@ get_duration_seconds() {
   local file="$1"
   local raw=""
   local seconds=""
+  local attempt=1
 
-  raw=$(mdls -raw -name kMDItemDurationSeconds "$file" 2>/dev/null)
-
-  if [[ "$raw" == "(null)" || -z "$raw" ]]; then
+  # ffprobe reads media files directly and works on pCloud, where Spotlight's
+  # mdls commonly returns a "could not find" sentence instead of a duration.
+  while (( attempt <= 10 )); do
     if command -v ffprobe >/dev/null 2>&1; then
-      raw=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
+      raw=$(ffprobe -v error -show_entries format=duration \
+        -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
     fi
+    [[ "$raw" =~ '^[0-9]+([.][0-9]+)?$' ]] && break
+    (( attempt++ ))
+    (( attempt <= 10 )) && sleep 2
+  done
+
+  if [[ ! "$raw" =~ '^[0-9]+([.][0-9]+)?$' ]]; then
+    raw=$(mdls -raw -name kMDItemDurationSeconds "$file" 2>/dev/null)
   fi
 
-  if [[ "$raw" == "(null)" || -z "$raw" ]]; then
-    return 1
-  fi
-
+  [[ "$raw" =~ '^[0-9]+([.][0-9]+)?$' ]] || return 1
   seconds=$(duration_to_seconds "$raw") || return 1
 
   if [[ -z "$seconds" || "$seconds" -le 0 ]]; then
@@ -61,13 +83,22 @@ setopt EXTENDED_GLOB
 setopt NULL_GLOB
 setopt NO_CASE_GLOB
 
-FILES=( "$BASE_DIR"/*.(mp4|m4v|mov|mkv|avi|webm)(N) )
+FILES=()
+while IFS= read -r -d '' DISCOVERED_FILE; do
+  FILES+=( "$DISCOVERED_FILE" )
+done < <(
+  find -s "$BASE_DIR" -maxdepth 1 -type f \
+    \( -iname "*.mp4" -o -iname "*.m4v" -o -iname "*.mov" -o -iname "*.mkv" \
+       -o -iname "*.avi" -o -iname "*.webm" \) -print0
+)
 SELECTED_FILES=()
 SELECTED_DURATIONS=()
 TOTAL_SECONDS=0
+SELECTED_TOTAL_SECONDS=0
 STOPPED_AT=""
 STOPPED_DURATION=0
 STOPPED_REASON=""
+READ_ERROR_FILE=""
 
 echo "Scanning video files in:"
 echo "$BASE_DIR"
@@ -89,8 +120,7 @@ for FILE in "${FILES[@]}"; do
   DURATION_SECONDS=$(get_duration_seconds "$FILE")
 
   if [ $? -ne 0 ]; then
-    STOPPED_AT="$FILE"
-    STOPPED_REASON="duration could not be read"
+    READ_ERROR_FILE="$FILE"
     break
   fi
 
@@ -100,6 +130,7 @@ for FILE in "${FILES[@]}"; do
     SELECTED_FILES+=( "$FILE" )
     SELECTED_DURATIONS+=( "$DURATION_SECONDS" )
     TOTAL_SECONDS=$NEXT_TOTAL
+    SELECTED_TOTAL_SECONDS=$(( SELECTED_TOTAL_SECONDS + DURATION_SECONDS ))
   else
     STOPPED_AT="$FILE"
     STOPPED_DURATION=$DURATION_SECONDS
@@ -107,6 +138,23 @@ for FILE in "${FILES[@]}"; do
     break
   fi
 done
+
+# "Move First" is strictly sequential. Do not perform a partial or
+# out-of-sequence move when any earlier file cannot be inspected.
+if [ -n "$READ_ERROR_FILE" ]; then
+  echo "Nothing was moved."
+  echo
+  echo "Could not read the duration after 10 attempts:"
+  echo "${READ_ERROR_FILE:t}"
+  echo
+  echo "The sequence was stopped at this file. Later files were not considered."
+  echo "Wait for pCloud to finish making the file available, then run again."
+  echo
+  if [[ -t 0 ]]; then
+    read -k 1 "?Press any key to close..."
+  fi
+  exit 1
+fi
 
 if [ ${#SELECTED_FILES[@]} -eq 0 ]; then
   echo "No videos can be moved without exceeding 2h."
@@ -142,7 +190,8 @@ done
 
 echo
 echo "Selected files: ${#SELECTED_FILES[@]}"
-echo "Selected total duration: $(format_duration "$TOTAL_SECONDS")"
+echo "Selected total duration: $(format_duration "$SELECTED_TOTAL_SECONDS")"
+echo "Total planned for $BATCH_NAME: $(format_duration "$TOTAL_SECONDS")"
 echo "Maximum allowed duration: $(format_duration "$MAX_SECONDS")"
 echo
 
@@ -173,7 +222,8 @@ done
 
 echo
 echo "Done. Moved $MOVED_COUNT file(s)."
-echo "Moved total duration: $(format_duration "$TOTAL_SECONDS")"
+echo "Moved this run: $(format_duration "$SELECTED_TOTAL_SECONDS")"
+echo "Total duration in $BATCH_NAME: $(format_duration "$TOTAL_SECONDS")"
 echo
 
 read -k 1 "?Press any key to close..."

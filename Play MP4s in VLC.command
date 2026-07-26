@@ -1,6 +1,10 @@
 #!/bin/zsh
 
-BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -n "${1:-}" && -d "$1" ]]; then
+  BASE_DIR="${1:A}"
+else
+  BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
 VLC="/Applications/VLC.app/Contents/MacOS/VLC"
 
 if [ ! -x "$VLC" ]; then

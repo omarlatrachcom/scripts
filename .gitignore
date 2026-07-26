@@ -4,3 +4,5 @@ __pycache__/
 youtube_channel_views*_report.html
 youtube_channel_views*_saved_videos.json
 logs/
+Portable Command Launchers/
+.command_launcher_targets/
