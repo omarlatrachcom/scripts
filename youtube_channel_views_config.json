@@ -1,6 +1,6 @@
 {
-  "min_views": "15000",
-  "recent_min_views": "5000",
+  "min_views": "500000",
+  "recent_min_views": "50000",
   "max_videos_per_channel": null,
   "published_after": null,
   "published_before": null,
@@ -8,7 +8,7 @@
   "browser_profile": null,
   "cookies_file": null,
   "open_browser": true,
-  "active_theme": "books",
+  "active_theme": "Documentary_FR",
   "themes": [
     {
       "name": "books",
@@ -68,8 +68,8 @@
     },
     {
       "name": "Documentary_FR",
-      "min_views": 1000000,
-      "recent_min_views": 100000,
+      "min_views": 500000,
+      "recent_min_views": 50000,
       "report_file": "youtube_channel_views_documentary_fr_report.html",
       "saved_videos_file": "youtube_channel_views_documentary_fr_saved_videos.json",
       "recent_saved_videos_file": "youtube_channel_views_documentary_fr_recent_saved_videos.json",
