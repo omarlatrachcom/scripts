@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Fetch videos from configured YouTube channels, sort them by view count and
-published date, and open a local HTML report in the browser.
+Fetch popular videos from configured YouTube channels until the configured
+minimum view count is reached, then open a local HTML report in the browser.
 
 The script installs its own Python metadata dependencies on first run if they
 are missing:
@@ -63,6 +63,7 @@ VENV_PYTHON = VENV_DIR / "bin" / "python"
 DEPENDENCY_PACKAGES = ("yt-dlp", "yt-dlp-ejs")
 SUPPORTED_COOKIE_BROWSERS = {"brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale"}
 DETAIL_LOOKUP_ROUNDS = 3
+POPULAR_FETCH_BATCH_SIZE = 50
 
 DEFAULT_CONFIG = {
     "min_views": "50k",
@@ -576,10 +577,8 @@ def theme_config_to_json(theme: ThemeConfig, config_dir: Path) -> dict[str, Any]
     payload: dict[str, Any] = {
         "name": theme.name,
         "min_views": theme.min_views,
-        "recent_min_views": theme.recent_min_views,
         "report_file": path_text_relative_to(theme.report_file, config_dir),
         "saved_videos_file": path_text_relative_to(theme.saved_videos_file, config_dir),
-        "recent_saved_videos_file": path_text_relative_to(theme.recent_saved_videos_file, config_dir),
         "channels": [channel_config_to_json(channel) for channel in theme.channels],
     }
     if theme.extra_saved_videos_files:
@@ -1114,10 +1113,22 @@ def ytdlp_options(config: Config, *, flat: bool, ignore_errors: bool = True) -> 
 
     if flat:
         options["extract_flat"] = "in_playlist"
-        options["lazy_playlist"] = False
+        options["lazy_playlist"] = True
         if config.max_videos_per_channel is not None:
             options["playlistend"] = config.max_videos_per_channel
     return options
+
+
+def popular_channel_videos_url(channel_url: str) -> str:
+    """Return a channel Videos-tab URL using YouTube's popular ordering."""
+    parsed = urlparse(channel_url.strip())
+    path = parsed.path.rstrip("/")
+    path = re.sub(r"/(?:featured|videos|shorts|streams|playlists|community|about|search)$", "", path)
+    return parsed._replace(
+        path=f"{path}/videos",
+        query="view=0&sort=p&flow=grid",
+        fragment="",
+    ).geturl()
 
 
 def coerce_optional_count(value: Any) -> int | None:
@@ -1433,63 +1444,95 @@ def fetch_channel_videos(
     config: Config,
     logger: LogFn = print,
 ) -> tuple[list[Video], ChannelStats]:
-    with YoutubeDL(ytdlp_options(config, flat=True)) as ydl:
-        info = ydl.extract_info(channel_url, download=False)
-
-    if not isinstance(info, dict):
-        return [], ChannelStats(channel_url=channel_url, title=channel_url, error="No channel metadata returned.")
-
-    channel_title = str(info.get("channel") or info.get("uploader") or info.get("title") or channel_url)
-    raw_entries = info.get("entries") or []
-    entries = [entry for entry in raw_entries if isinstance(entry, dict)]
-    scanned_count = len(entries)
-    date_filtered = 0
-    if has_published_date_filter(config):
-        before_count = len(entries)
-        entries = [
-            entry for entry in entries
-            if entry_matches_published_date_range(entry, config, unknown_matches=True)
-        ]
-        date_filtered += before_count - len(entries)
-    missing_view_indexes = [
-        index for index, entry in enumerate(entries)
-        if coerce_optional_count(entry.get("view_count")) is None
-    ]
-    missing_view_entries = [entries[index] for index in missing_view_indexes]
-    detail_stats = DetailFetchStats(attempted=len(missing_view_entries))
-    if missing_view_entries and config.fetch_missing_view_counts:
-        logger(
-            f"  Found {format_count(len(entries))} videos; "
-            f"{format_count(len(missing_view_entries))} need detailed view-count lookup."
-        )
-        resolved_entries, detail_stats = fetch_detail_for_missing_views(YoutubeDL, missing_view_entries, config, logger)
-        for index, resolved_entry in zip(missing_view_indexes, resolved_entries):
-            entries[index] = resolved_entry
-        if detail_stats.auth_failed:
-            logger(
-                f"  Auth/bot checks still blocked {format_count(detail_stats.auth_failed)} "
-                "detail lookup(s) after targeted repairs."
-            )
-        if detail_stats.failed:
-            logger(
-                f"  Detail lookup remains unresolved for {format_count(detail_stats.failed)} "
-                "video(s) after all targeted repair rounds."
-            )
-
+    popular_url = popular_channel_videos_url(channel_url)
+    logger(f"  Popular ordering: {popular_url}")
+    channel_title = channel_url
     videos: list[Video] = []
+    scanned_count = 0
+    date_filtered = 0
     missing_view_count = 0
-    candidate_min_views = min(config.min_views, config.recent_min_views)
-    for source_order, entry in enumerate(entries, start=1):
-        video = video_from_entry(entry, channel_title, channel_url, source_order)
-        if video is None:
-            missing_view_count += 1
-            continue
-        if not video_matches_published_date_range(video, config):
-            date_filtered += 1
-            continue
-        if video.view_count >= candidate_min_views:
+    detail_attempted = 0
+    detail_failed = 0
+    auth_failed = 0
+    last_error = ""
+    next_index = 1
+    stopped_below_threshold = False
+
+    while config.max_videos_per_channel is None or next_index <= config.max_videos_per_channel:
+        batch_end = next_index + POPULAR_FETCH_BATCH_SIZE - 1
+        if config.max_videos_per_channel is not None:
+            batch_end = min(batch_end, config.max_videos_per_channel)
+
+        options = ytdlp_options(config, flat=True)
+        options["playliststart"] = next_index
+        options["playlistend"] = batch_end
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(popular_url, download=False)
+        if not isinstance(info, dict):
+            if scanned_count == 0:
+                return [], ChannelStats(
+                    channel_url=channel_url,
+                    title=channel_url,
+                    error="No channel metadata returned.",
+                )
+            break
+
+        channel_title = str(info.get("channel") or info.get("uploader") or info.get("title") or channel_title)
+        entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
+        if not entries:
+            break
+
+        missing_indexes = [
+            index for index, entry in enumerate(entries)
+            if coerce_optional_count(entry.get("view_count")) is None
+        ]
+        if missing_indexes and config.fetch_missing_view_counts:
+            logger(
+                f"  Popular items {next_index}-{next_index + len(entries) - 1}: "
+                f"{format_count(len(missing_indexes))} need detailed view-count lookup."
+            )
+            resolved, batch_stats = fetch_detail_for_missing_views(
+                YoutubeDL,
+                [entries[index] for index in missing_indexes],
+                config,
+                logger,
+            )
+            for index, resolved_entry in zip(missing_indexes, resolved):
+                entries[index] = resolved_entry
+            detail_attempted += batch_stats.attempted
+            detail_failed += batch_stats.failed
+            auth_failed += batch_stats.auth_failed
+            last_error = batch_stats.last_error or last_error
+
+        for offset, entry in enumerate(entries):
+            source_order = next_index + offset
+            scanned_count += 1
+            video = video_from_entry(entry, channel_title, channel_url, source_order)
+            if video is None:
+                missing_view_count += 1
+                continue
+            if video.view_count < config.min_views:
+                logger(
+                    f"  Stopping at popular item #{source_order}: "
+                    f"{format_count(video.view_count)} views is below {format_count(config.min_views)}."
+                )
+                stopped_below_threshold = True
+                break
+            if not video_matches_published_date_range(video, config):
+                date_filtered += 1
+                continue
             videos.append(video)
 
+        if stopped_below_threshold or len(entries) < batch_end - next_index + 1:
+            break
+        next_index = batch_end + 1
+
+    detail_stats = DetailFetchStats(
+        attempted=detail_attempted,
+        failed=detail_failed,
+        auth_failed=auth_failed,
+        last_error=last_error,
+    )
     return videos, ChannelStats(
         channel_url=channel_url,
         title=channel_title,
@@ -1516,10 +1559,10 @@ def channel_video_count_from_info(info: dict[str, Any]) -> int | None:
 
 def scan_limit_text(config: Config, video_count: int | None) -> str:
     if config.max_videos_per_channel is None:
-        return "all current videos" if video_count is not None else "all available videos"
+        return "popular videos until the first result below min_views"
     if video_count is None:
-        return f"up to {format_count(config.max_videos_per_channel)} newest videos"
-    return f"{format_count(min(config.max_videos_per_channel, video_count))} newest videos"
+        return f"up to {format_count(config.max_videos_per_channel)} popular videos"
+    return f"up to {format_count(min(config.max_videos_per_channel, video_count))} popular videos"
 
 
 def render_channel_preview_lines(
@@ -1735,19 +1778,16 @@ def render_video_table(
 
 def render_html(
     videos_by_views: list[Video],
-    recent_videos: list[Video],
     stats: list[ChannelStats],
     config: Config,
     *,
     save_endpoint: str | None = None,
-    recent_save_endpoint: str | None = None,
 ) -> str:
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     scanned_count = sum(stat.scanned for stat in stats)
     error_count = sum(1 for stat in stats if stat.error)
-    unique_report_video_count = len({video.video_id for video in [*videos_by_views, *recent_videos]})
+    unique_report_video_count = len({video.video_id for video in videos_by_views})
     saved_file_text = escape(path_text_relative_to(config.saved_videos_file, config.config_dir))
-    recent_saved_file_text = escape(path_text_relative_to(config.recent_saved_videos_file, config.config_dir))
     extra_saved_file_html = "".join(
         "\n        "
         f"<span>Extra saved store: <code>{escape(path_text_relative_to(path, config.config_dir))}</code></span>"
@@ -1923,12 +1963,11 @@ def render_html(
 <body>
   <header>
     <h1>YouTube Channel Videos by Views</h1>
-    <p>Theme: {theme_name}. Generated {escape(generated_at)}. Minimum views: {format_count(config.min_views)}. Recent minimum views: {format_count(config.recent_min_views)}. Published date: {published_date_range}.</p>
+    <p>Theme: {theme_name}. Generated {escape(generated_at)}. Popular videos with at least {format_count(config.min_views)} views. Published date: {published_date_range}.</p>
   </header>
   <main>
     <div class="stats">
       <div class="stat"><strong>{format_count(len(videos_by_views))}</strong><span>videos by views</span></div>
-      <div class="stat"><strong>{format_count(len(recent_videos))}</strong><span>recent videos</span></div>
       <div class="stat"><strong>{format_count(unique_report_video_count)}</strong><span>unique videos shown</span></div>
       <div class="stat"><strong>{format_count(scanned_count)}</strong><span>videos scanned</span></div>
       <div class="stat"><strong>{format_count(len(stats))}</strong><span>channels configured</span></div>
@@ -1938,8 +1977,7 @@ def render_html(
     <section>
       <h2>Videos by Views</h2>
       <div class="report-controls">
-        <span>Most-viewed saved videos: <code>{saved_file_text}</code></span>
-        <span>Recent saved videos: <code>{recent_saved_file_text}</code></span>
+        <span>Saved videos: <code>{saved_file_text}</code></span>
         {extra_saved_file_html}
         <span title="{filter_store_title}">Filtering saved stores: <code>{format_count(len(filter_store_files))}</code></span>
         <span id="action-status"></span>
@@ -1948,15 +1986,6 @@ def render_html(
           videos_by_views,
           save_endpoint=save_endpoint,
           empty_message="No videos met the configured minimum view count.",
-      )}
-    </section>
-
-    <section>
-      <h2>Recent Videos</h2>
-      {render_video_table(
-          recent_videos,
-          save_endpoint=recent_save_endpoint,
-          empty_message="No recent videos met the configured recent minimum view count.",
       )}
     </section>
 
@@ -2072,12 +2101,6 @@ def apply_arg_overrides(config: Config, args: argparse.Namespace) -> Config:
             extra_saved_videos_files=selected_theme.extra_saved_videos_files,
             theme_name=selected_theme.name,
         )
-    if getattr(args, "recent_min_views", None) is not None:
-        try:
-            recent_min_views = parse_count(args.recent_min_views)
-        except ValueError as exc:
-            raise SystemExit(str(exc)) from exc
-        config = replace(config, recent_min_views=recent_min_views)
     if args.limit is not None:
         if args.limit <= 0:
             raise SystemExit("--limit must be a positive integer.")
@@ -2131,12 +2154,6 @@ def apply_arg_overrides(config: Config, args: argparse.Namespace) -> Config:
     return config
 
 
-def recent_video_sort_key(video: Video) -> tuple[int, int, int, int]:
-    if video.published_sort_value:
-        return (1, video.published_sort_value, video.view_count, -video.source_order)
-    return (0, 0, -video.source_order, video.view_count)
-
-
 def build_report(
     config: Config,
     output_path: Path,
@@ -2144,7 +2161,6 @@ def build_report(
     auto_install: bool = True,
     update_deps: bool = False,
     save_endpoint: str | None = None,
-    recent_save_endpoint: str | None = None,
     logger: LogFn = print,
 ) -> tuple[Path, list[Video], list[ChannelStats]]:
     if update_deps:
@@ -2157,7 +2173,7 @@ def build_report(
     try:
         logger(f"Theme: {config.theme_name}")
         logger(f"Minimum views: {format_count(config.min_views)}")
-        logger(f"Recent minimum views: {format_count(config.recent_min_views)}")
+        logger("Channel order: most popular first; stop at the first video below the minimum.")
         if has_published_date_filter(config):
             logger(f"Published date range: {format_published_date_range(config)}")
         if config.max_videos_per_channel is not None:
@@ -2217,19 +2233,14 @@ def build_report(
             key=lambda video: (video.view_count, video.published_sort_value, -video.source_order),
             reverse=True,
         )
-        recent_videos = [video for video in all_videos if video.view_count >= config.recent_min_views]
-        recent_videos.sort(key=recent_video_sort_key, reverse=True)
-
         output_path = output_path.expanduser()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
             render_html(
                 videos_by_views,
-                recent_videos,
                 stats,
                 config,
                 save_endpoint=save_endpoint,
-                recent_save_endpoint=recent_save_endpoint,
             ),
             encoding="utf-8",
         )
@@ -2240,7 +2251,7 @@ def build_report(
             logger("Opened report in browser.")
 
         logger("Fetch completed.")
-        report_video_ids = {video.video_id for video in [*videos_by_views, *recent_videos]}
+        report_video_ids = {video.video_id for video in videos_by_views}
         report_videos = [video for video in all_videos if video.video_id in report_video_ids]
         return output_path, report_videos, stats
     except BaseException as exc:
@@ -2280,11 +2291,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Temporarily limit the number of videos fetched per channel for this run.",
-    )
-    parser.add_argument(
-        "--recent-min-views",
-        default=None,
-        help="Temporarily override the minimum view count for the Recent Videos section, e.g. 10000, 10k, or 1.2m.",
     )
     parser.add_argument(
         "--published-after",
@@ -2437,15 +2443,10 @@ def launch_gui(args: argparse.Namespace) -> int:
             ttk.Button(files, text="Browse", command=self.browse_output).grid(row=2, column=2, padx=(8, 0), pady=3)
             ttk.Button(files, text="Open", command=self.open_report).grid(row=2, column=3, padx=(8, 0), pady=3)
 
-            ttk.Label(files, text="Most viewed saved").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
+            ttk.Label(files, text="Saved videos").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
             ttk.Entry(files, textvariable=self.saved_file_var).grid(row=3, column=1, sticky="ew", pady=3)
             ttk.Button(files, text="Browse", command=self.browse_saved_file).grid(row=3, column=2, padx=(8, 0), pady=3)
             ttk.Button(files, text="Open", command=self.open_saved_file).grid(row=3, column=3, padx=(8, 0), pady=3)
-
-            ttk.Label(files, text="Recent saved").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=3)
-            ttk.Entry(files, textvariable=self.recent_saved_file_var).grid(row=4, column=1, sticky="ew", pady=3)
-            ttk.Button(files, text="Browse", command=self.browse_recent_saved_file).grid(row=4, column=2, padx=(8, 0), pady=3)
-            ttk.Button(files, text="Open", command=self.open_recent_saved_file).grid(row=4, column=3, padx=(8, 0), pady=3)
 
             settings = ttk.Frame(outer)
             settings.grid(row=2, column=0, sticky="ew", pady=(0, 10))
@@ -2454,10 +2455,8 @@ def launch_gui(args: argparse.Namespace) -> int:
 
             ttk.Label(settings, text="Min views").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
             ttk.Entry(settings, textvariable=self.min_views_var, width=12).grid(row=0, column=1, sticky="ew", pady=3)
-            ttk.Label(settings, text="Recent min").grid(row=0, column=2, sticky="w", padx=(14, 8), pady=3)
-            ttk.Entry(settings, textvariable=self.recent_min_views_var, width=12).grid(row=0, column=3, sticky="ew", pady=3)
-            ttk.Label(settings, text="Max/channel").grid(row=0, column=4, sticky="w", padx=(14, 8), pady=3)
-            ttk.Entry(settings, textvariable=self.max_videos_var, width=12).grid(row=0, column=5, sticky="ew", pady=3)
+            ttk.Label(settings, text="Max/channel").grid(row=0, column=2, sticky="w", padx=(14, 8), pady=3)
+            ttk.Entry(settings, textvariable=self.max_videos_var, width=12).grid(row=0, column=3, sticky="ew", pady=3)
 
             ttk.Label(settings, text="Published after").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
             ttk.Entry(settings, textvariable=self.published_after_var, width=12).grid(row=1, column=1, sticky="ew", pady=3)
@@ -3048,7 +3047,6 @@ def launch_gui(args: argparse.Namespace) -> int:
 
             return {
                 "min_views": self.min_views_var.get().strip() or str(config.min_views),
-                "recent_min_views": self.recent_min_views_var.get().strip() or str(config.recent_min_views),
                 "max_videos_per_channel": config.max_videos_per_channel,
                 "published_after": format_date_limit(config.published_after),
                 "published_before": format_date_limit(config.published_before),
@@ -3153,7 +3151,6 @@ def launch_gui(args: argparse.Namespace) -> int:
                     auto_install=not args.no_auto_install,
                     update_deps=args.update_deps,
                     save_endpoint=save_endpoint,
-                    recent_save_endpoint=recent_save_endpoint,
                     logger=self.queue_log,
                 )
             except SystemExit as exc:

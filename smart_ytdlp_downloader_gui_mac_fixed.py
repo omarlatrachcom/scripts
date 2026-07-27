@@ -461,6 +461,20 @@ DOWNLOAD_ARTIFACT_SUFFIX_RE = re.compile(
 PLAYLIST_PREFIX_RE = re.compile(r"^(?P<prefix>\d+\s+-\s+)(?P<title>.*)$")
 
 
+def download_artifact_base_name(name: str) -> str | None:
+    """Return the shared title portion of a media/subtitle artifact name."""
+    suffix_match = DOWNLOAD_ARTIFACT_SUFFIX_RE.search(name)
+    if suffix_match is None:
+        return None
+    base_name = name[: suffix_match.start()]
+    return base_name or None
+
+
+def artifact_layout_key(name: str) -> str:
+    """Normalize trailing punctuation yt-dlp may rewrite in directory names."""
+    return name.rstrip(" .#")
+
+
 def ascii_safe_download_artifact_name(name: str) -> str | None:
     """Return yt-dlp's ASCII-safe equivalent for a known download artifact."""
     suffix_match = DOWNLOAD_ARTIFACT_SUFFIX_RE.search(name)
@@ -543,6 +557,99 @@ def reconcile_ascii_safe_artifact_names(directory: str | Path, logger) -> int:
 
     logger(f"> Filename reconciliation renamed {len(safe_plan)} existing artifact(s).")
     return len(safe_plan)
+
+
+@dataclass
+class LayoutReconciliationStats:
+    moved_files: int = 0
+    skipped_conflicts: int = 0
+    failed_files: int = 0
+    removed_empty_folders: int = 0
+
+
+def reconcile_download_artifact_layout(
+    directory: str | Path,
+    *,
+    wrap_in_folder: bool,
+    logger,
+) -> LayoutReconciliationStats:
+    """Make existing artifacts match the active wrapped/unwrapped layout."""
+    base = Path(directory).expanduser()
+    stats = LayoutReconciliationStats()
+    if not base.exists():
+        return stats
+
+    if wrap_in_folder:
+        candidates = [
+            path
+            for path in base.iterdir()
+            if path.is_file() and download_artifact_base_name(path.name)
+        ]
+        for source in sorted(candidates):
+            artifact_base = download_artifact_base_name(source.name)
+            if artifact_base is None:
+                continue
+            folder = base / artifact_base
+            destination = folder / source.name
+            if destination.exists():
+                stats.skipped_conflicts += 1
+                logger(f"WARNING: Folder wrapping skipped because this file already exists: {destination}")
+                continue
+            try:
+                folder.mkdir(parents=False, exist_ok=True)
+                source.rename(destination)
+            except Exception as exc:
+                stats.failed_files += 1
+                logger(f"WARNING: Could not wrap existing artifact '{source.name}': {exc}")
+            else:
+                stats.moved_files += 1
+                logger(f"> Wrapped existing artifact: {source.name} -> {folder.name}/")
+    else:
+        for folder in sorted(path for path in base.iterdir() if path.is_dir()):
+            for source in sorted(path for path in folder.iterdir() if path.is_file()):
+                artifact_base = download_artifact_base_name(source.name)
+                if artifact_base is None:
+                    continue
+                safe_folder_artifact = ascii_safe_download_artifact_name(f"{folder.name}.mp4")
+                safe_folder_base = (
+                    download_artifact_base_name(safe_folder_artifact)
+                    if safe_folder_artifact is not None
+                    else None
+                )
+                matching_folder_names = {folder.name}
+                if safe_folder_base is not None:
+                    matching_folder_names.add(safe_folder_base)
+                if artifact_layout_key(artifact_base) not in {
+                    artifact_layout_key(name) for name in matching_folder_names
+                }:
+                    continue
+                destination = base / source.name
+                if destination.exists():
+                    stats.skipped_conflicts += 1
+                    logger(f"WARNING: Folder unwrapping skipped because this file already exists: {destination}")
+                    continue
+                try:
+                    source.rename(destination)
+                except Exception as exc:
+                    stats.failed_files += 1
+                    logger(f"WARNING: Could not unwrap existing artifact '{source.name}': {exc}")
+                else:
+                    stats.moved_files += 1
+                    logger(f"> Unwrapped existing artifact: {folder.name}/{source.name}")
+
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
+            else:
+                stats.removed_empty_folders += 1
+
+    layout_name = "wrapped" if wrap_in_folder else "unwrapped"
+    logger(
+        f"> Layout reconciliation ({layout_name}): moved {stats.moved_files} file(s), "
+        f"skipped {stats.skipped_conflicts} conflict(s), failed {stats.failed_files} file(s)."
+    )
+    return stats
 
 
 def run_download(urls: list[str], ydl_opts: dict, *, retry_without_cookies: bool, logger) -> int:
@@ -1715,6 +1822,11 @@ class DownloaderGUI:
             extractor_args = build_youtube_extractor_args(logger)
 
             reconcile_ascii_safe_artifact_names(config["output_dir"], logger)
+            reconcile_download_artifact_layout(
+                config["output_dir"],
+                wrap_in_folder=bool(config["wrap_in_folder"]),
+                logger=logger,
+            )
             before_files = snapshot_all_files(config["output_dir"])
 
             ytdlp_logger = GuiLogger(logger)

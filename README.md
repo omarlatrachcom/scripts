@@ -106,8 +106,11 @@ What it does:
 - Reads `min_views` and the selected theme from the JSON config file.
 - Lets you add themes, then enable or disable individual channels per theme
   from the GUI before fetching.
-- Fetches channel video metadata with `yt-dlp`.
-- Filters out videos below the configured minimum view count.
+- Fetches each channel's videos in YouTube's Popular order with `yt-dlp`.
+- Stops scanning a channel at the first video below `min_views`, fetching in
+  small batches so large channels do not need to be loaded completely.
+- Produces a popular-only report; the former Recent Videos threshold and
+  section are no longer used.
 - Optionally limits fetches by max videos per channel and published-date range.
 - Sorts matching videos by view count, highest first.
 - Writes the selected theme's report HTML and opens it in the browser.

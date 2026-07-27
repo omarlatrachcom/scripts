@@ -1,6 +1,5 @@
 {
-  "min_views": "500000",
-  "recent_min_views": "50000",
+  "min_views": "5000000",
   "max_videos_per_channel": null,
   "published_after": null,
   "published_before": null,
@@ -8,15 +7,13 @@
   "browser_profile": null,
   "cookies_file": null,
   "open_browser": true,
-  "active_theme": "Documentary_FR",
+  "active_theme": "Documentary_EN",
   "themes": [
     {
       "name": "books",
       "min_views": 15000,
-      "recent_min_views": 5000,
       "report_file": "youtube_channel_views_books_report.html",
       "saved_videos_file": "youtube_channel_views_books_saved_videos.json",
-      "recent_saved_videos_file": "youtube_channel_views_books_recent_saved_videos.json",
       "channels": [
         {
           "enabled": true,
@@ -38,11 +35,9 @@
     },
     {
       "name": "Documentary_EN",
-      "min_views": 10000000,
-      "recent_min_views": 1000000,
+      "min_views": 5000000,
       "report_file": "youtube_channel_views_documentary_en_report.html",
       "saved_videos_file": "youtube_channel_views_documentary_en_saved_videos.json",
-      "recent_saved_videos_file": "youtube_channel_views_documentary_en_recent_saved_videos.json",
       "channels": [
         {
           "enabled": true,
@@ -63,16 +58,18 @@
         {
           "enabled": true,
           "url": "https://www.youtube.com/@DWShift/videos"
+        },
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@DWDocumentary/videos"
         }
       ]
     },
     {
       "name": "Documentary_FR",
       "min_views": 500000,
-      "recent_min_views": 50000,
       "report_file": "youtube_channel_views_documentary_fr_report.html",
       "saved_videos_file": "youtube_channel_views_documentary_fr_saved_videos.json",
-      "recent_saved_videos_file": "youtube_channel_views_documentary_fr_recent_saved_videos.json",
       "channels": [
         {
           "enabled": true,
@@ -87,18 +84,12 @@
     {
       "name": "Documentary_عربية",
       "min_views": 10000000,
-      "recent_min_views": 1000000,
       "report_file": "youtube_channel_views_documentary_report.html",
       "saved_videos_file": "youtube_channel_views_documentary_saved_videos.json",
-      "recent_saved_videos_file": "youtube_channel_views_documentary_recent_saved_videos.json",
       "channels": [
         {
           "enabled": true,
           "url": "https://www.youtube.com/@aljazeeradocumentary/videos"
-        },
-        {
-          "enabled": true,
-          "url": "https://www.youtube.com/@dwdocarabia/videos"
         }
       ]
     }
