@@ -1,5 +1,5 @@
 {
-  "min_views": "5000000",
+  "min_views": "1000000",
   "max_videos_per_channel": null,
   "published_after": null,
   "published_before": null,
@@ -7,7 +7,7 @@
   "browser_profile": null,
   "cookies_file": null,
   "open_browser": true,
-  "active_theme": "Documentary_EN",
+  "active_theme": "Documentary_عربية",
   "themes": [
     {
       "name": "books",
@@ -83,7 +83,7 @@
     },
     {
       "name": "Documentary_عربية",
-      "min_views": 10000000,
+      "min_views": 1000000,
       "report_file": "youtube_channel_views_documentary_report.html",
       "saved_videos_file": "youtube_channel_views_documentary_saved_videos.json",
       "channels": [
