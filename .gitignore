@@ -4,6 +4,9 @@ __pycache__/
 youtube_channel_views*_report.html
 youtube_channel_views*_saved_videos.json
 youtube_channel_views_detail_cache.json
+youtube_data_api_key.txt
+prompt_manager_store.json
+prompt_manager_store.backup-*.json
 logs/
 Portable Command Launchers/
 .command_launcher_targets/

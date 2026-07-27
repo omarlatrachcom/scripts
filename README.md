@@ -39,8 +39,8 @@ Prompt Manager is a local GUI for organizing reusable prompts by project.
 
 What it does:
 
-- Stores projects and prompts locally in:
-  `~/Library/Application Support/PromptManager/store.json`
+- Stores projects and prompts in `prompt_manager_store.json` beside the script.
+  The store and its backups are excluded from Git.
 - Lets you create, edit, delete, and organize prompts.
 - Lets you compose a final prompt with subject/input text.
 - Supports different separator styles, including Markdown rules, headings, and
@@ -106,9 +106,10 @@ What it does:
 - Reads `min_views` and the selected theme from the JSON config file.
 - Lets you add themes, then enable or disable individual channels per theme
   from the GUI before fetching.
-- Fetches each channel's videos in YouTube's Popular order with `yt-dlp`.
-- Stops scanning a channel at the first video below `min_views`, fetching in
-  small batches so large channels do not need to be loaded completely.
+- Fetches each channel's videos in exact view-count order through the official
+  YouTube Data API.
+- Scans channel upload inventories in efficient 50-video API batches, filters
+  by `min_views`, and sorts matching videos locally by view count.
 - Produces a popular-only report; the former Recent Videos threshold and
   section are no longer used.
 - Optionally limits fetches by max videos per channel and published-date range.
@@ -124,6 +125,12 @@ What it does:
   `~/Library/Application Support/YouTubeChannelViewsBrowser/venv`.
 - Opens as a GUI by default. Fetching starts only when you click
   `Fetch Videos`.
+
+The first fetch requires a YouTube Data API key. Paste it into the masked
+`YouTube API key` field and click `Save Key`. The key is stored outside this
+repository with user-only permissions at:
+`youtube_data_api_key.txt` beside the script. This file is excluded by
+`.gitignore`.
 
 Open the GUI from Terminal:
 

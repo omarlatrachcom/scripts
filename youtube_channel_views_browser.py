@@ -25,13 +25,15 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 from dataclasses import dataclass, replace
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, TextIO
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 
 try:
@@ -58,12 +60,13 @@ DETAIL_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
 DETAIL_CACHE_CHECKPOINT_SIZE = 100
 DEFAULT_THEME_NAME = "Default"
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "YouTubeChannelViewsBrowser"
+YOUTUBE_API_KEY_FILE = SCRIPT_DIR / "youtube_data_api_key.txt"
+YOUTUBE_API_KEY_ENV = "YOUTUBE_DATA_API_KEY"
 VENV_DIR = APP_SUPPORT_DIR / "venv"
 VENV_PYTHON = VENV_DIR / "bin" / "python"
 DEPENDENCY_PACKAGES = ("yt-dlp", "yt-dlp-ejs")
 SUPPORTED_COOKIE_BROWSERS = {"brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale"}
 DETAIL_LOOKUP_ROUNDS = 3
-POPULAR_FETCH_BATCH_SIZE = 50
 
 DEFAULT_CONFIG = {
     "min_views": "50k",
@@ -136,6 +139,7 @@ class Config:
     published_after: int | None = None
     published_before: int | None = None
     fetch_missing_view_counts: bool = True
+    youtube_api_key: str | None = None
     open_browser: bool = True
     cookies_from_browser: str | None = None
     browser_profile: str | None = None
@@ -993,6 +997,7 @@ def load_config(path: Path) -> Config:
         published_after=published_after,
         published_before=published_before,
         fetch_missing_view_counts=fetch_missing_view_counts,
+        youtube_api_key=load_youtube_api_key(),
         open_browser=open_browser,
         cookies_from_browser=cookies_from_browser,
         browser_profile=browser_profile,
@@ -1119,16 +1124,102 @@ def ytdlp_options(config: Config, *, flat: bool, ignore_errors: bool = True) -> 
     return options
 
 
-def popular_channel_videos_url(channel_url: str) -> str:
-    """Return a channel Videos-tab URL using YouTube's popular ordering."""
-    parsed = urlparse(channel_url.strip())
-    path = parsed.path.rstrip("/")
-    path = re.sub(r"/(?:featured|videos|shorts|streams|playlists|community|about|search)$", "", path)
-    return parsed._replace(
-        path=f"{path}/videos",
-        query="view=0&sort=p&flow=grid",
-        fragment="",
-    ).geturl()
+def load_youtube_api_key() -> str | None:
+    env_key = os.environ.get(YOUTUBE_API_KEY_ENV, "").strip()
+    if env_key:
+        return env_key
+    try:
+        key = YOUTUBE_API_KEY_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return key or None
+
+
+def save_youtube_api_key(key: str) -> None:
+    key = key.strip()
+    if not key:
+        raise ValueError("API key cannot be empty.")
+    APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+    YOUTUBE_API_KEY_FILE.write_text(key + "\n", encoding="utf-8")
+    YOUTUBE_API_KEY_FILE.chmod(0o600)
+
+
+def youtube_api_get(resource: str, params: dict[str, Any], api_key: str) -> dict[str, Any]:
+    query = urlencode({**params, "key": api_key})
+    request = urllib.request.Request(
+        f"https://www.googleapis.com/youtube/v3/{resource}?{query}",
+        headers={"Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+            message = payload.get("error", {}).get("message")
+        except Exception:
+            message = None
+        raise RuntimeError(f"YouTube Data API error: {message or exc.reason}") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"YouTube Data API request failed: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("YouTube Data API returned an invalid response.")
+    return payload
+
+
+def channel_lookup_parameter(channel_url: str) -> tuple[str, str]:
+    path_parts = [part for part in urlparse(channel_url).path.split("/") if part]
+    if not path_parts:
+        raise ValueError(f"Invalid YouTube channel URL: {channel_url}")
+    if path_parts[0] == "channel" and len(path_parts) > 1:
+        return "id", path_parts[1]
+    if path_parts[0] == "user" and len(path_parts) > 1:
+        return "forUsername", path_parts[1]
+    handle = path_parts[0]
+    if not handle.startswith("@"):
+        handle = f"@{handle}"
+    return "forHandle", handle
+
+
+def resolve_api_channel(channel_url: str, api_key: str) -> tuple[str, str, str]:
+    parameter, value = channel_lookup_parameter(channel_url)
+    payload = youtube_api_get("channels", {"part": "snippet,contentDetails", parameter: value}, api_key)
+    items = payload.get("items") or []
+    if not items:
+        raise ValueError(f"YouTube Data API could not resolve channel: {channel_url}")
+    item = items[0]
+    uploads_id = item.get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads")
+    if not uploads_id:
+        raise ValueError(f"YouTube Data API did not return an uploads playlist for: {channel_url}")
+    return str(item["id"]), str(item.get("snippet", {}).get("title") or channel_url), str(uploads_id)
+
+
+ISO_DURATION_RE = re.compile(
+    r"^P(?:(?P<days>\d+)D)?T?(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?$"
+)
+
+
+def api_duration_text(value: str) -> str:
+    match = ISO_DURATION_RE.fullmatch(value or "")
+    if not match:
+        return ""
+    total = (
+        int(match.group("days") or 0) * 86400
+        + int(match.group("hours") or 0) * 3600
+        + int(match.group("minutes") or 0) * 60
+        + int(match.group("seconds") or 0)
+    )
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+
+
+def api_thumbnail_url(snippet: dict[str, Any]) -> str:
+    thumbnails = snippet.get("thumbnails") or {}
+    for name in ("maxres", "standard", "high", "medium", "default"):
+        if thumbnails.get(name, {}).get("url"):
+            return str(thumbnails[name]["url"])
+    return ""
 
 
 def coerce_optional_count(value: Any) -> int | None:
@@ -1439,109 +1530,80 @@ def fetch_detail_for_missing_views(
 
 
 def fetch_channel_videos(
-    YoutubeDL: type,
     channel_url: str,
     config: Config,
     logger: LogFn = print,
 ) -> tuple[list[Video], ChannelStats]:
-    popular_url = popular_channel_videos_url(channel_url)
-    logger(f"  Popular ordering: {popular_url}")
-    channel_title = channel_url
+    api_key = config.youtube_api_key
+    if not api_key:
+        raise ValueError("A YouTube Data API key is required. Add it in the GUI first.")
+    channel_id, channel_title, uploads_id = resolve_api_channel(channel_url, api_key)
+    logger(f"  API channel: {channel_title} ({channel_id})")
     videos: list[Video] = []
-    scanned_count = 0
+    scanned = 0
     date_filtered = 0
-    missing_view_count = 0
-    detail_attempted = 0
-    detail_failed = 0
-    auth_failed = 0
-    last_error = ""
-    next_index = 1
-    stopped_below_threshold = False
+    page_token: str | None = None
 
-    while config.max_videos_per_channel is None or next_index <= config.max_videos_per_channel:
-        batch_end = next_index + POPULAR_FETCH_BATCH_SIZE - 1
+    while config.max_videos_per_channel is None or scanned < config.max_videos_per_channel:
+        page_size = 50
         if config.max_videos_per_channel is not None:
-            batch_end = min(batch_end, config.max_videos_per_channel)
-
-        options = ytdlp_options(config, flat=True)
-        options["playliststart"] = next_index
-        options["playlistend"] = batch_end
-        with YoutubeDL(options) as ydl:
-            info = ydl.extract_info(popular_url, download=False)
-        if not isinstance(info, dict):
-            if scanned_count == 0:
-                return [], ChannelStats(
-                    channel_url=channel_url,
-                    title=channel_url,
-                    error="No channel metadata returned.",
-                )
-            break
-
-        channel_title = str(info.get("channel") or info.get("uploader") or info.get("title") or channel_title)
-        entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
-        if not entries:
-            break
-
-        missing_indexes = [
-            index for index, entry in enumerate(entries)
-            if coerce_optional_count(entry.get("view_count")) is None
+            page_size = min(page_size, config.max_videos_per_channel - scanned)
+        params: dict[str, Any] = {"part": "contentDetails", "playlistId": uploads_id, "maxResults": page_size}
+        if page_token:
+            params["pageToken"] = page_token
+        search_payload = youtube_api_get("playlistItems", params, api_key)
+        search_items = search_payload.get("items") or []
+        video_ids = [
+            str(item.get("contentDetails", {}).get("videoId"))
+            for item in search_items
+            if item.get("contentDetails", {}).get("videoId")
         ]
-        if missing_indexes and config.fetch_missing_view_counts:
-            logger(
-                f"  Popular items {next_index}-{next_index + len(entries) - 1}: "
-                f"{format_count(len(missing_indexes))} need detailed view-count lookup."
-            )
-            resolved, batch_stats = fetch_detail_for_missing_views(
-                YoutubeDL,
-                [entries[index] for index in missing_indexes],
-                config,
-                logger,
-            )
-            for index, resolved_entry in zip(missing_indexes, resolved):
-                entries[index] = resolved_entry
-            detail_attempted += batch_stats.attempted
-            detail_failed += batch_stats.failed
-            auth_failed += batch_stats.auth_failed
-            last_error = batch_stats.last_error or last_error
-
-        for offset, entry in enumerate(entries):
-            source_order = next_index + offset
-            scanned_count += 1
-            video = video_from_entry(entry, channel_title, channel_url, source_order)
-            if video is None:
-                missing_view_count += 1
-                continue
-            if video.view_count < config.min_views:
-                logger(
-                    f"  Stopping at popular item #{source_order}: "
-                    f"{format_count(video.view_count)} views is below {format_count(config.min_views)}."
-                )
-                stopped_below_threshold = True
-                break
-            if not video_matches_published_date_range(video, config):
-                date_filtered += 1
-                continue
-            videos.append(video)
-
-        if stopped_below_threshold or len(entries) < batch_end - next_index + 1:
+        if not video_ids:
             break
-        next_index = batch_end + 1
+        detail_payload = youtube_api_get(
+            "videos",
+            {"part": "snippet,contentDetails,statistics", "id": ",".join(video_ids)},
+            api_key,
+        )
+        details = {str(item.get("id")): item for item in detail_payload.get("items") or []}
+        for video_id in video_ids:
+            item = details.get(video_id)
+            if not item:
+                continue
+            scanned += 1
+            views = int(item.get("statistics", {}).get("viewCount") or 0)
+            if views < config.min_views:
+                continue
+            snippet = item.get("snippet") or {}
+            published_text = str(snippet.get("publishedAt") or "")[:10]
+            published_value = int(published_text.replace("-", "")) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", published_text) else 0
+            video = Video(
+                video_id=video_id,
+                title=str(snippet.get("title") or "Untitled video"),
+                url=f"https://www.youtube.com/watch?v={video_id}",
+                view_count=views,
+                channel=str(snippet.get("channelTitle") or channel_title),
+                channel_url=f"https://www.youtube.com/channel/{channel_id}",
+                duration=api_duration_text(str(item.get("contentDetails", {}).get("duration") or "")),
+                published=published_text,
+                published_sort_value=published_value,
+                source_order=scanned,
+                thumbnail_url=api_thumbnail_url(snippet),
+            )
+            if video_matches_published_date_range(video, config):
+                videos.append(video)
+            else:
+                date_filtered += 1
+        page_token = search_payload.get("nextPageToken")
+        if not page_token:
+            break
 
-    detail_stats = DetailFetchStats(
-        attempted=detail_attempted,
-        failed=detail_failed,
-        auth_failed=auth_failed,
-        last_error=last_error,
-    )
     return videos, ChannelStats(
         channel_url=channel_url,
         title=channel_title,
-        scanned=scanned_count,
+        scanned=scanned,
         included=len(videos),
-        missing_view_count=missing_view_count,
         date_filtered=date_filtered,
-        detail_lookup_failed=detail_stats.failed,
-        auth_failed=detail_stats.auth_failed,
     )
 
 
@@ -2166,25 +2228,20 @@ def build_report(
     if update_deps:
         install_dependencies()
 
-    YoutubeDL = import_youtube_dl(auto_install=auto_install)
     fetch_logger = FetchRunLogger(config, logger)
     logger = fetch_logger
 
     try:
         logger(f"Theme: {config.theme_name}")
         logger(f"Minimum views: {format_count(config.min_views)}")
-        logger("Channel order: most popular first; stop at the first video below the minimum.")
+        logger("Scanning complete upload inventories through the API, then sorting matching videos by views.")
         if has_published_date_filter(config):
             logger(f"Published date range: {format_published_date_range(config)}")
         if config.max_videos_per_channel is not None:
             logger(f"Per-channel fetch limit: {format_count(config.max_videos_per_channel)}")
-        if config.cookies_file is not None:
-            logger(f"Using cookies file: {config.cookies_file}")
-        elif config.cookies_from_browser is not None:
-            profile_note = f" profile={config.browser_profile}" if config.browser_profile else ""
-            logger(f"Using cookies from browser: {config.cookies_from_browser}{profile_note}")
-        else:
-            logger("No cookies configured; YouTube may block detail lookups.")
+        if not config.youtube_api_key:
+            raise ValueError("A YouTube Data API key is required. Add it in the GUI first.")
+        logger("Using the official YouTube Data API for popularity and statistics.")
 
         channel_urls = enabled_channel_urls(config)
         if not channel_urls:
@@ -2199,7 +2256,7 @@ def build_report(
         for index, channel_url in enumerate(channel_urls, start=1):
             logger(f"[{index}/{len(channel_urls)}] Fetching {channel_url}")
             try:
-                videos, channel_stats = fetch_channel_videos(YoutubeDL, channel_url, config, logger)
+                videos, channel_stats = fetch_channel_videos(channel_url, config, logger)
             except Exception as exc:
                 message = str(exc).strip() or exc.__class__.__name__
                 logger(f"  ERROR: {message}")
@@ -2399,6 +2456,7 @@ def launch_gui(args: argparse.Namespace) -> int:
             self.cookies_browser_var = tk.StringVar(value="")
             self.browser_profile_var = tk.StringVar(value="")
             self.cookies_file_var = tk.StringVar(value="")
+            self.youtube_api_key_var = tk.StringVar(value=load_youtube_api_key() or "")
             self.open_browser_var = tk.BooleanVar(value=True)
             self.status_var = tk.StringVar(value="Ready. Click Fetch Videos to build the report.")
 
@@ -2482,7 +2540,14 @@ def launch_gui(args: argparse.Namespace) -> int:
             ttk.Entry(cookie_file_frame, textvariable=self.cookies_file_var).grid(row=0, column=0, sticky="ew")
             ttk.Button(cookie_file_frame, text="Browse", command=self.browse_cookies_file).grid(row=0, column=1, padx=(8, 0))
             ttk.Checkbutton(settings, text="Open browser after fetch", variable=self.open_browser_var).grid(
-                row=3, column=0, columnspan=6, sticky="w", pady=3
+                row=4, column=0, columnspan=6, sticky="w", pady=3
+            )
+            ttk.Label(settings, text="YouTube API key").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
+            ttk.Entry(settings, textvariable=self.youtube_api_key_var, show="•").grid(
+                row=3, column=1, columnspan=4, sticky="ew", pady=3
+            )
+            ttk.Button(settings, text="Save Key", command=self.save_api_key).grid(
+                row=3, column=5, sticky="e", pady=3
             )
 
             channels_frame = ttk.LabelFrame(outer, text="Channels")
@@ -3026,6 +3091,7 @@ def launch_gui(args: argparse.Namespace) -> int:
                 published_after=published_after,
                 published_before=published_before,
                 fetch_missing_view_counts=True,
+                youtube_api_key=optional_string(self.youtube_api_key_var.get()),
                 open_browser=bool(self.open_browser_var.get()),
                 cookies_from_browser=cookies_browser,
                 browser_profile=optional_string(self.browser_profile_var.get()),
@@ -3038,6 +3104,14 @@ def launch_gui(args: argparse.Namespace) -> int:
                 theme_name=selected_theme.name,
                 themes=tuple(self.themes),
             )
+
+        def save_api_key(self) -> None:
+            try:
+                save_youtube_api_key(self.youtube_api_key_var.get())
+            except Exception as exc:
+                messagebox.showerror("API key", str(exc))
+            else:
+                self.status_var.set("YouTube Data API key saved securely for this user.")
 
         def config_json(self, config: Config) -> dict[str, Any]:
             config_dir = Path(self.config_var.get()).expanduser().parent

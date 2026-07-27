@@ -7,7 +7,7 @@ Refactored for clearer separation of concerns and improved accessibility:
 - Larger default fonts and spacing
 - Clear focus indication for keyboard users
 - Structured storage/service/UI layers in a single runnable file
-- Same local storage location: ~/Library/Application Support/PromptManager/store.json
+- Local prompt storage beside this script in prompt_manager_store.json
 """
 
 from __future__ import annotations
@@ -36,7 +36,8 @@ LEGACY_DATA_DIR = SCRIPT_DIR / "data"
 LEGACY_STORE_PATH = LEGACY_DATA_DIR / "store.json"
 LEGACY_DIRECT_STORE_PATH = SCRIPT_DIR / "store.json"
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "PromptManager"
-STORE_PATH = APP_SUPPORT_DIR / "store.json"
+LEGACY_APP_SUPPORT_STORE_PATH = APP_SUPPORT_DIR / "store.json"
+STORE_PATH = SCRIPT_DIR / "prompt_manager_store.json"
 
 SEPARATOR_STYLES: list[tuple[str, str]] = [
     ("Markdown rule (---)", "markdown_hr"),
@@ -164,7 +165,11 @@ class StoreRepository:
 
     def store_candidates(self) -> list[Path]:
         candidates: list[Path] = []
-        for candidate in (LEGACY_STORE_PATH, LEGACY_DIRECT_STORE_PATH):
+        for candidate in (
+            LEGACY_APP_SUPPORT_STORE_PATH,
+            LEGACY_STORE_PATH,
+            LEGACY_DIRECT_STORE_PATH,
+        ):
             if candidate.exists() and candidate != self.active_store_path:
                 candidates.append(candidate)
         return candidates
@@ -926,7 +931,7 @@ class ManageProjectsPage(BasePage):
         super().__init__(parent, app)
 
         ttk.Label(self, text="Manage Projects", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(self, text="Projects are stored in Application Support on this Mac.", style="Muted.TLabel").pack(anchor="w", pady=(4, 14))
+        ttk.Label(self, text="Prompts are stored beside this script in prompt_manager_store.json.", style="Muted.TLabel").pack(anchor="w", pady=(4, 14))
 
         nav = tk.Frame(self, bg=self.theme.palette.window_bg)
         nav.pack(fill="x", pady=(0, 12))
