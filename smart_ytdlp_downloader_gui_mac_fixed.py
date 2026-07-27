@@ -435,7 +435,7 @@ def completed_playlist_indices(
 
     normalized_extensions = {extension.lower().lstrip(".") for extension in extensions}
     completed: set[int] = set()
-    for path in base.iterdir():
+    for path in base.rglob("*"):
         if not path.is_file() or path.stat().st_size <= 0:
             continue
         if path.suffix.lower().lstrip(".") not in normalized_extensions:
@@ -491,7 +491,7 @@ def reconcile_ascii_safe_artifact_names(directory: str | Path, logger) -> int:
 
     plan: list[tuple[Path, Path]] = []
     destinations: dict[Path, list[Path]] = {}
-    for source in base.iterdir():
+    for source in base.rglob("*"):
         if not source.is_file():
             continue
         safe_name = ascii_safe_download_artifact_name(source.name)
@@ -1174,6 +1174,7 @@ class DownloaderGUI:
         self.media_var = tk.StringVar(value=state.get("media_type", "video"))
         self.url_var = tk.StringVar(value=state.get("url", ""))
         self.output_dir_var = tk.StringVar(value=state.get("output_dir", str(Path.home() / "Downloads")))
+        self.wrap_in_folder_var = tk.BooleanVar(value=state.get("wrap_in_folder", False))
         self.use_cookies_var = tk.BooleanVar(value=state.get("use_cookies", True))
         self.browser_var = tk.StringVar(value=state.get("browser", "firefox"))
         self.want_subs_var = tk.BooleanVar(value=state.get("want_subs", False))
@@ -1264,6 +1265,14 @@ class DownloaderGUI:
 
         browse_btn = AccessibleButton(settings, text="Browse…", command=self.choose_output_dir, kind="neutral", font=self.fonts["button"])
         browse_btn.grid(row=2, column=3, sticky="e", pady=6)
+
+        self.wrap_in_folder_check = ttk.Checkbutton(
+            settings,
+            text="Put each downloaded file in a same-named folder",
+            variable=self.wrap_in_folder_var,
+            style="Card.TCheckbutton",
+        )
+        self.wrap_in_folder_check.grid(row=3, column=3, sticky="w", pady=6)
 
         self.cookies_check = ttk.Checkbutton(settings, text="Use browser cookies", variable=self.use_cookies_var, command=self.apply_state_rules, style="Card.TCheckbutton")
         self.cookies_check.grid(row=3, column=0, sticky="w", pady=6)
@@ -1563,6 +1572,7 @@ class DownloaderGUI:
                 "media_type": self.media_var.get(),
                 "url": self.url_var.get().strip(),
                 "output_dir": self.output_dir_var.get().strip(),
+                "wrap_in_folder": self.wrap_in_folder_var.get(),
                 "use_cookies": self.use_cookies_var.get(),
                 "browser": self.browser_var.get().strip() or "firefox",
                 "want_subs": self.want_subs_var.get() or self.media_var.get() == "srt",
@@ -1611,6 +1621,7 @@ class DownloaderGUI:
             "media_type": self.media_var.get(),
             "url": url,
             "output_dir": str(output_dir),
+            "wrap_in_folder": self.wrap_in_folder_var.get(),
             "use_cookies": self.use_cookies_var.get(),
             "browser": self.browser_var.get().strip() or "firefox",
             "want_subs": self.want_subs_var.get() or self.media_var.get() == "srt",
@@ -1655,6 +1666,8 @@ class DownloaderGUI:
             logger(" Smart YouTube Downloader GUI (macOS) ")
             logger("=" * 70)
             logger(f"Current output directory: {config['output_dir']}")
+            if config["wrap_in_folder"]:
+                logger("> Folder wrapping enabled: each item will be stored in a folder with the same base name.")
             logger("")
 
             check_ffmpeg(logger)
@@ -1751,16 +1764,17 @@ class DownloaderGUI:
                 common_opts.update(build_subtitle_opts(langs=subs_langs, auto=False, skip_download=(media_type == "srt")))
 
             if mode == "single":
+                item_prefix = "%(title)s/" if config["wrap_in_folder"] else ""
                 if media_type == "video":
-                    outtmpl = "%(title)s.mp4"
+                    outtmpl = f"{item_prefix}%(title)s.mp4"
                     mode_label = "VIDEO"
                     artifact_label = "video"
                 elif media_type == "audio":
-                    outtmpl = "%(title)s.%(ext)s"
+                    outtmpl = f"{item_prefix}%(title)s.%(ext)s"
                     mode_label = "AUDIO-ONLY ~192 kbps MP3"
                     artifact_label = "audio (mp3)"
                 else:
-                    outtmpl = "%(title)s.%(ext)s"
+                    outtmpl = f"{item_prefix}%(title)s.%(ext)s"
                     mode_label = "SRT-ONLY"
                     artifact_label = ".srt subtitles"
 
@@ -1811,17 +1825,19 @@ class DownloaderGUI:
             playlist_len = maybe_get_playlist_length(url, extractor_args, cookiesfrombrowser, logger)
             index_width = 2 if playlist_len is None or playlist_len < 100 else 3
             index_pattern = f"%(playlist_index)0{index_width}d"
+            item_base = f"{index_pattern} - %(title)s"
+            item_prefix = f"{item_base}/" if config["wrap_in_folder"] else ""
 
             if media_type == "video":
-                outtmpl = f"{index_pattern} - %(title)s.mp4"
+                outtmpl = f"{item_prefix}{item_base}.mp4"
                 pattern_desc = f"{index_pattern.replace('%(playlist_index)', 'N')} - <title>.mp4"
                 mode_label = "VIDEO"
             elif media_type == "audio":
-                outtmpl = f"{index_pattern} - %(title)s.%(ext)s"
+                outtmpl = f"{item_prefix}{item_base}.%(ext)s"
                 pattern_desc = f"{index_pattern.replace('%(playlist_index)', 'N')} - <title>.mp3"
                 mode_label = "AUDIO-ONLY ~192 kbps MP3"
             else:
-                outtmpl = f"{index_pattern} - %(title)s.%(ext)s"
+                outtmpl = f"{item_prefix}{item_base}.%(ext)s"
                 pattern_desc = f"{index_pattern.replace('%(playlist_index)', 'N')} - <title>.srt"
                 mode_label = "SRT-ONLY"
 
