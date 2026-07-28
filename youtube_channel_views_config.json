@@ -1,5 +1,5 @@
 {
-  "min_views": "1000000",
+  "min_views": "4000000",
   "max_videos_per_channel": null,
   "published_after": null,
   "published_before": null,
@@ -7,7 +7,7 @@
   "browser_profile": null,
   "cookies_file": null,
   "open_browser": true,
-  "active_theme": "Documentary_عربية",
+  "active_theme": "Documentary_EN",
   "themes": [
     {
       "name": "books",
@@ -35,7 +35,7 @@
     },
     {
       "name": "Documentary_EN",
-      "min_views": 5000000,
+      "min_views": 4000000,
       "report_file": "youtube_channel_views_documentary_en_report.html",
       "saved_videos_file": "youtube_channel_views_documentary_en_saved_videos.json",
       "channels": [
@@ -62,6 +62,10 @@
         {
           "enabled": true,
           "url": "https://www.youtube.com/@DWDocumentary/videos"
+        },
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@BBCArchive/videos"
         }
       ]
     },

@@ -2020,12 +2020,11 @@ class DownloaderGUI:
                         self.queue_progress(None, f"Repairing {len(targets)} missing media item(s)...", indeterminate=True)
                         targeted_opts = {
                             **ydl_opts,
-                            # These indices were selected only because their
-                            # final media artifact is absent. Allow yt-dlp to
-                            # reuse/replace completed .f### components and run
-                            # the pending merge instead of leaving video-only
-                            # and audio-only debris indefinitely.
-                            "overwrites": True,
+                            # Preserve yt-dlp's continuation behavior for
+                            # existing .part files.  Forcing overwrites here
+                            # makes an interrupted targeted repair restart from
+                            # byte zero instead of resuming.
+                            "overwrites": False,
                             "playlist_items": format_playlist_items(targets),
                         }
                         result = run_download([url], targeted_opts, retry_without_cookies=True, logger=logger) or result
