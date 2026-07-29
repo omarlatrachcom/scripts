@@ -475,8 +475,8 @@ def artifact_layout_key(name: str) -> str:
     return name.rstrip(" .#")
 
 
-def ascii_safe_download_artifact_name(name: str) -> str | None:
-    """Return yt-dlp's ASCII-safe equivalent for a known download artifact."""
+def portable_unicode_download_artifact_name(name: str) -> str | None:
+    """Return a portable filename while preserving Unicode titles."""
     suffix_match = DOWNLOAD_ARTIFACT_SUFFIX_RE.search(name)
     if suffix_match is None:
         return None
@@ -491,14 +491,17 @@ def ascii_safe_download_artifact_name(name: str) -> str | None:
         prefix = ""
         title = base
 
-    safe_title = sanitize_filename(title, restricted=True)
+    # Keep Arabic and other Unicode text legible. yt-dlp still replaces
+    # filesystem-reserved characters, while ``windowsfilenames`` in the
+    # download options applies the stricter cross-platform character rules.
+    safe_title = sanitize_filename(title, restricted=False)
     if not safe_title:
         safe_title = "video"
     return f"{prefix}{safe_title}{suffix}"
 
 
-def reconcile_ascii_safe_artifact_names(directory: str | Path, logger) -> int:
-    """Rename legacy artifacts to the active ASCII-safe filename policy."""
+def reconcile_portable_unicode_artifact_names(directory: str | Path, logger) -> int:
+    """Rename legacy artifacts to the active portable Unicode policy."""
     base = Path(directory).expanduser()
     if not base.exists():
         return 0
@@ -508,7 +511,7 @@ def reconcile_ascii_safe_artifact_names(directory: str | Path, logger) -> int:
     for source in base.rglob("*"):
         if not source.is_file():
             continue
-        safe_name = ascii_safe_download_artifact_name(source.name)
+        safe_name = portable_unicode_download_artifact_name(source.name)
         if not safe_name or safe_name == source.name:
             continue
         destination = source.with_name(safe_name)
@@ -527,12 +530,12 @@ def reconcile_ascii_safe_artifact_names(directory: str | Path, logger) -> int:
     ]
     for destination in sorted(conflicts):
         logger(
-            f"WARNING: ASCII-safe rename skipped because the destination already exists "
+            f"WARNING: Portable-name reconciliation skipped because the destination already exists "
             f"or is ambiguous: {destination.name}"
         )
 
     if not safe_plan:
-        logger("> Filename reconciliation: existing download artifacts are already ASCII-safe.")
+        logger("> Filename reconciliation: existing download artifacts already use portable names.")
         return 0
 
     temporary_moves: list[tuple[Path, Path, Path]] = []
@@ -543,7 +546,7 @@ def reconcile_ascii_safe_artifact_names(directory: str | Path, logger) -> int:
             temporary_moves.append((source, temporary, destination))
         for source, temporary, destination in temporary_moves:
             temporary.rename(destination)
-            logger(f"> ASCII-safe rename: {source.name} -> {destination.name}")
+            logger(f"> Portable-name reconciliation: {source.name} -> {destination.name}")
     except Exception:
         for source, temporary, destination in reversed(temporary_moves):
             try:
@@ -610,7 +613,7 @@ def reconcile_download_artifact_layout(
                 artifact_base = download_artifact_base_name(source.name)
                 if artifact_base is None:
                     continue
-                safe_folder_artifact = ascii_safe_download_artifact_name(f"{folder.name}.mp4")
+                safe_folder_artifact = portable_unicode_download_artifact_name(f"{folder.name}.mp4")
                 safe_folder_base = (
                     download_artifact_base_name(safe_folder_artifact)
                     if safe_folder_artifact is not None
@@ -1821,7 +1824,7 @@ class DownloaderGUI:
 
             extractor_args = build_youtube_extractor_args(logger)
 
-            reconcile_ascii_safe_artifact_names(config["output_dir"], logger)
+            reconcile_portable_unicode_artifact_names(config["output_dir"], logger)
             reconcile_download_artifact_layout(
                 config["output_dir"],
                 wrap_in_folder=bool(config["wrap_in_folder"]),
@@ -1838,16 +1841,16 @@ class DownloaderGUI:
                 "concurrent_fragment_downloads": 4,
                 "progress_hooks": [self.make_progress_hook()],
                 "windowsfilenames": True,
-                # Transliterate accents and restrict generated media/subtitle
-                # names to portable ASCII characters from the outset.
-                "restrictfilenames": True,
+                # Preserve Arabic and other Unicode titles. windowsfilenames
+                # still removes characters that are unsafe across platforms.
+                "restrictfilenames": False,
                 "logger": ytdlp_logger,
                 "paths": {"home": config["output_dir"]},
                 "keepvideo": False,
             }
             logger(
-                "> Filename policy: portable ASCII-safe names are enabled for "
-                "media, subtitles, and temporary format components."
+                "> Filename policy: readable Unicode names are enabled; "
+                "cross-platform unsafe characters are sanitized."
             )
             if extractor_args:
                 common_opts["extractor_args"] = extractor_args
