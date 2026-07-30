@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -534,8 +535,37 @@ def artifact_layout_key(name: str) -> str:
     return name.rstrip(" .#")
 
 
-def portable_unicode_download_artifact_name(name: str) -> str | None:
-    """Return a portable filename while preserving Unicode titles."""
+def portable_safe_title(title: str) -> str:
+    """Return a portable title, preserving non-Latin scripts such as Arabic."""
+    normalized = unicodedata.normalize("NFKC", title)
+    has_non_latin_text = any(
+        character.isalnum()
+        and ord(character) > 127
+        and not unicodedata.name(character, "").startswith("LATIN ")
+        for character in normalized
+    )
+    if not has_non_latin_text:
+        return sanitize_filename(normalized, restricted=True)
+
+    safe_characters: list[str] = []
+    previous_was_separator = False
+    for character in normalized:
+        category = unicodedata.category(character)
+        if category.startswith(("L", "N")) or character == "-":
+            safe_characters.append(character)
+            previous_was_separator = False
+        elif category.startswith("M"):
+            # Combining marks are optional for readability and can behave
+            # inconsistently across filesystems, so omit them.
+            continue
+        elif not previous_was_separator:
+            safe_characters.append("_")
+            previous_was_separator = True
+    return "".join(safe_characters).strip("_.-")
+
+
+def portable_safe_download_artifact_name(name: str) -> str | None:
+    """Return a safe artifact name while preserving non-Latin scripts."""
     suffix_match = DOWNLOAD_ARTIFACT_SUFFIX_RE.search(name)
     if suffix_match is None:
         return None
@@ -550,17 +580,14 @@ def portable_unicode_download_artifact_name(name: str) -> str | None:
         prefix = ""
         title = base
 
-    # Keep Arabic and other Unicode text legible. yt-dlp still replaces
-    # filesystem-reserved characters, while ``windowsfilenames`` in the
-    # download options applies the stricter cross-platform character rules.
-    safe_title = sanitize_filename(title, restricted=False)
+    safe_title = portable_safe_title(title)
     if not safe_title:
         safe_title = "video"
     return f"{prefix}{safe_title}{suffix}"
 
 
-def reconcile_portable_unicode_artifact_names(directory: str | Path, logger) -> int:
-    """Rename legacy artifacts to the active portable Unicode policy."""
+def reconcile_portable_safe_artifact_names(directory: str | Path, logger) -> int:
+    """Rename artifacts to the active portable ASCII/Unicode-safe policy."""
     base = Path(directory).expanduser()
     if not base.exists():
         return 0
@@ -570,7 +597,7 @@ def reconcile_portable_unicode_artifact_names(directory: str | Path, logger) -> 
     for source in base.rglob("*"):
         if not source.is_file():
             continue
-        safe_name = portable_unicode_download_artifact_name(source.name)
+        safe_name = portable_safe_download_artifact_name(source.name)
         if not safe_name or safe_name == source.name:
             continue
         destination = source.with_name(safe_name)
@@ -589,12 +616,12 @@ def reconcile_portable_unicode_artifact_names(directory: str | Path, logger) -> 
     ]
     for destination in sorted(conflicts):
         logger(
-            f"WARNING: Portable-name reconciliation skipped because the destination already exists "
+            f"WARNING: Portable-safe rename skipped because the destination already exists "
             f"or is ambiguous: {destination.name}"
         )
 
     if not safe_plan:
-        logger("> Filename reconciliation: existing download artifacts already use portable names.")
+        logger("> Filename reconciliation: existing download artifacts are already portable-safe.")
         return 0
 
     temporary_moves: list[tuple[Path, Path, Path]] = []
@@ -605,7 +632,7 @@ def reconcile_portable_unicode_artifact_names(directory: str | Path, logger) -> 
             temporary_moves.append((source, temporary, destination))
         for source, temporary, destination in temporary_moves:
             temporary.rename(destination)
-            logger(f"> Portable-name reconciliation: {source.name} -> {destination.name}")
+            logger(f"> Portable-safe rename: {source.name} -> {destination.name}")
     except Exception:
         for source, temporary, destination in reversed(temporary_moves):
             try:
@@ -617,8 +644,52 @@ def reconcile_portable_unicode_artifact_names(directory: str | Path, logger) -> 
                 pass
         raise
 
-    logger(f"> Filename reconciliation renamed {len(safe_plan)} existing artifact(s).")
+    logger(f"> Filename reconciliation renamed {len(safe_plan)} existing artifact(s) to portable-safe names.")
     return len(safe_plan)
+
+
+def reconcile_portable_safe_wrapper_folder_names(directory: str | Path, logger) -> int:
+    """Rename same-named artifact folders to the portable-safe policy."""
+    base = Path(directory).expanduser()
+    if not base.exists():
+        return 0
+
+    renamed = 0
+    for source in sorted(path for path in base.iterdir() if path.is_dir()):
+        safe_folder_artifact = portable_safe_download_artifact_name(f"{source.name}.mp4")
+        safe_folder_name = (
+            download_artifact_base_name(safe_folder_artifact)
+            if safe_folder_artifact is not None
+            else None
+        )
+        if not safe_folder_name or safe_folder_name == source.name:
+            continue
+
+        contains_matching_artifact = any(
+            path.is_file() and download_artifact_base_name(path.name) == safe_folder_name
+            for path in source.iterdir()
+        )
+        if not contains_matching_artifact:
+            continue
+
+        destination = source.with_name(safe_folder_name)
+        if destination.exists():
+            logger(
+                f"WARNING: Portable-safe folder rename skipped because the destination exists: "
+                f"{destination.name}"
+            )
+            continue
+        try:
+            source.rename(destination)
+        except Exception as exc:
+            logger(f"WARNING: Could not rename wrapper folder '{source.name}': {exc}")
+        else:
+            renamed += 1
+            logger(f"> Portable-safe folder rename: {source.name} -> {destination.name}")
+
+    if renamed:
+        logger(f"> Filename reconciliation renamed {renamed} wrapper folder(s) to portable-safe names.")
+    return renamed
 
 
 @dataclass
@@ -672,7 +743,7 @@ def reconcile_download_artifact_layout(
                 artifact_base = download_artifact_base_name(source.name)
                 if artifact_base is None:
                     continue
-                safe_folder_artifact = portable_unicode_download_artifact_name(f"{folder.name}.mp4")
+                safe_folder_artifact = portable_safe_download_artifact_name(f"{folder.name}.mp4")
                 safe_folder_base = (
                     download_artifact_base_name(safe_folder_artifact)
                     if safe_folder_artifact is not None
@@ -2026,6 +2097,8 @@ class DownloaderGUI:
             self.queue_log(f"######## Plan item {position} of {len(jobs)} ########")
             self.queue_log(f"Type: {job['mode']} | Output: {job['output_dir']}")
             success, summary = self.download_one(item_config)
+            reconcile_portable_safe_artifact_names(job["output_dir"], self.queue_log)
+            reconcile_portable_safe_wrapper_folder_names(job["output_dir"], self.queue_log)
             results.append((success, summary))
             self.queue_log(
                 f"######## Item {position} {'completed' if success else 'failed'} ########"
@@ -2099,7 +2172,8 @@ class DownloaderGUI:
 
             extractor_args = build_youtube_extractor_args(logger)
 
-            reconcile_portable_unicode_artifact_names(config["output_dir"], logger)
+            reconcile_portable_safe_artifact_names(config["output_dir"], logger)
+            reconcile_portable_safe_wrapper_folder_names(config["output_dir"], logger)
             reconcile_download_artifact_layout(
                 config["output_dir"],
                 wrap_in_folder=bool(config["wrap_in_folder"]),
@@ -2116,16 +2190,16 @@ class DownloaderGUI:
                 "concurrent_fragment_downloads": 4,
                 "progress_hooks": [self.make_progress_hook()],
                 "windowsfilenames": True,
-                # Preserve Arabic and other Unicode titles. windowsfilenames
-                # still removes characters that are unsafe across platforms.
+                # Keep non-Latin titles available for post-download portable
+                # reconciliation instead of discarding their letters.
                 "restrictfilenames": False,
                 "logger": ytdlp_logger,
                 "paths": {"home": config["output_dir"]},
                 "keepvideo": False,
             }
             logger(
-                "> Filename policy: readable Unicode names are enabled; "
-                "cross-platform unsafe characters are sanitized."
+                "> Filename policy: portable ASCII/Unicode-safe names are enabled; "
+                "non-Latin letters are preserved and unsafe separators become underscores."
             )
             if extractor_args:
                 common_opts["extractor_args"] = extractor_args
