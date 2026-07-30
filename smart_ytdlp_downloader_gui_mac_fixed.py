@@ -423,6 +423,63 @@ def get_playlist_indices(url: str, extractor_args: dict, cookiesfrombrowser, log
 PLAYLIST_FILE_INDEX_RE = re.compile(r"^(?P<index>\d+)\s+-\s+")
 
 
+def existing_playlist_index_width(directory: str | Path) -> int:
+    """Return the widest playlist index already present in an output tree."""
+    base = Path(directory).expanduser()
+    if not base.exists():
+        return 0
+
+    widest = 0
+    for path in base.rglob("*"):
+        match = PLAYLIST_FILE_INDEX_RE.match(path.name)
+        if match:
+            widest = max(widest, len(match.group("index")))
+    return widest
+
+
+def normalize_playlist_index_width(
+    directory: str | Path,
+    *,
+    width: int,
+    logger,
+) -> tuple[int, int]:
+    """Pad existing playlist prefixes to ``width`` without overwriting files.
+
+    Both downloaded artifacts and optional per-item wrapper directories are
+    handled. Children are renamed before their parent wrapper directory.
+    """
+    base = Path(directory).expanduser()
+    if not base.exists():
+        return 0, 0
+
+    renamed = 0
+    conflicts = 0
+    paths = sorted(base.rglob("*"), key=lambda path: len(path.parts), reverse=True)
+    for source in paths:
+        match = PLAYLIST_FILE_INDEX_RE.match(source.name)
+        if match is None:
+            continue
+
+        old_index = match.group("index")
+        new_index = f"{int(old_index):0{width}d}"
+        if old_index == new_index:
+            continue
+
+        destination = source.with_name(new_index + source.name[match.end("index") :])
+        if destination.exists():
+            conflicts += 1
+            logger(
+                f"WARNING: Could not normalize playlist number for {source.name!r}; "
+                f"{destination.name!r} already exists."
+            )
+            continue
+
+        source.rename(destination)
+        renamed += 1
+
+    return renamed, conflicts
+
+
 def completed_playlist_indices(
     directory: str | Path,
     *,
@@ -1938,7 +1995,11 @@ class DownloaderGUI:
                 start_idx, end_idx = end_idx, start_idx
 
             playlist_len = maybe_get_playlist_length(url, extractor_args, cookiesfrombrowser, logger)
-            index_width = 2 if playlist_len is None or playlist_len < 100 else 3
+            index_width = max(
+                2,
+                len(str(playlist_len)) if playlist_len is not None else 0,
+                existing_playlist_index_width(config["output_dir"]),
+            )
             index_pattern = f"%(playlist_index)0{index_width}d"
             item_base = f"{index_pattern} - %(title)s"
             item_prefix = f"{item_base}/" if config["wrap_in_folder"] else ""
@@ -1958,6 +2019,21 @@ class DownloaderGUI:
 
             logger(f"> Playlist detected. Total items (approx): {playlist_len or 'unknown'}")
             logger(f"> File naming pattern: {pattern_desc}")
+            renamed_prefixes, rename_conflicts = normalize_playlist_index_width(
+                config["output_dir"],
+                width=index_width,
+                logger=logger,
+            )
+            if renamed_prefixes:
+                logger(
+                    f"> Normalized {renamed_prefixes} existing playlist path(s) "
+                    f"to {index_width}-digit numbering."
+                )
+            if rename_conflicts:
+                logger(
+                    f"WARNING: {rename_conflicts} existing playlist path(s) could not be "
+                    "renamed because the target name already exists."
+                )
 
             ydl_opts = {**common_opts, "ignoreerrors": True, "noplaylist": False, "outtmpl": outtmpl}
             if start_idx is not None:
