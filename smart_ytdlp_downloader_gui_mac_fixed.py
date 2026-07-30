@@ -36,6 +36,8 @@ APP_STATE_FILE = APP_SUPPORT_DIR / "gui_state.json"
 RESTARTED_AFTER_UPDATE_ENV = "SMART_YTDLP_RESTARTED_AFTER_UPDATE"
 UPDATER_PACKAGES = ["yt-dlp", "yt-dlp-ejs"]
 SUPPORTED_BROWSERS = ("firefox", "chrome", "chromium", "brave", "edge", "safari")
+JOB_MODE_LABELS = {"single": "Single video", "playlist": "Playlist"}
+JOB_MODE_VALUES = {label: mode for mode, label in JOB_MODE_LABELS.items()}
 STARTUP_MESSAGES: list[str] = []
 
 
@@ -1337,15 +1339,25 @@ class DownloaderGUI:
 
         state = load_gui_state()
 
-        self.mode_var = tk.StringVar(value=state.get("mode", "playlist"))
         self.media_var = tk.StringVar(value=state.get("media_type", "video"))
-        self.url_var = tk.StringVar(value=state.get("url", ""))
-        self.output_dir_var = tk.StringVar(value=state.get("output_dir", str(Path.home() / "Downloads")))
-        self.wrap_in_folder_var = tk.BooleanVar(value=state.get("wrap_in_folder", False))
+        saved_jobs = state.get("jobs")
+        if not isinstance(saved_jobs, list) or not saved_jobs:
+            saved_jobs = [
+                {
+                    "mode": state.get("mode", "playlist"),
+                    "url": state.get("url", ""),
+                    "output_dir": state.get("output_dir", str(Path.home() / "Downloads")),
+                }
+            ]
+        self.initial_jobs = saved_jobs
+        self.legacy_want_subs = bool(state.get("want_subs", False))
+        self.legacy_subs_lang = state.get("subs_lang", "en")
+        if self.legacy_subs_lang not in {"fr", "en"}:
+            self.legacy_subs_lang = "en"
+        self.legacy_wrap_in_folder = bool(state.get("wrap_in_folder", False))
+        self.job_rows: list[dict] = []
         self.use_cookies_var = tk.BooleanVar(value=state.get("use_cookies", True))
         self.browser_var = tk.StringVar(value=state.get("browser", "firefox"))
-        self.want_subs_var = tk.BooleanVar(value=state.get("want_subs", False))
-        self.subs_lang_var = tk.StringVar(value=state.get("subs_lang", "en"))
         self.start_idx_var = tk.StringVar(value=state.get("playlist_start", ""))
         self.end_idx_var = tk.StringVar(value=state.get("playlist_end", ""))
         self.status_var = tk.StringVar(value="Ready.")
@@ -1411,49 +1423,49 @@ class DownloaderGUI:
         settings.columnconfigure(1, weight=1)
         settings.columnconfigure(3, weight=1)
 
-        ttk.Label(settings, text="Mode:", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
-        mode_frame = ttk.Frame(settings, style="Card.TFrame")
-        mode_frame.grid(row=0, column=1, sticky="w", pady=6)
-        ttk.Radiobutton(mode_frame, text="Playlist", value="playlist", variable=self.mode_var, command=self.apply_state_rules, style="Card.TRadiobutton").pack(side="left")
-        ttk.Radiobutton(mode_frame, text="Single video", value="single", variable=self.mode_var, command=self.apply_state_rules, style="Card.TRadiobutton").pack(side="left", padx=(14, 0))
-
-        ttk.Label(settings, text="Media:", style="Card.TLabel").grid(row=0, column=2, sticky="w", padx=(16, 8), pady=6)
+        ttk.Label(settings, text="Media:", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
         media_frame = ttk.Frame(settings, style="Card.TFrame")
-        media_frame.grid(row=0, column=3, sticky="w", pady=6)
+        media_frame.grid(row=0, column=1, columnspan=3, sticky="w", pady=6)
         ttk.Radiobutton(media_frame, text="Video (<=1080p)", value="video", variable=self.media_var, command=self.apply_state_rules, style="Card.TRadiobutton").pack(side="left")
         ttk.Radiobutton(media_frame, text="Audio-only (MP3 ~192 kbps)", value="audio", variable=self.media_var, command=self.apply_state_rules, style="Card.TRadiobutton").pack(side="left", padx=(14, 0))
         ttk.Radiobutton(media_frame, text="SRT-only (subtitles only)", value="srt", variable=self.media_var, command=self.apply_state_rules, style="Card.TRadiobutton").pack(side="left", padx=(14, 0))
 
-        ttk.Label(settings, text="YouTube URL:", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(settings, textvariable=self.url_var).grid(row=1, column=1, columnspan=3, sticky="ew", pady=6)
-
-        ttk.Label(settings, text="Output folder:", style="Card.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(settings, textvariable=self.output_dir_var).grid(row=2, column=1, columnspan=2, sticky="ew", pady=6)
-
-        browse_btn = AccessibleButton(settings, text="Browse…", command=self.choose_output_dir, kind="neutral", font=self.fonts["button"])
-        browse_btn.grid(row=2, column=3, sticky="e", pady=6)
-
-        self.wrap_in_folder_check = ttk.Checkbutton(
-            settings,
-            text="Put each downloaded file in a same-named folder",
-            variable=self.wrap_in_folder_var,
-            style="Card.TCheckbutton",
-        )
-        self.wrap_in_folder_check.grid(row=3, column=3, sticky="w", pady=6)
-
         self.cookies_check = ttk.Checkbutton(settings, text="Use browser cookies", variable=self.use_cookies_var, command=self.apply_state_rules, style="Card.TCheckbutton")
-        self.cookies_check.grid(row=3, column=0, sticky="w", pady=6)
+        self.cookies_check.grid(row=1, column=0, sticky="w", pady=6)
 
-        ttk.Label(settings, text="Browser:", style="Card.TLabel").grid(row=3, column=1, sticky="e", padx=(0, 8), pady=6)
+        ttk.Label(settings, text="Browser:", style="Card.TLabel").grid(row=1, column=1, sticky="e", padx=(0, 8), pady=6)
         self.browser_combo = ttk.Combobox(settings, textvariable=self.browser_var, values=SUPPORTED_BROWSERS, state="readonly", width=14)
-        self.browser_combo.grid(row=3, column=2, sticky="w", pady=6)
+        self.browser_combo.grid(row=1, column=2, sticky="w", pady=6)
 
-        self.subs_check = ttk.Checkbutton(settings, text="Download subtitles (.srt)", variable=self.want_subs_var, command=self.apply_state_rules, style="Card.TCheckbutton")
-        self.subs_check.grid(row=4, column=0, sticky="w", pady=6)
-
-        ttk.Label(settings, text="Subtitle language:", style="Card.TLabel").grid(row=4, column=1, sticky="e", padx=(0, 8), pady=6)
-        self.subs_lang_entry = ttk.Entry(settings, textvariable=self.subs_lang_var, width=10)
-        self.subs_lang_entry.grid(row=4, column=2, sticky="w", pady=6)
+        plan_frame = ttk.LabelFrame(body, text="Download plan (runs top to bottom)", padding=14, style="Card.TLabelframe")
+        plan_frame.pack(fill="x", pady=(12, 0))
+        plan_frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            plan_frame,
+            text="Folder: puts that row's media and subtitle files inside a same-named folder.",
+            style="Muted.Card.TLabel",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        self.plan_rows_frame = ttk.Frame(plan_frame, style="Card.TFrame")
+        self.plan_rows_frame.grid(row=1, column=0, sticky="ew")
+        self.plan_rows_frame.columnconfigure(2, weight=3)
+        self.plan_rows_frame.columnconfigure(3, weight=2)
+        for heading_column, heading in enumerate(
+            ("#", "Type", "YouTube URL", "Output folder", "Subtitles", "Language", "Folder", "", "")
+        ):
+            ttk.Label(
+                self.plan_rows_frame,
+                text=heading,
+                style="Muted.Card.TLabel",
+            ).grid(row=0, column=heading_column, sticky="w", padx=(0, 8), pady=(0, 4))
+        for saved_job in self.initial_jobs:
+            self.add_job_row(saved_job)
+        AccessibleButton(
+            plan_frame,
+            text="+ Add video or playlist",
+            command=self.add_job_row,
+            kind="neutral",
+            font=self.fonts["button"],
+        ).grid(row=2, column=0, sticky="w", pady=(10, 0))
 
         playlist_frame = ttk.LabelFrame(body, text="Playlist range (optional)", padding=14, style="Card.TLabelframe")
         playlist_frame.pack(fill="x", pady=(12, 0))
@@ -1605,49 +1617,225 @@ class DownloaderGUI:
         elif num == 5:
             self.app_canvas.yview_scroll(1, "units")
 
+    def add_job_row(self, saved_job: dict | None = None) -> None:
+        is_new_row = not isinstance(saved_job, dict)
+        saved_job = saved_job if isinstance(saved_job, dict) else {}
+        default_output = (
+            self.job_rows[-1]["output_var"].get()
+            if self.job_rows
+            else str(Path.home() / "Downloads")
+        )
+        saved_mode = saved_job.get("mode")
+        saved_subs_lang = saved_job.get(
+            "subs_lang",
+            "en" if is_new_row else self.legacy_subs_lang,
+        )
+        if saved_subs_lang not in {"fr", "en"}:
+            saved_subs_lang = "en"
+        mode_var = tk.StringVar(value=JOB_MODE_LABELS.get(saved_mode, JOB_MODE_LABELS["playlist"]))
+        row = {
+            "mode_var": mode_var,
+            "url_var": tk.StringVar(value=str(saved_job.get("url", ""))),
+            "output_var": tk.StringVar(value=str(saved_job.get("output_dir", default_output))),
+            "want_subs_var": tk.BooleanVar(
+                value=bool(saved_job.get("want_subs", False if is_new_row else self.legacy_want_subs))
+            ),
+            "subs_lang_var": tk.StringVar(value=saved_subs_lang),
+            "wrap_in_folder_var": tk.BooleanVar(
+                value=bool(
+                    saved_job.get(
+                        "wrap_in_folder",
+                        False if is_new_row else self.legacy_wrap_in_folder,
+                    )
+                )
+            ),
+            "widgets": [],
+        }
+        mode_var.trace_add("write", lambda *_args: self.apply_state_rules())
+        self.job_rows.append(row)
+        self.refresh_job_rows()
+
+    def remove_job_row(self, row: dict) -> None:
+        if row not in self.job_rows:
+            return
+        if len(self.job_rows) == 1:
+            row["url_var"].set("")
+            row["output_var"].set(str(Path.home() / "Downloads"))
+            row["mode_var"].set(JOB_MODE_LABELS["playlist"])
+            row["want_subs_var"].set(False)
+            row["subs_lang_var"].set("en")
+            row["wrap_in_folder_var"].set(False)
+            return
+        for widget in row["widgets"]:
+            widget.destroy()
+        self.job_rows.remove(row)
+        self.refresh_job_rows()
+
+    def refresh_job_rows(self) -> None:
+        for row_number, row in enumerate(self.job_rows, start=1):
+            for widget in row["widgets"]:
+                widget.destroy()
+
+            number_label = ttk.Label(
+                self.plan_rows_frame,
+                text=str(row_number),
+                style="Card.TLabel",
+            )
+            mode_combo = ttk.Combobox(
+                self.plan_rows_frame,
+                textvariable=row["mode_var"],
+                values=(JOB_MODE_LABELS["single"], JOB_MODE_LABELS["playlist"]),
+                state="readonly",
+                width=12,
+            )
+            url_entry = ttk.Entry(self.plan_rows_frame, textvariable=row["url_var"])
+            output_entry = ttk.Entry(self.plan_rows_frame, textvariable=row["output_var"])
+            subtitles_check = ttk.Checkbutton(
+                self.plan_rows_frame,
+                text=".srt",
+                variable=row["want_subs_var"],
+                command=self.apply_state_rules,
+                style="Card.TCheckbutton",
+            )
+            subtitle_language_combo = ttk.Combobox(
+                self.plan_rows_frame,
+                textvariable=row["subs_lang_var"],
+                values=("fr", "en"),
+                state="readonly" if row["want_subs_var"].get() else "disabled",
+                width=8,
+            )
+            folder_check = ttk.Checkbutton(
+                self.plan_rows_frame,
+                variable=row["wrap_in_folder_var"],
+                style="Card.TCheckbutton",
+            )
+            browse_button = AccessibleButton(
+                self.plan_rows_frame,
+                text="Browse…",
+                command=lambda selected=row: self.choose_output_dir(selected),
+                kind="neutral",
+                font=self.fonts["small"],
+            )
+            remove_button = AccessibleButton(
+                self.plan_rows_frame,
+                text="−",
+                command=lambda selected=row: self.remove_job_row(selected),
+                kind="close",
+                font=self.fonts["button"],
+            )
+            widgets = [
+                number_label,
+                mode_combo,
+                url_entry,
+                output_entry,
+                subtitles_check,
+                subtitle_language_combo,
+                folder_check,
+                browse_button,
+                remove_button,
+            ]
+            row["widgets"] = widgets
+            for column, widget in enumerate(widgets):
+                widget.grid(
+                    row=row_number,
+                    column=column,
+                    sticky="ew" if column in {2, 3} else "w",
+                    padx=(0, 8),
+                    pady=4,
+                )
+
+        self.on_scrollable_frame_configure()
+        if hasattr(self, "start_entry"):
+            self.apply_state_rules()
+
+    def planned_jobs(self, *, include_blank: bool = False) -> list[dict[str, object]]:
+        jobs = []
+        for row in self.job_rows:
+            job = {
+                "mode": JOB_MODE_VALUES.get(row["mode_var"].get(), "playlist"),
+                "url": row["url_var"].get().strip(),
+                "output_dir": row["output_var"].get().strip(),
+                "want_subs": row["want_subs_var"].get(),
+                "subs_lang": row["subs_lang_var"].get(),
+                "wrap_in_folder": row["wrap_in_folder_var"].get(),
+            }
+            if include_blank or job["url"] or job["output_dir"]:
+                jobs.append(job)
+        return jobs
+
     def apply_state_rules(self) -> None:
-        playlist_enabled = self.mode_var.get() == "playlist"
+        playlist_enabled = any(
+            JOB_MODE_VALUES.get(row["mode_var"].get()) == "playlist"
+            for row in self.job_rows
+        )
         srt_only = self.media_var.get() == "srt"
-        if srt_only and not self.want_subs_var.get():
-            self.want_subs_var.set(True)
-        subs_enabled = self.want_subs_var.get() or srt_only
+        if srt_only:
+            for row in self.job_rows:
+                row["want_subs_var"].set(True)
         cookies_enabled = self.use_cookies_var.get()
 
         self.start_entry.configure(state="normal" if playlist_enabled else "disabled")
         self.end_entry.configure(state="normal" if playlist_enabled else "disabled")
-        self.subs_lang_entry.configure(state="normal" if subs_enabled else "disabled")
         self.browser_combo.configure(state="readonly" if cookies_enabled else "disabled")
 
-        if srt_only:
-            self.subs_check.configure(state="disabled")
-        else:
-            self.subs_check.configure(state="normal")
+        for row in self.job_rows:
+            row["widgets"][4].configure(state="disabled" if srt_only else "normal")
+            row["widgets"][5].configure(
+                state="readonly" if row["want_subs_var"].get() else "disabled"
+            )
 
-    def choose_output_dir(self) -> None:
-        folder = filedialog.askdirectory(initialdir=self.output_dir_var.get() or str(Path.home()))
+    def choose_output_dir(self, row: dict) -> None:
+        folder = filedialog.askdirectory(initialdir=row["output_var"].get() or str(Path.home()))
         if folder:
-            self.output_dir_var.set(folder)
+            row["output_var"].set(folder)
 
     def open_output_folder(self) -> None:
-        folder = Path(self.output_dir_var.get()).expanduser()
-        if not folder.exists():
-            messagebox.showwarning("Folder not found", f"This folder does not exist:\n{folder}")
+        jobs = self.planned_jobs()
+        if not jobs:
+            messagebox.showwarning("No download plan", "Add a URL and output folder first.")
+            return
+        folders = list(
+            dict.fromkeys(
+                Path(job["output_dir"]).expanduser()
+                for job in jobs
+                if job["output_dir"]
+            )
+        )
+        missing = [folder for folder in folders if not folder.exists()]
+        if missing:
+            messagebox.showwarning(
+                "Folder not found",
+                "These planned folders do not exist:\n" + "\n".join(str(folder) for folder in missing),
+            )
             return
         try:
-            subprocess.Popen(["open", str(folder)])
+            for folder in folders:
+                subprocess.Popen(["open", str(folder)])
         except Exception as exc:
             messagebox.showerror("Open folder failed", str(exc))
 
     def clean_residue_files(self) -> None:
-        folder = Path(self.output_dir_var.get()).expanduser()
-        if not folder.exists():
-            messagebox.showwarning("Folder not found", f"This folder does not exist:\n{folder}")
+        folders = {
+            Path(job["output_dir"]).expanduser()
+            for job in self.planned_jobs()
+            if job["output_dir"]
+        }
+        missing = [folder for folder in folders if not folder.exists()]
+        if missing:
+            messagebox.showwarning(
+                "Folder not found",
+                "These planned folders do not exist:\n" + "\n".join(str(folder) for folder in missing),
+            )
             return
 
-        residue_files = find_residue_files_in_directory(folder)
+        residue_files = {
+            path
+            for folder in folders
+            for path in find_residue_files_in_directory(folder)
+        }
         if not residue_files:
-            self.append_log("> Manual residue cleanup: nothing to remove in the selected output folder.")
-            messagebox.showinfo("Clean residue", "No known yt-dlp residue files were found in this output folder.")
+            self.append_log("> Manual residue cleanup: nothing to remove in the planned output folders.")
+            messagebox.showinfo("Clean residue", "No known yt-dlp residue files were found in the planned output folders.")
             return
 
         self.append_log("> Manual residue cleanup: removing known yt-dlp temporary/intermediate files from the output folder...")
@@ -1735,15 +1923,10 @@ class DownloaderGUI:
     def save_current_state(self) -> None:
         save_gui_state(
             {
-                "mode": self.mode_var.get(),
                 "media_type": self.media_var.get(),
-                "url": self.url_var.get().strip(),
-                "output_dir": self.output_dir_var.get().strip(),
-                "wrap_in_folder": self.wrap_in_folder_var.get(),
+                "jobs": self.planned_jobs(include_blank=True),
                 "use_cookies": self.use_cookies_var.get(),
                 "browser": self.browser_var.get().strip() or "firefox",
-                "want_subs": self.want_subs_var.get() or self.media_var.get() == "srt",
-                "subs_lang": self.subs_lang_var.get().strip() or "en",
                 "playlist_start": self.start_idx_var.get().strip(),
                 "playlist_end": self.end_idx_var.get().strip(),
             }
@@ -1753,30 +1936,42 @@ class DownloaderGUI:
         if self.downloading:
             return
 
-        url = self.url_var.get().strip()
-        output_dir = Path(self.output_dir_var.get().strip()).expanduser()
-
-        if not url:
-            messagebox.showwarning("Missing URL", "Please paste a YouTube video or playlist URL.")
+        jobs = self.planned_jobs(include_blank=True)
+        if not jobs:
+            messagebox.showwarning("Empty download plan", "Add at least one video or playlist.")
             return
-        if not output_dir:
-            messagebox.showwarning("Missing output folder", "Please choose an output folder.")
-            return
-
-        try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            messagebox.showerror("Invalid output folder", str(exc))
-            return
+        for position, job in enumerate(jobs, start=1):
+            if not job["url"]:
+                messagebox.showwarning("Missing URL", f"Enter a YouTube URL for plan item {position}.")
+                return
+            if not job["output_dir"]:
+                messagebox.showwarning(
+                    "Missing output folder",
+                    f"Choose an output folder for plan item {position}.",
+                )
+                return
+            output_dir = Path(job["output_dir"]).expanduser()
+            try:
+                output_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                messagebox.showerror(
+                    "Invalid output folder",
+                    f"Plan item {position}:\n{output_dir}\n\n{exc}",
+                )
+                return
+            job["output_dir"] = str(output_dir)
 
         if self.use_cookies_var.get() and self.browser_var.get().strip() not in SUPPORTED_BROWSERS:
             messagebox.showwarning("Invalid browser", "Choose one of: firefox, chrome, chromium, brave, edge, safari.")
             return
 
-        want_subs = self.want_subs_var.get() or self.media_var.get() == "srt"
-        if want_subs and not self.subs_lang_var.get().strip():
-            messagebox.showwarning("Missing subtitle language", "Enter a subtitle language code such as en, fr, or ar.")
-            return
+        for position, job in enumerate(jobs, start=1):
+            if job["want_subs"] and job["subs_lang"] not in {"fr", "en"}:
+                messagebox.showwarning(
+                    "Missing subtitle language",
+                    f"Choose French (fr) or English (en) for plan item {position}.",
+                )
+                return
 
         self.save_current_state()
         self.clear_log()
@@ -1784,20 +1979,15 @@ class DownloaderGUI:
         self.queue_progress(None, "Preparing download...", indeterminate=True)
 
         config = {
-            "mode": self.mode_var.get(),
             "media_type": self.media_var.get(),
-            "url": url,
-            "output_dir": str(output_dir),
-            "wrap_in_folder": self.wrap_in_folder_var.get(),
+            "jobs": jobs,
             "use_cookies": self.use_cookies_var.get(),
             "browser": self.browser_var.get().strip() or "firefox",
-            "want_subs": self.want_subs_var.get() or self.media_var.get() == "srt",
-            "subs_lang": self.subs_lang_var.get().strip() or "en",
             "start_idx": self.start_idx_var.get().strip(),
             "end_idx": self.end_idx_var.get().strip(),
         }
 
-        self.worker = threading.Thread(target=self.download_worker, args=(config,), daemon=True)
+        self.worker = threading.Thread(target=self.download_plan_worker, args=(config,), daemon=True)
         self.worker.start()
 
     def make_progress_hook(self):
@@ -1825,7 +2015,35 @@ class DownloaderGUI:
                 self.queue_log(f"ERROR while downloading: {name}")
         return hook
 
-    def download_worker(self, config: dict) -> None:
+    def download_plan_worker(self, config: dict) -> None:
+        jobs = config["jobs"]
+        results: list[tuple[bool, str]] = []
+        for position, job in enumerate(jobs, start=1):
+            item_config = {**config, **job}
+            item_config.pop("jobs", None)
+            self.queue.put(("status", f"Plan item {position} of {len(jobs)}"))
+            self.queue_log("")
+            self.queue_log(f"######## Plan item {position} of {len(jobs)} ########")
+            self.queue_log(f"Type: {job['mode']} | Output: {job['output_dir']}")
+            success, summary = self.download_one(item_config)
+            results.append((success, summary))
+            self.queue_log(
+                f"######## Item {position} {'completed' if success else 'failed'} ########"
+            )
+
+        succeeded = sum(1 for success, _summary in results if success)
+        total = len(results)
+        if succeeded == total:
+            summary = f"Download plan completed: all {total} item(s) succeeded."
+            self.queue.put(("done", True, summary))
+        else:
+            summary = (
+                f"Download plan completed: {succeeded} of {total} item(s) succeeded; "
+                f"{total - succeeded} failed. Check the log, then rerun to resume."
+            )
+            self.queue.put(("done", False, summary))
+
+    def download_one(self, config: dict) -> tuple[bool, str]:
         logger = self.queue_log
 
         try:
@@ -1962,8 +2180,7 @@ class DownloaderGUI:
                         "> Keeping partial yt-dlp files so a later run can continue the interrupted download."
                     )
                     summary = "Download finished with errors. Run it again later to resume the unfinished file."
-                    self.queue.put(("done", False, summary))
-                    return
+                    return False, summary
 
                 if want_subs and subs_langs:
                     cleanup_stats = run_optional_auto_sub_fallback(
@@ -1984,8 +2201,7 @@ class DownloaderGUI:
                 if residue_stats.removed_files:
                     summary += f" Residue cleanup removed {residue_stats.removed_files} file(s)."
                 logger(summary)
-                self.queue.put(("done", True, summary))
-                return
+                return True, summary
 
             logger("> Playlist mode selected.")
             start_idx = parse_positive_int(config["start_idx"], "start index", logger)
@@ -2185,7 +2401,7 @@ class DownloaderGUI:
                 if residue_stats.removed_files:
                     summary += f" Residue cleanup removed {residue_stats.removed_files} file(s)."
                 logger(summary)
-                self.queue.put(("done", True, summary))
+                return True, summary
             else:
                 parts = []
                 if remaining_media:
@@ -2200,12 +2416,12 @@ class DownloaderGUI:
                 if residue_stats.removed_files:
                     summary += f" Residue cleanup removed {residue_stats.removed_files} file(s)."
                 logger(summary)
-                self.queue.put(("done", False, summary))
+                return False, summary
 
         except Exception as exc:
             logger(f"Unhandled error: {exc}")
-            self.queue.put(("done", False, "Download failed."))
             self.queue.put(("errorbox", "Download failed", str(exc)))
+            return False, f"Download failed: {exc}"
 
 
 def main() -> None:
