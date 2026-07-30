@@ -34,7 +34,7 @@ from pathlib import Path
 # ------------- CONFIG -------------
 
 MAX_LINES_PER_CHUNK = 150  # subtitle text lines per tab/chunk
-DEFAULT_MODEL_NAME = "GPT-5.5 High"
+DEFAULT_MODEL_NAME = "GPT-5.6 Sol High"
 
 VIDEO_EXTENSIONS = [".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".mpeg", ".mpg"]
 
