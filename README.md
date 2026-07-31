@@ -63,7 +63,8 @@ Smart YouTube Downloader is a high-contrast GUI wrapper around `yt-dlp`.
 
 What it does:
 
-- Downloads a single YouTube video or a playlist.
+- Downloads a single YouTube video or a playlist at up to 4K resolution when
+  available, with automatic fallback to the best lower quality.
 - Supports video downloads, audio-only MP3 downloads, and SRT-only subtitle
   downloads.
 - Supports playlist start/end ranges.

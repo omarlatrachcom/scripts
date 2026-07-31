@@ -1497,7 +1497,7 @@ class DownloaderGUI:
         ttk.Label(settings, text="Media:", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
         media_frame = ttk.Frame(settings, style="Card.TFrame")
         media_frame.grid(row=0, column=1, columnspan=3, sticky="w", pady=6)
-        ttk.Radiobutton(media_frame, text="Video (<=1080p)", value="video", variable=self.media_var, command=self.apply_state_rules, style="Card.TRadiobutton").pack(side="left")
+        ttk.Radiobutton(media_frame, text="Video (up to 4K)", value="video", variable=self.media_var, command=self.apply_state_rules, style="Card.TRadiobutton").pack(side="left")
         ttk.Radiobutton(media_frame, text="Audio-only (MP3 ~192 kbps)", value="audio", variable=self.media_var, command=self.apply_state_rules, style="Card.TRadiobutton").pack(side="left", padx=(14, 0))
         ttk.Radiobutton(media_frame, text="SRT-only (subtitles only)", value="srt", variable=self.media_var, command=self.apply_state_rules, style="Card.TRadiobutton").pack(side="left", padx=(14, 0))
 
@@ -2159,7 +2159,7 @@ class DownloaderGUI:
                     logger(f"> Subtitle strategy: try MANUAL '{subs_lang}' first, then AUTO-generated '{subs_lang}' only if manual is missing.")
 
             if media_type == "video":
-                format_str = "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
+                format_str = "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"
             elif media_type == "audio":
                 # Prefer normal audio-only formats, but fall back to any playable
                 # format that contains audio. FFmpegExtractAudio below still
