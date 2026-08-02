@@ -65,8 +65,12 @@ What it does:
 
 - Downloads a single YouTube video or a playlist at up to 4K resolution when
   available, with automatic fallback to the best lower quality.
-- Supports video downloads, audio-only MP3 downloads, and SRT-only subtitle
-  downloads.
+- Supports video downloads and audio-only MP3 downloads while preferring the
+  video's original audio track over YouTube dubs.
+- Supports SRT-only subtitle downloads in French (`fr`), English (`en`), or
+  Spanish (`es`).
+- Creates media, subtitle, and resumable `.part` files with portable-safe names
+  from the start, while preserving readable non-Latin scripts.
 - Supports playlist start/end ranges.
 - Can use browser cookies from Firefox, Chrome, Chromium, Brave, Edge, or Safari.
 - Saves GUI state in:

@@ -37,6 +37,7 @@ APP_STATE_FILE = APP_SUPPORT_DIR / "gui_state.json"
 RESTARTED_AFTER_UPDATE_ENV = "SMART_YTDLP_RESTARTED_AFTER_UPDATE"
 UPDATER_PACKAGES = ["yt-dlp", "yt-dlp-ejs"]
 SUPPORTED_BROWSERS = ("firefox", "chrome", "chromium", "brave", "edge", "safari")
+SUPPORTED_SUBTITLE_LANGUAGES = ("fr", "en", "es")
 JOB_MODE_LABELS = {"single": "Single video", "playlist": "Playlist"}
 JOB_MODE_VALUES = {label: mode for mode, label in JOB_MODE_LABELS.items()}
 STARTUP_MESSAGES: list[str] = []
@@ -131,6 +132,7 @@ run_auto_update_before_import()
 
 try:
     from yt_dlp import YoutubeDL  # type: ignore
+    from yt_dlp.postprocessor.common import PostProcessor  # type: ignore
     from yt_dlp.utils import sanitize_filename  # type: ignore
     try:
         from yt_dlp.version import __version__ as YTDLP_VERSION  # type: ignore
@@ -564,6 +566,16 @@ def portable_safe_title(title: str) -> str:
     return "".join(safe_characters).strip("_.-")
 
 
+class PortableSafeTitlePP(PostProcessor):
+    """Expose a safe title to output templates before any files are created."""
+
+    def run(self, info: dict) -> tuple[list[str], dict]:
+        title = info.get("title")
+        safe_title = portable_safe_title(str(title)) if title else ""
+        info["portable_title"] = safe_title or "video"
+        return [], info
+
+
 def portable_safe_download_artifact_name(name: str) -> str | None:
     """Return a safe artifact name while preserving non-Latin scripts."""
     suffix_match = DOWNLOAD_ARTIFACT_SUFFIX_RE.search(name)
@@ -785,9 +797,16 @@ def reconcile_download_artifact_layout(
     return stats
 
 
+def build_youtube_dl(ydl_opts: dict) -> YoutubeDL:
+    """Build yt-dlp with safe-title metadata ready before filename creation."""
+    ydl = YoutubeDL(ydl_opts)
+    ydl.add_post_processor(PortableSafeTitlePP(), when="video")
+    return ydl
+
+
 def run_download(urls: list[str], ydl_opts: dict, *, retry_without_cookies: bool, logger) -> int:
     try:
-        with YoutubeDL(ydl_opts) as ydl:
+        with build_youtube_dl(ydl_opts) as ydl:
             result = ydl.download(urls)
     except KeyboardInterrupt:
         raise
@@ -801,7 +820,7 @@ def run_download(urls: list[str], ydl_opts: dict, *, retry_without_cookies: bool
             retry_opts = {**ydl_opts}
             retry_opts.pop("cookiesfrombrowser", None)
             try:
-                with YoutubeDL(retry_opts) as ydl:
+                with build_youtube_dl(retry_opts) as ydl:
                     retry_result = ydl.download(urls)
             except KeyboardInterrupt:
                 raise
@@ -833,7 +852,7 @@ def run_download(urls: list[str], ydl_opts: dict, *, retry_without_cookies: bool
                 )
                 retry_opts = {**ydl_opts}
                 retry_opts.pop("cookiesfrombrowser", None)
-                with YoutubeDL(retry_opts) as ydl:
+                with build_youtube_dl(retry_opts) as ydl:
                     retry_result = ydl.download(urls)
                 if retry_result == 0:
                     logger("> Retry without cookies succeeded.")
@@ -1423,7 +1442,7 @@ class DownloaderGUI:
         self.initial_jobs = saved_jobs
         self.legacy_want_subs = bool(state.get("want_subs", False))
         self.legacy_subs_lang = state.get("subs_lang", "en")
-        if self.legacy_subs_lang not in {"fr", "en"}:
+        if self.legacy_subs_lang not in SUPPORTED_SUBTITLE_LANGUAGES:
             self.legacy_subs_lang = "en"
         self.legacy_wrap_in_folder = bool(state.get("wrap_in_folder", False))
         self.job_rows: list[dict] = []
@@ -1701,7 +1720,7 @@ class DownloaderGUI:
             "subs_lang",
             "en" if is_new_row else self.legacy_subs_lang,
         )
-        if saved_subs_lang not in {"fr", "en"}:
+        if saved_subs_lang not in SUPPORTED_SUBTITLE_LANGUAGES:
             saved_subs_lang = "en"
         mode_var = tk.StringVar(value=JOB_MODE_LABELS.get(saved_mode, JOB_MODE_LABELS["playlist"]))
         row = {
@@ -1771,7 +1790,7 @@ class DownloaderGUI:
             subtitle_language_combo = ttk.Combobox(
                 self.plan_rows_frame,
                 textvariable=row["subs_lang_var"],
-                values=("fr", "en"),
+                values=SUPPORTED_SUBTITLE_LANGUAGES,
                 state="readonly" if row["want_subs_var"].get() else "disabled",
                 width=8,
             )
@@ -2037,10 +2056,10 @@ class DownloaderGUI:
             return
 
         for position, job in enumerate(jobs, start=1):
-            if job["want_subs"] and job["subs_lang"] not in {"fr", "en"}:
+            if job["want_subs"] and job["subs_lang"] not in SUPPORTED_SUBTITLE_LANGUAGES:
                 messagebox.showwarning(
                     "Missing subtitle language",
-                    f"Choose French (fr) or English (en) for plan item {position}.",
+                    f"Choose French (fr), English (en), or Spanish (es) for plan item {position}.",
                 )
                 return
 
@@ -2190,8 +2209,8 @@ class DownloaderGUI:
                 "concurrent_fragment_downloads": 4,
                 "progress_hooks": [self.make_progress_hook()],
                 "windowsfilenames": True,
-                # Keep non-Latin titles available for post-download portable
-                # reconciliation instead of discarding their letters.
+                # PortableSafeTitlePP handles the title itself before filename
+                # creation while preserving readable non-Latin scripts.
                 "restrictfilenames": False,
                 "logger": ytdlp_logger,
                 "paths": {"home": config["output_dir"]},
@@ -2199,12 +2218,23 @@ class DownloaderGUI:
             }
             logger(
                 "> Filename policy: portable ASCII/Unicode-safe names are enabled; "
-                "non-Latin letters are preserved and unsafe separators become underscores."
+                "names are sanitized before downloads start, non-Latin letters are preserved, "
+                "and unsafe separators become underscores."
             )
             if extractor_args:
                 common_opts["extractor_args"] = extractor_args
             if format_str:
                 common_opts["format"] = format_str
+
+            if media_type in {"video", "audio"}:
+                # YouTube may expose several dubbed audio tracks. yt-dlp's
+                # extractor marks the creator's original track with the highest
+                # language preference; force that preference ahead of quality
+                # when choosing the audio stream. Normal format fallback still
+                # works for videos where YouTube provides no language metadata.
+                common_opts["format_sort"] = ["lang"]
+                common_opts["format_sort_force"] = True
+                logger("> Audio-track strategy: prefer the video's original audio over dubbed tracks.")
 
             js_runtime_opts = build_js_runtime_opts(logger)
             if js_runtime_opts:
@@ -2228,17 +2258,17 @@ class DownloaderGUI:
                 common_opts.update(build_subtitle_opts(langs=subs_langs, auto=False, skip_download=(media_type == "srt")))
 
             if mode == "single":
-                item_prefix = "%(title)s/" if config["wrap_in_folder"] else ""
+                item_prefix = "%(portable_title)s/" if config["wrap_in_folder"] else ""
                 if media_type == "video":
-                    outtmpl = f"{item_prefix}%(title)s.mp4"
+                    outtmpl = f"{item_prefix}%(portable_title)s.mp4"
                     mode_label = "VIDEO"
                     artifact_label = "video"
                 elif media_type == "audio":
-                    outtmpl = f"{item_prefix}%(title)s.%(ext)s"
+                    outtmpl = f"{item_prefix}%(portable_title)s.%(ext)s"
                     mode_label = "AUDIO-ONLY ~192 kbps MP3"
                     artifact_label = "audio (mp3)"
                 else:
-                    outtmpl = f"{item_prefix}%(title)s.%(ext)s"
+                    outtmpl = f"{item_prefix}%(portable_title)s.%(ext)s"
                     mode_label = "SRT-ONLY"
                     artifact_label = ".srt subtitles"
 
@@ -2291,7 +2321,7 @@ class DownloaderGUI:
                 existing_playlist_index_width(config["output_dir"]),
             )
             index_pattern = f"%(playlist_index)0{index_width}d"
-            item_base = f"{index_pattern} - %(title)s"
+            item_base = f"{index_pattern} - %(portable_title)s"
             item_prefix = f"{item_base}/" if config["wrap_in_folder"] else ""
 
             if media_type == "video":
