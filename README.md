@@ -255,18 +255,18 @@ through ChatGPT.
 
 ### `video_splitter_gui_mac.py`
 
-Video Splitter is a GUI for splitting local video files and, optionally, their
-matching subtitles.
+Video Splitter is a GUI for splitting local video or MP3 audio files and,
+optionally, their matching subtitles.
 
 What it does:
 
-- Lets you pick a folder and select a video file.
+- Lets you pick a folder and select a supported video or MP3 file.
 - Supports a two-part cut at a chosen timestamp.
 - Supports window splitting with overlap, useful for breaking long videos into
   reviewable chunks.
 - Can split one or two SRT files alongside the video.
 - Can convert split subtitle outputs to ASS.
-- Uses `ffmpeg` and `ffprobe` for video work.
+- Uses `ffmpeg` and `ffprobe` for video and MP3 work.
 - Saves GUI state in:
   `~/Library/Application Support/VideoSplitGUI/gui_state.json`
 
@@ -282,8 +282,8 @@ Required setup:
 brew install ffmpeg
 ```
 
-Use it when you need local video segments and want the subtitle timing to follow
-the split outputs.
+Use it when you need local video or MP3 segments and want any subtitle timing to
+follow the split outputs.
 
 ## Turn a Script Into a macOS App With Automator
 

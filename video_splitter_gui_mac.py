@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Tkinter GUI for splitting local video files on macOS.
+Tkinter GUI for splitting local video and MP3 files on macOS.
 
 What it covers:
-- Pick a folder, list videos, choose one
+- Pick a folder, list videos and MP3 audio files, choose one
 - Split mode 1: two-part cut at a chosen time (part1 / part2)
 - Split mode 2: window split with overlap (vsplit / vsplit_srt style)
 - Optionally split one or two external SRT or ASS files alongside the video
@@ -38,6 +38,8 @@ from tkinter import filedialog, messagebox, ttk, scrolledtext
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "VideoSplitGUI"
 APP_STATE_FILE = APP_SUPPORT_DIR / "gui_state.json"
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".flv", ".ts")
+AUDIO_EXTENSIONS = (".mp3",)
+MEDIA_EXTENSIONS = VIDEO_EXTENSIONS + AUDIO_EXTENSIONS
 
 PALETTE = {
     "window_bg": "#F5F5F7",
@@ -234,12 +236,17 @@ def format_seconds_compact(seconds: float) -> str:
     return f"{m:d}:{s:02d}"
 
 
-def list_videos(directory: str | Path) -> list[str]:
+def list_media_files(directory: str | Path) -> list[str]:
     base = Path(directory).expanduser()
     if not base.is_dir():
         return []
-    files = [p.name for p in base.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS]
+    files = [p.name for p in base.iterdir() if p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS]
     return sorted(files, key=str.lower)
+
+
+# Kept for compatibility with callers that imported the old helper name.
+def list_videos(directory: str | Path) -> list[str]:
+    return list_media_files(directory)
 
 
 def matching_subtitle_files(directory: str | Path, video_filename: str) -> list[str]:
@@ -824,7 +831,7 @@ def split_video_two_parts(input_video: Path, cut_seconds: float, output_dir: Pat
     ext = input_video.suffix
     out1 = output_dir / f"{base}.part1{ext}"
     out2 = output_dir / f"{base}.part2{ext}"
-    logger(f"> Splitting video into two parts at {format_seconds_compact(cut_seconds)}")
+    logger(f"> Splitting media into two parts at {format_seconds_compact(cut_seconds)}")
     run_cmd([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(input_video),
@@ -887,7 +894,7 @@ def split_video_windows(input_video: Path, duration_seconds: int, overlap_second
 class VideoSplitGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Video Splitter GUI (macOS)")
+        self.root.title("Video & MP3 Splitter GUI (macOS)")
         self.root.geometry("1220x860")
         self.root.minsize(1080, 760)
 
@@ -934,10 +941,10 @@ class VideoSplitGUI:
 
         header = ttk.Frame(main, padding=(18, 14), style="Header.TFrame")
         header.pack(fill="x")
-        ttk.Label(header, text="Video Splitter", style="HeaderTitle.TLabel").pack(anchor="w")
+        ttk.Label(header, text="Video & MP3 Splitter", style="HeaderTitle.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="Directory picker + video list + native SRT/ASS split + optional SRT-to-ASS conversion, built for your Mac workflow.",
+            text="Split video or MP3 files, with native SRT/ASS splitting and optional SRT-to-ASS conversion.",
             style="HeaderSubtitle.TLabel",
         ).pack(anchor="w", pady=(4, 0))
 
@@ -961,11 +968,11 @@ class VideoSplitGUI:
         ttk.Button(folder_card, text="Browse…", command=self.choose_output_dir).grid(row=1, column=2, padx=(8, 0), pady=6)
         ttk.Button(folder_card, text="Open output", command=self.open_output_dir).grid(row=1, column=3, padx=(8, 0), pady=6)
 
-        left_card = ttk.LabelFrame(body, text="Pick a video", padding=14, style="Card.TLabelframe")
+        left_card = ttk.LabelFrame(body, text="Pick a media file", padding=14, style="Card.TLabelframe")
         left_card.grid(row=1, column=0, rowspan=2, sticky="nsew", padx=(0, 6), pady=(12, 0))
         left_card.rowconfigure(1, weight=1)
         left_card.columnconfigure(0, weight=1)
-        ttk.Label(left_card, text="Videos in the selected folder:", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(left_card, text="Videos and MP3s in the selected folder:", style="Card.TLabel").grid(row=0, column=0, sticky="w")
 
         list_frame = ttk.Frame(left_card, style="Card.TFrame")
         list_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
@@ -994,7 +1001,7 @@ class VideoSplitGUI:
 
         ttk.Label(
             left_card,
-            text="When you change the selected video, subtitle choices update automatically.",
+            text="When you change the selected media file, subtitle choices update automatically.",
             style="Muted.Card.TLabel",
         ).grid(row=2, column=0, sticky="w", pady=(10, 0))
 
@@ -1222,23 +1229,23 @@ class VideoSplitGUI:
             self.output_dir_var.set(str(directory / "split_output"))
         elif not initial_load and Path(self.output_dir_var.get().strip()).expanduser() == Path(self.directory_var.get().strip()).expanduser() / "split_output":
             self.output_dir_var.set(str(directory / "split_output"))
-        videos = list_videos(directory)
-        self.video_paths = videos
+        media_files = list_media_files(directory)
+        self.video_paths = media_files
         self.video_listbox.delete(0, "end")
-        for name in videos:
+        for name in media_files:
             self.video_listbox.insert("end", name)
-        if videos:
+        if media_files:
             self.video_listbox.selection_set(0)
             self.video_listbox.activate(0)
             self.on_video_selected()
-            self.status_var.set(f"Loaded {len(videos)} video(s) from {directory}")
+            self.status_var.set(f"Loaded {len(media_files)} media file(s) from {directory}")
         else:
             self.subtitle_choices = []
             self.subtitle_a_combo["values"] = [""]
             self.subtitle_b_combo["values"] = [""]
             self.subtitle_a_var.set("")
             self.subtitle_b_var.set("")
-            self.status_var.set("No videos found in the selected folder.")
+            self.status_var.set("No supported videos or MP3 files found in the selected folder.")
         self.save_state()
 
     def selected_video_name(self) -> str:
@@ -1279,7 +1286,7 @@ class VideoSplitGUI:
             messagebox.showerror("Invalid folder", f"This folder does not exist:\n{directory}")
             return
         if not video_name:
-            messagebox.showwarning("No video selected", "Choose a video from the list first.")
+            messagebox.showwarning("No media selected", "Choose a video or MP3 file from the list first.")
             return
         if not output_dir:
             messagebox.showwarning("Missing output folder", "Choose an output folder first.")
@@ -1328,10 +1335,10 @@ class VideoSplitGUI:
         logger = self.queue_log
         try:
             logger("=" * 70)
-            logger(" Video Splitter GUI (macOS) ")
+            logger(" Video & MP3 Splitter GUI (macOS) ")
             logger("=" * 70)
             logger(f"Folder: {config['directory']}")
-            logger(f"Video:  {config['video_name']}")
+            logger(f"Media:  {config['video_name']}")
             logger(f"Output: {config['output_dir']}")
             logger("")
             ensure_ffmpeg(logger)
@@ -1340,7 +1347,7 @@ class VideoSplitGUI:
             output_dir = Path(config["output_dir"])
             input_video = directory / config["video_name"]
             if not input_video.is_file():
-                raise RuntimeError(f"Selected video not found: {input_video}")
+                raise RuntimeError(f"Selected media file not found: {input_video}")
 
             subtitle_paths: list[Path] = []
             if config["split_subs"]:
@@ -1367,7 +1374,7 @@ class VideoSplitGUI:
                 total_duration = ffprobe_duration_seconds(input_video)
                 if not (0 < cut_seconds < total_duration):
                     raise RuntimeError("Cut point must be greater than 0 and less than the video duration.")
-                self.queue_progress(None, "Splitting video into two parts...", indeterminate=True)
+                self.queue_progress(None, "Splitting media into two parts...", indeterminate=True)
                 video_part1, video_part2 = split_video_two_parts(input_video, cut_seconds, output_dir, logger)
                 segment1 = SegmentOutput(video_path=video_part1, subtitle_paths=[], ass_paths=[])
                 segment2 = SegmentOutput(video_path=video_part2, subtitle_paths=[], ass_paths=[])
@@ -1417,7 +1424,7 @@ class VideoSplitGUI:
                 overlap_seconds = int(config["overlap"] or "0")
                 preseek_seconds = int(config["preseek"] or "0")
                 accurate_copy = bool(subtitle_paths)
-                self.queue_progress(None, "Splitting video into windows...", indeterminate=True)
+                self.queue_progress(None, "Splitting media into windows...", indeterminate=True)
                 windows = split_video_windows(input_video, duration_seconds, overlap_seconds, preseek_seconds, output_dir, accurate_copy, logger)
                 for video_path, _start, _length in windows:
                     created_segments.append(SegmentOutput(video_path=video_path, subtitle_paths=[], ass_paths=[]))
@@ -1451,7 +1458,7 @@ class VideoSplitGUI:
 
             logger("")
             logger("Done.")
-            logger("Created video files:")
+            logger("Created media files:")
             for segment in created_segments:
                 logger(f"  {segment.video_path.name}")
             subtitle_count = sum(len(segment.subtitle_paths) for segment in created_segments)
@@ -1460,7 +1467,7 @@ class VideoSplitGUI:
             if ass_outputs:
                 logger(f"Created ASS files: {len(ass_outputs)}")
 
-            summary = f"Finished. Created {len(created_segments)} video file(s)"
+            summary = f"Finished. Created {len(created_segments)} media file(s)"
             if subtitle_count:
                 summary += f", {subtitle_count} subtitle file(s)"
             if ass_outputs:

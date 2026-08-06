@@ -24,16 +24,16 @@ osascript -e "set volume output volume 100"
 FILES=()
 while IFS= read -r -d '' DISCOVERED_FILE; do
   FILES+=( "$DISCOVERED_FILE" )
-done < <(find -s "$BASE_DIR" -type f -iname "*.mp4" -print0)
+done < <(find -s "$BASE_DIR" -type f \( -iname "*.mp4" -o -iname "*.mp3" \) -print0)
 
 if [ ${#FILES[@]} -eq 0 ]; then
-  echo "No MP4 files found in:"
+  echo "No MP4 or MP3 files found in:"
   echo "$BASE_DIR"
   read -k 1 "?Press any key to close..."
   exit 0
 fi
 
-echo "Playing ${#FILES[@]} MP4 file(s) in order..."
+echo "Playing ${#FILES[@]} MP4/MP3 file(s) in order..."
 echo
 
 "$VLC" \

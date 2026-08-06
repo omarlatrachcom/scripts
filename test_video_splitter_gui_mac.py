@@ -3,6 +3,8 @@ import unittest
 from pathlib import Path
 
 from video_splitter_gui_mac import (
+    list_media_files,
+    list_videos,
     matching_subtitle_files,
     split_ass_cut_file,
     split_ass_window_file,
@@ -26,6 +28,16 @@ Comment: 0,0:00:30.00,0:00:31.00,Fancy,,0,0,0,,outside\r
 
 
 class AssSubtitleSplitTests(unittest.TestCase):
+    def test_media_discovery_includes_mp3_and_supported_videos(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for name in ("track.MP3", "movie.mp4", "clip.mkv", "audio.wav", "notes.txt"):
+                (directory / name).touch()
+
+            expected = ["clip.mkv", "movie.mp4", "track.MP3"]
+            self.assertEqual(list_media_files(directory), expected)
+            self.assertEqual(list_videos(directory), expected)
+
     def test_window_split_preserves_formatting_and_clips_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "input.ass"
