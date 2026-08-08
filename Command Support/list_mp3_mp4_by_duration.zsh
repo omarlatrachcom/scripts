@@ -1,13 +1,31 @@
 #!/bin/zsh
 
-if [[ -n "${1:-}" && -d "$1" ]]; then
-  BASE_DIR="${1:A}"
-else
-  BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Shared implementation for the MP3/MP4 minimum-duration listing commands.
+
+MIN_SECONDS="${1:-}"
+MIN_DURATION_LABEL="${2:-}"
+REPORT_FILENAME="${3:-}"
+REQUESTED_DIR="${4:-}"
+
+if [[ ! "$MIN_SECONDS" =~ '^[0-9]+$' || "$MIN_SECONDS" -le 0 ||
+      -z "$MIN_DURATION_LABEL" || -z "$REPORT_FILENAME" ]]; then
+  echo "Usage: ${0:t} MIN_SECONDS DURATION_LABEL REPORT_FILENAME [FOLDER]"
+  exit 2
 fi
 
-MIN_SECONDS=$((30 * 60))
-REPORT="$BASE_DIR/mp3_30mn_or_longer.txt"
+if [[ -n "$REQUESTED_DIR" && -d "$REQUESTED_DIR" ]]; then
+  BASE_DIR="${REQUESTED_DIR:A}"
+else
+  BASE_DIR="${0:A:h}"
+fi
+
+REPORT="$BASE_DIR/$REPORT_FILENAME"
+
+pause_if_interactive() {
+  if [[ -t 0 ]]; then
+    read -k 1 "?Press any key to close..."
+  fi
+}
 
 format_duration() {
   local total=$1
@@ -15,7 +33,7 @@ format_duration() {
   local m=$(( (total % 3600) / 60 ))
   local s=$(( total % 60 ))
 
-  if [ "$h" -gt 0 ]; then
+  if (( h > 0 )); then
     printf "%dh %02dm %02ds" "$h" "$m" "$s"
   else
     printf "%dm %02ds" "$m" "$s"
@@ -49,25 +67,26 @@ get_duration() {
 FILES=()
 while IFS= read -r -d '' DISCOVERED_FILE; do
   FILES+=( "$DISCOVERED_FILE" )
-done < <(find -s "$BASE_DIR" -maxdepth 1 -type f -iname "*.mp3" -print0)
+done < <(
+  find -s "$BASE_DIR" -maxdepth 1 -type f \
+    \( -iname '*.mp3' -o -iname '*.mp4' \) -print0
+)
 
 # Keep the Terminal output visible and save the same listing as a text report.
 exec > >(tee "$REPORT")
 
-echo "MP3 files at least 30 minutes long in:"
+echo "MP3 and MP4 files at least $MIN_DURATION_LABEL long in:"
 echo "$BASE_DIR"
 echo "Generated: $(date)"
 echo
 
-if [ ${#FILES[@]} -eq 0 ]; then
-  echo "No MP3 files found."
+if (( ${#FILES[@]} == 0 )); then
+  echo "No MP3 or MP4 files found."
   echo
   echo "Report saved to:"
   echo "$REPORT"
   echo
-  if [[ -t 0 ]]; then
-    read -k 1 "?Press any key to close..."
-  fi
+  pause_if_interactive
   exit 0
 fi
 
@@ -77,9 +96,9 @@ UNREADABLE_COUNT=0
 for FILE in "${FILES[@]}"; do
   DURATION_RAW=$(get_duration "$FILE")
 
-  if [ $? -ne 0 ]; then
+  if (( $? != 0 )); then
     echo "Could not read duration  |  ${FILE:t}"
-    UNREADABLE_COUNT=$(( UNREADABLE_COUNT + 1 ))
+    (( UNREADABLE_COUNT++ ))
     continue
   fi
 
@@ -87,18 +106,18 @@ for FILE in "${FILES[@]}"; do
     'BEGIN { exit !(duration >= minimum) }'; then
     DURATION_SECONDS=$(awk -v duration="$DURATION_RAW" 'BEGIN { printf "%.0f", duration }')
     echo "$(format_duration "$DURATION_SECONDS")  |  ${FILE:t}"
-    MATCH_COUNT=$(( MATCH_COUNT + 1 ))
+    (( MATCH_COUNT++ ))
   fi
 done
 
-if [ "$MATCH_COUNT" -eq 0 ]; then
-  echo "No MP3 files are 30 minutes or longer."
+if (( MATCH_COUNT == 0 )); then
+  echo "No MP3 or MP4 files are $MIN_DURATION_LABEL or longer."
 fi
 
 echo
 echo "Matching files: $MATCH_COUNT"
-echo "MP3 files scanned: ${#FILES[@]}"
-if [ "$UNREADABLE_COUNT" -gt 0 ]; then
+echo "MP3/MP4 files scanned: ${#FILES[@]}"
+if (( UNREADABLE_COUNT > 0 )); then
   echo "Durations not readable: $UNREADABLE_COUNT"
 fi
 echo
@@ -106,6 +125,4 @@ echo "Report saved to:"
 echo "$REPORT"
 echo
 
-if [[ -t 0 ]]; then
-  read -k 1 "?Press any key to close..."
-fi
+pause_if_interactive
