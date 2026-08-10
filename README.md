@@ -72,6 +72,9 @@ What it does:
 - Creates media, subtitle, and resumable `.part` files with portable-safe names
   from the start, while preserving readable non-Latin scripts.
 - Supports playlist start/end ranges.
+- Offers a per-plan-item reverse-order checkbox for playlists; it is off by
+  default, unavailable for single-video rows, and renumbers the reversed list
+  from `01` in its new order.
 - Can use browser cookies from Firefox, Chrome, Chromium, Brave, Edge, or Safari.
 - Saves GUI state in:
   `~/Library/Application Support/SmartYTDownloader/gui_state.json`

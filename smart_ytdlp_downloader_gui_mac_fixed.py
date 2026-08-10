@@ -569,10 +569,21 @@ def portable_safe_title(title: str) -> str:
 class PortableSafeTitlePP(PostProcessor):
     """Expose a safe title to output templates before any files are created."""
 
+    def __init__(self, playlist_number_by_index: dict[int, int] | None = None) -> None:
+        super().__init__()
+        self.playlist_number_by_index = playlist_number_by_index or {}
+
     def run(self, info: dict) -> tuple[list[str], dict]:
         title = info.get("title")
         safe_title = portable_safe_title(str(title)) if title else ""
         info["portable_title"] = safe_title or "video"
+        playlist_index = info.get("playlist_index")
+        try:
+            playlist_index = int(playlist_index)
+        except (TypeError, ValueError):
+            playlist_index = None
+        if playlist_index in self.playlist_number_by_index:
+            info["reverse_playlist_index"] = self.playlist_number_by_index[playlist_index]
         return [], info
 
 
@@ -799,8 +810,13 @@ def reconcile_download_artifact_layout(
 
 def build_youtube_dl(ydl_opts: dict) -> YoutubeDL:
     """Build yt-dlp with safe-title metadata ready before filename creation."""
-    ydl = YoutubeDL(ydl_opts)
-    ydl.add_post_processor(PortableSafeTitlePP(), when="video")
+    actual_opts = dict(ydl_opts)
+    playlist_number_by_index = actual_opts.pop("_playlist_number_by_index", None)
+    ydl = YoutubeDL(actual_opts)
+    ydl.add_post_processor(
+        PortableSafeTitlePP(playlist_number_by_index=playlist_number_by_index),
+        when="video",
+    )
     return ydl
 
 
@@ -1540,7 +1556,18 @@ class DownloaderGUI:
         self.plan_rows_frame.columnconfigure(2, weight=3)
         self.plan_rows_frame.columnconfigure(3, weight=2)
         for heading_column, heading in enumerate(
-            ("#", "Type", "YouTube URL", "Output folder", "Subtitles", "Language", "Folder", "", "")
+            (
+                "#",
+                "Type",
+                "YouTube URL",
+                "Output folder",
+                "Subtitles",
+                "Language",
+                "Folder",
+                "Reverse",
+                "",
+                "",
+            )
         ):
             ttk.Label(
                 self.plan_rows_frame,
@@ -1739,6 +1766,9 @@ class DownloaderGUI:
                     )
                 )
             ),
+            "reverse_playlist_var": tk.BooleanVar(
+                value=bool(saved_job.get("reverse_playlist", False))
+            ),
             "widgets": [],
         }
         mode_var.trace_add("write", lambda *_args: self.apply_state_rules())
@@ -1755,6 +1785,7 @@ class DownloaderGUI:
             row["want_subs_var"].set(False)
             row["subs_lang_var"].set("en")
             row["wrap_in_folder_var"].set(False)
+            row["reverse_playlist_var"].set(False)
             return
         for widget in row["widgets"]:
             widget.destroy()
@@ -1799,6 +1830,11 @@ class DownloaderGUI:
                 variable=row["wrap_in_folder_var"],
                 style="Card.TCheckbutton",
             )
+            reverse_playlist_check = ttk.Checkbutton(
+                self.plan_rows_frame,
+                variable=row["reverse_playlist_var"],
+                style="Card.TCheckbutton",
+            )
             browse_button = AccessibleButton(
                 self.plan_rows_frame,
                 text="Browse…",
@@ -1821,6 +1857,7 @@ class DownloaderGUI:
                 subtitles_check,
                 subtitle_language_combo,
                 folder_check,
+                reverse_playlist_check,
                 browse_button,
                 remove_button,
             ]
@@ -1848,6 +1885,7 @@ class DownloaderGUI:
                 "want_subs": row["want_subs_var"].get(),
                 "subs_lang": row["subs_lang_var"].get(),
                 "wrap_in_folder": row["wrap_in_folder_var"].get(),
+                "reverse_playlist": row["reverse_playlist_var"].get(),
             }
             if include_blank or job["url"] or job["output_dir"]:
                 jobs.append(job)
@@ -1873,6 +1911,10 @@ class DownloaderGUI:
             row["widgets"][5].configure(
                 state="readonly" if row["want_subs_var"].get() else "disabled"
             )
+            is_playlist = JOB_MODE_VALUES.get(row["mode_var"].get()) == "playlist"
+            if not is_playlist:
+                row["reverse_playlist_var"].set(False)
+            row["widgets"][7].configure(state="normal" if is_playlist else "disabled")
 
     def choose_output_dir(self, row: dict) -> None:
         folder = filedialog.askdirectory(initialdir=row["output_var"].get() or str(Path.home()))
@@ -2308,6 +2350,9 @@ class DownloaderGUI:
                 return True, summary
 
             logger("> Playlist mode selected.")
+            reverse_playlist = bool(config.get("reverse_playlist", False))
+            if reverse_playlist:
+                logger("> Playlist order: last-to-first (reverse playlist order).")
             start_idx = parse_positive_int(config["start_idx"], "start index", logger)
             end_idx = parse_positive_int(config["end_idx"], "end index", logger)
             if start_idx and end_idx and end_idx < start_idx:
@@ -2315,29 +2360,56 @@ class DownloaderGUI:
                 start_idx, end_idx = end_idx, start_idx
 
             playlist_len = maybe_get_playlist_length(url, extractor_args, cookiesfrombrowser, logger)
+            visible_indices = get_playlist_indices(url, extractor_args, cookiesfrombrowser, logger)
+            if visible_indices is not None:
+                expected_indices = {
+                    index
+                    for index in visible_indices
+                    if (start_idx is None or index >= start_idx) and (end_idx is None or index <= end_idx)
+                }
+            else:
+                expected_indices = set()
+
             index_width = max(
                 2,
                 len(str(playlist_len)) if playlist_len is not None else 0,
                 existing_playlist_index_width(config["output_dir"]),
             )
-            index_pattern = f"%(playlist_index)0{index_width}d"
+            reverse_number_by_source_index = {
+                source_index: number
+                for number, source_index in enumerate(
+                    sorted(expected_indices, reverse=True),
+                    start=1,
+                )
+            }
+            if reverse_playlist and reverse_number_by_source_index:
+                index_field = "reverse_playlist_index"
+            elif reverse_playlist:
+                # When the up-front inventory is unavailable, yt-dlp's
+                # playlist_autonumber still counts the full reversed run from 1.
+                index_field = "playlist_autonumber"
+            else:
+                index_field = "playlist_index"
+            index_pattern = f"%({index_field})0{index_width}d"
             item_base = f"{index_pattern} - %(portable_title)s"
             item_prefix = f"{item_base}/" if config["wrap_in_folder"] else ""
 
             if media_type == "video":
                 outtmpl = f"{item_prefix}{item_base}.mp4"
-                pattern_desc = f"{index_pattern.replace('%(playlist_index)', 'N')} - <title>.mp4"
+                pattern_desc = f"<{index_width}-digit number> - <title>.mp4"
                 mode_label = "VIDEO"
             elif media_type == "audio":
                 outtmpl = f"{item_prefix}{item_base}.%(ext)s"
-                pattern_desc = f"{index_pattern.replace('%(playlist_index)', 'N')} - <title>.mp3"
+                pattern_desc = f"<{index_width}-digit number> - <title>.mp3"
                 mode_label = "AUDIO-ONLY ~192 kbps MP3"
             else:
                 outtmpl = f"{item_prefix}{item_base}.%(ext)s"
-                pattern_desc = f"{index_pattern.replace('%(playlist_index)', 'N')} - <title>.srt"
+                pattern_desc = f"<{index_width}-digit number> - <title>.srt"
                 mode_label = "SRT-ONLY"
 
             logger(f"> Playlist detected. Total items (approx): {playlist_len or 'unknown'}")
+            if reverse_playlist:
+                logger("> Reverse numbering: the last playlist item is numbered 1, then 2, and so on.")
             logger(f"> File naming pattern: {pattern_desc}")
             renamed_prefixes, rename_conflicts = normalize_playlist_index_width(
                 config["output_dir"],
@@ -2356,21 +2428,16 @@ class DownloaderGUI:
                 )
 
             ydl_opts = {**common_opts, "ignoreerrors": True, "noplaylist": False, "outtmpl": outtmpl}
+            if reverse_playlist:
+                ydl_opts["playlistreverse"] = True
+                if reverse_number_by_source_index:
+                    ydl_opts["_playlist_number_by_index"] = reverse_number_by_source_index
             if start_idx is not None:
                 ydl_opts["playliststart"] = start_idx
             if end_idx is not None:
                 ydl_opts["playlistend"] = end_idx
 
             cleanup_stats = SubtitleCleanupStats()
-            visible_indices = get_playlist_indices(url, extractor_args, cookiesfrombrowser, logger)
-            if visible_indices is not None:
-                expected_indices = {
-                    index
-                    for index in visible_indices
-                    if (start_idx is None or index >= start_idx) and (end_idx is None or index <= end_idx)
-                }
-            else:
-                expected_indices = set()
 
             if media_type == "video":
                 media_extensions = {"mp4"}
@@ -2379,22 +2446,34 @@ class DownloaderGUI:
             else:
                 media_extensions = set()
 
+            source_index_by_reverse_number = {
+                number: source_index
+                for source_index, number in reverse_number_by_source_index.items()
+            }
+
+            def completed_source_indices(extensions: set[str]) -> set[int]:
+                completed_numbers = completed_playlist_indices(
+                    config["output_dir"],
+                    extensions=extensions,
+                )
+                if not reverse_playlist:
+                    return completed_numbers
+                return {
+                    source_index_by_reverse_number[number]
+                    for number in completed_numbers
+                    if number in source_index_by_reverse_number
+                }
+
             def missing_media_indices() -> set[int]:
                 if not media_extensions:
                     return set()
-                completed = completed_playlist_indices(
-                    config["output_dir"],
-                    extensions=media_extensions,
-                )
+                completed = completed_source_indices(media_extensions)
                 return expected_indices - completed
 
             def missing_subtitle_indices() -> set[int]:
                 if not want_subs:
                     return set()
-                completed = completed_playlist_indices(
-                    config["output_dir"],
-                    extensions={"srt"},
-                )
+                completed = completed_source_indices({"srt"})
                 return expected_indices - completed
 
             result = 0
