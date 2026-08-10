@@ -8,29 +8,34 @@ Features:
    - Extract text with Apple's built-in Vision OCR.
    - Write token-safe .txt chunks into the same selected folder.
 
-2. PDF to TXT Chunker
+2. JPG to PDF
+   - Select a folder containing JPG/JPEG images.
+   - Combines every JPG/JPEG into one PDF in natural filename order.
+   - Saves the PDF into the selected folder without overwriting an existing file.
+
+3. PDF to TXT Chunker
    - Select a folder containing PDFs.
    - Handles all PDFs in alphabetical/natural filename order.
    - Extracts copyable PDF text directly, and falls back to OCR for scanned pages.
    - Writes token-safe .txt output files into the same selected folder.
    - Keeps each source PDF separate; output text files never mix multiple PDFs.
 
-3. PDF Splitter
+4. PDF Splitter
    - Select one PDF file from any local/cloud-mounted location, including Drive.
    - Add as many page ranges as needed with the + button.
    - Each part is saved into the same folder as the selected PDF.
 
-4. Word to PDF
+5. Word to PDF
    - Select one Word-format document.
    - Converts it to PDF beside the original document.
    - Uses LibreOffice headless conversion.
 
-5. EPUB to PDF
+6. EPUB to PDF
    - Select one EPUB document.
    - Converts it to PDF beside the original document.
    - Uses Calibre's ebook-convert for image/CSS/code-block preservation.
 
-6. TXT Cleaner
+7. TXT Cleaner
    - Select a folder containing TXT files.
    - Removes metadata lines containing configured markers.
    - Removes printed page numbers around generated page markers.
@@ -265,6 +270,7 @@ IMAGE_EXTENSIONS = {
     ".heif",
     ".webp",
 }
+JPG_EXTENSIONS = {".jpg", ".jpeg"}
 
 REQUIRED_MODULES = {
     "Vision": "pyobjc-framework-Vision",
@@ -344,6 +350,13 @@ class ProcessingResult:
 
 
 @dataclass(frozen=True)
+class JPGPDFResult:
+    source_folder: Path
+    output_pdf: Path
+    image_files: list[Path]
+
+
+@dataclass(frozen=True)
 class PDFPartRange:
     start_page: int
     end_page: int
@@ -398,6 +411,10 @@ class BookUtilsError(RuntimeError):
 
 class OCRChunkerError(BookUtilsError):
     """Raised for user-facing OCR chunker failures."""
+
+
+class JPGPDFConversionError(BookUtilsError):
+    """Raised for user-facing JPG to PDF conversion failures."""
 
 
 class PDFSplitterError(BookUtilsError):
@@ -499,6 +516,18 @@ def find_images(folder: Path) -> list[Path]:
             path
             for path in folder.iterdir()
             if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ],
+        key=natural_sort_key,
+    )
+
+
+def find_jpg_images(folder: Path) -> list[Path]:
+    """Return JPG/JPEG files in natural filename order."""
+    return sorted(
+        [
+            path
+            for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() in JPG_EXTENSIONS
         ],
         key=natural_sort_key,
     )
@@ -3805,6 +3834,89 @@ def sanitize_stem(stem: str) -> str:
     return cleaned or "split_pdf"
 
 
+def unique_jpg_pdf_output_path(folder: Path) -> Path:
+    """Return a non-existing PDF path inside an image folder."""
+    folder_name = folder.resolve().name.strip() or "images"
+
+    output_path = folder / f"{folder_name}.pdf"
+    if not output_path.exists():
+        return output_path
+
+    for counter in range(2, 10_000):
+        candidate = folder / f"{folder_name}_{counter}.pdf"
+        if not candidate.exists():
+            return candidate
+
+    raise JPGPDFConversionError(
+        f"Could not create a unique PDF output name in {folder}."
+    )
+
+
+def construct_pdf_from_jpgs(
+    folder: Path,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> JPGPDFResult:
+    """Combine all JPG/JPEG files in a folder into one naturally sorted PDF."""
+    if not folder.exists() or not folder.is_dir():
+        raise JPGPDFConversionError("Select a valid image folder first.")
+
+    image_files = find_jpg_images(folder)
+    if not image_files:
+        raise JPGPDFConversionError(
+            "The selected folder does not contain any JPG or JPEG images."
+        )
+
+    import fitz
+
+    output_path = unique_jpg_pdf_output_path(folder)
+    output_document = fitz.open()
+
+    try:
+        for index, image_path in enumerate(image_files, start=1):
+            if progress_callback:
+                progress_callback(
+                    f"Adding {image_path.name} ({index}/{len(image_files)})",
+                    index - 1,
+                    len(image_files),
+                )
+
+            try:
+                with fitz.open(str(image_path)) as image_document:
+                    image_pdf_bytes = image_document.convert_to_pdf()
+
+                with fitz.open("pdf", image_pdf_bytes) as image_pdf:
+                    output_document.insert_pdf(image_pdf)
+            except Exception as exc:
+                raise JPGPDFConversionError(
+                    f"Could not add {image_path.name} to the PDF: {exc}"
+                ) from exc
+
+        if output_document.page_count != len(image_files):
+            raise JPGPDFConversionError(
+                "The generated PDF page count does not match the number of JPG images."
+            )
+
+        output_document.set_metadata({"title": folder.name})
+        output_document.save(str(output_path), garbage=4, deflate=True)
+    except JPGPDFConversionError:
+        remove_partial_output(output_path)
+        raise
+    except Exception as exc:
+        remove_partial_output(output_path)
+        raise JPGPDFConversionError(f"Could not write the PDF: {exc}") from exc
+    finally:
+        output_document.close()
+
+    if progress_callback:
+        progress_callback("Done.", len(image_files), len(image_files))
+
+    return JPGPDFResult(
+        source_folder=folder,
+        output_pdf=output_path,
+        image_files=image_files,
+    )
+
+
 def unique_output_path(path: Path) -> Path:
     """Return a non-existing path by appending a counter when needed."""
     if not path.exists():
@@ -4307,6 +4419,7 @@ class BookUtilsApp:
         self.tk = tk
         self.ttk = ttk
         self.selected_folder: Path | None = None
+        self.selected_jpg_pdf_folder: Path | None = None
         self.selected_pdf_text_folder: Path | None = None
         self.selected_text_clean_folder: Path | None = None
         self.selected_pdf: Path | None = None
@@ -4324,6 +4437,7 @@ class BookUtilsApp:
 
         self.status_var = tk.StringVar(value="Choose an action.")
         self.folder_var = tk.StringVar(value="No image folder selected")
+        self.jpg_pdf_folder_var = tk.StringVar(value="No JPG folder selected")
         self.pdf_text_folder_var = tk.StringVar(value="No PDF folder selected")
         self.text_clean_folder_var = tk.StringVar(value="No TXT folder selected")
         self.pdf_var = tk.StringVar(value="No PDF selected")
@@ -4349,9 +4463,10 @@ class BookUtilsApp:
         description = self.ttk.Label(
             frame,
             text=(
-                "Convert JPG images or PDFs to ChatGPT-safe text chunks, clean TXT "
-                "metadata markers, split a selected PDF into page ranges, or convert "
-                "a Word/EPUB document to PDF beside the original file."
+                "Convert JPG images to a single PDF, convert JPG images or PDFs to "
+                "ChatGPT-safe text chunks, clean TXT metadata markers, split a "
+                "selected PDF into page ranges, or convert a Word/EPUB document to "
+                "PDF beside the original file."
             ),
             wraplength=700,
         )
@@ -4361,12 +4476,14 @@ class BookUtilsApp:
         notebook.pack(fill="both", expand=True, pady=(0, 12))
 
         ocr_tab = self.ttk.Frame(notebook, padding=12)
+        jpg_pdf_tab = self.ttk.Frame(notebook, padding=12)
         pdf_text_tab = self.ttk.Frame(notebook, padding=12)
         text_clean_tab = self.ttk.Frame(notebook, padding=12)
         pdf_tab = self.ttk.Frame(notebook, padding=12)
         word_pdf_tab = self.ttk.Frame(notebook, padding=12)
         epub_pdf_tab = self.ttk.Frame(notebook, padding=12)
         notebook.add(ocr_tab, text="JPG to TXT")
+        notebook.add(jpg_pdf_tab, text="JPG to PDF")
         notebook.add(pdf_text_tab, text="PDF to TXT")
         notebook.add(text_clean_tab, text="Clean TXT")
         notebook.add(pdf_tab, text="Split PDF")
@@ -4374,6 +4491,7 @@ class BookUtilsApp:
         notebook.add(epub_pdf_tab, text="EPUB to PDF")
 
         self._build_ocr_tab(ocr_tab)
+        self._build_jpg_pdf_tab(jpg_pdf_tab)
         self._build_pdf_text_tab(pdf_text_tab)
         self._build_text_clean_tab(text_clean_tab)
         self._build_pdf_tab(pdf_tab)
@@ -4449,6 +4567,52 @@ class BookUtilsApp:
             command=self.start_conversion,
         )
         self.convert_button.pack(anchor="w")
+
+    def _build_jpg_pdf_tab(self, parent) -> None:
+        description = self.ttk.Label(
+            parent,
+            text=(
+                "Choose a folder containing JPG/JPEG images. The app combines all "
+                "of them into one PDF in natural filename order (for example, "
+                "page2.jpg before page10.jpg) and saves it in that folder."
+            ),
+            wraplength=700,
+        )
+        description.pack(anchor="w", pady=(0, 14))
+
+        folder_row = self.ttk.Frame(parent)
+        folder_row.pack(fill="x", pady=(0, 12))
+
+        self.select_jpg_pdf_folder_button = self.ttk.Button(
+            folder_row,
+            text="Select Folder",
+            command=self.select_jpg_pdf_folder,
+        )
+        self.select_jpg_pdf_folder_button.pack(side="left")
+
+        folder_label = self.ttk.Label(
+            folder_row,
+            textvariable=self.jpg_pdf_folder_var,
+            wraplength=540,
+        )
+        folder_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
+
+        hint = self.ttk.Label(
+            parent,
+            text=(
+                "Only .jpg and .jpeg files are included. Existing PDFs are never "
+                "overwritten; a numbered output name is used when needed."
+            ),
+            wraplength=700,
+        )
+        hint.pack(anchor="w", pady=(0, 12))
+
+        self.jpg_pdf_button = self.ttk.Button(
+            parent,
+            text="Create PDF",
+            command=self.start_jpg_pdf_conversion,
+        )
+        self.jpg_pdf_button.pack(anchor="w")
 
     def _build_pdf_text_tab(self, parent) -> None:
         description = self.ttk.Label(
@@ -4869,6 +5033,21 @@ class BookUtilsApp:
         self.folder_var.set(str(self.selected_folder))
         self.status_var.set("Folder selected. Click JPG to TXT to start.")
 
+    def select_jpg_pdf_folder(self) -> None:
+        from tkinter import filedialog
+
+        folder_name = filedialog.askdirectory(
+            parent=self.root,
+            title="Select folder containing JPG images",
+        )
+
+        if not folder_name:
+            return
+
+        self.selected_jpg_pdf_folder = Path(folder_name)
+        self.jpg_pdf_folder_var.set(str(self.selected_jpg_pdf_folder))
+        self.status_var.set("JPG folder selected. Click Create PDF to start.")
+
     def select_pdf_text_folder(self) -> None:
         from tkinter import filedialog
 
@@ -5107,6 +5286,41 @@ class BookUtilsApp:
             return
 
         self.root.after(0, self._show_ocr_success, result)
+
+    def start_jpg_pdf_conversion(self) -> None:
+        from tkinter import messagebox
+
+        if self.is_running:
+            return
+
+        if self.selected_jpg_pdf_folder is None:
+            messagebox.showwarning(
+                title="No JPG folder selected",
+                message="Please click Select Folder first.",
+                parent=self.root,
+            )
+            return
+
+        self._set_running_state(True, "Starting JPG to PDF conversion...")
+
+        worker = threading.Thread(
+            target=self._run_jpg_pdf_worker,
+            args=(self.selected_jpg_pdf_folder,),
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_jpg_pdf_worker(self, folder: Path) -> None:
+        try:
+            result = construct_pdf_from_jpgs(
+                folder=folder,
+                progress_callback=self._thread_safe_progress,
+            )
+        except Exception as exc:
+            self.root.after(0, self._show_error, exc)
+            return
+
+        self.root.after(0, self._show_jpg_pdf_success, result)
 
     def start_pdf_text_extraction(self) -> None:
         from tkinter import messagebox
@@ -5365,6 +5579,21 @@ class BookUtilsApp:
             parent=self.root,
         )
 
+    def _show_jpg_pdf_success(self, result: JPGPDFResult) -> None:
+        from tkinter import messagebox
+
+        self._update_progress("Done.", 1, 1)
+        self._set_running_state(False)
+
+        messagebox.showinfo(
+            title="Done",
+            message=(
+                f"Created a PDF with {len(result.image_files)} page(s).\n\n"
+                f"Saved as:\n{result.output_pdf}"
+            ),
+            parent=self.root,
+        )
+
     def _show_pdf_text_success(self, result: PDFTextResult) -> None:
         from tkinter import messagebox
 
@@ -5482,6 +5711,8 @@ class BookUtilsApp:
 
         self.select_folder_button.configure(state=state)
         self.convert_button.configure(state=state)
+        self.select_jpg_pdf_folder_button.configure(state=state)
+        self.jpg_pdf_button.configure(state=state)
         self.select_pdf_text_folder_button.configure(state=state)
         self.pdf_text_button.configure(state=state)
         self.select_text_clean_folder_button.configure(state=state)

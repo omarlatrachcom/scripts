@@ -1,8 +1,83 @@
+import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
 
 import book_utils
+
+
+class JPGPDFConversionTests(unittest.TestCase):
+    def test_find_jpg_images_uses_natural_order_and_ignores_other_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            for name in ("page10.jpg", "page2.JPEG", "page1.jpg", "page3.png"):
+                (folder / name).write_bytes(b"placeholder")
+
+            image_names = [path.name for path in book_utils.find_jpg_images(folder)]
+
+            self.assertEqual(
+                image_names,
+                ["page1.jpg", "page2.JPEG", "page10.jpg"],
+            )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("fitz") is not None,
+        "PyMuPDF is required for JPG-to-PDF integration testing",
+    )
+    def test_construct_pdf_from_jpgs_creates_pages_in_natural_order(self) -> None:
+        import fitz
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir) / "scanned_book"
+            folder.mkdir()
+            colors_by_name = {
+                "page10.jpg": (255, 0, 0),
+                "page2.jpeg": (0, 255, 0),
+                "page1.jpg": (0, 0, 255),
+            }
+            for name, color in colors_by_name.items():
+                Image.new("RGB", (80, 60), color).save(folder / name, quality=100)
+            Image.new("RGB", (80, 60), "white").save(folder / "ignored.png")
+
+            result = book_utils.construct_pdf_from_jpgs(folder)
+
+            self.assertEqual(result.output_pdf, folder / "scanned_book.pdf")
+            self.assertEqual(
+                [path.name for path in result.image_files],
+                ["page1.jpg", "page2.jpeg", "page10.jpg"],
+            )
+            with fitz.open(result.output_pdf) as document:
+                self.assertEqual(document.page_count, 3)
+                center_colors = []
+                for page in document:
+                    pixmap = page.get_pixmap(matrix=fitz.Matrix(0.1, 0.1))
+                    center_index = (
+                        (pixmap.height // 2) * pixmap.width + (pixmap.width // 2)
+                    ) * pixmap.n
+                    center_colors.append(tuple(pixmap.samples[center_index:center_index + 3]))
+
+            self.assertGreater(center_colors[0][2], 240)
+            self.assertGreater(center_colors[1][1], 240)
+            self.assertGreater(center_colors[2][0], 240)
+
+    def test_construct_pdf_from_jpgs_rejects_empty_folder_before_importing_fitz(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(
+                book_utils.JPGPDFConversionError,
+                "does not contain any JPG",
+            ):
+                book_utils.construct_pdf_from_jpgs(Path(temp_dir))
+
+    def test_unique_jpg_pdf_output_path_does_not_overwrite_existing_pdf(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir) / "My Scans"
+            folder.mkdir()
+            (folder / "My Scans.pdf").write_bytes(b"existing")
+
+            output_path = book_utils.unique_jpg_pdf_output_path(folder)
+
+            self.assertEqual(output_path, folder / "My Scans_2.pdf")
 
 
 class TextCleanerPageNumberTests(unittest.TestCase):
