@@ -1,4 +1,6 @@
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -7,7 +9,6 @@ from article_extractor_gui import (
     Comment,
     ExtractedArticle,
     ExtractionError,
-    FiqhIslamOnlineAdapter,
     InfoQPodcastAdapter,
     IslamOnlineBooksAdapter,
     IslamOnlineShariaAdapter,
@@ -21,7 +22,10 @@ from article_extractor_gui import (
     infer_website_name,
     export_article,
     html_to_blocks,
+    permanently_remove_website_source,
+    remove_managed_website_sections,
     split_blocks,
+    website_sections_to_remove,
 )
 
 
@@ -195,6 +199,85 @@ class WebsiteSelectionTests(unittest.TestCase):
         with self.assertRaises(ExtractionError):
             website.validate_url("https://unrelated.substack.com/p/example")
 
+
+class WebsiteRemovalTests(unittest.TestCase):
+    def test_exact_managed_sections_are_removed_without_touching_shared_text(self):
+        source = """before
+# BEGIN WEBSITE CODE: example-adapter
+website only
+# END WEBSITE CODE: example-adapter
+after
+"""
+        self.assertEqual(
+            remove_managed_website_sections(source, {"example-adapter"}),
+            "before\nafter\n",
+        )
+        with self.assertRaisesRegex(ExtractionError, "missing or ambiguous"):
+            remove_managed_website_sections(source, {"unknown"})
+        with self.assertRaisesRegex(ExtractionError, "missing or ambiguous"):
+            remove_managed_website_sections(source + source, {"example-adapter"})
+
+    def test_shared_islamonline_parser_is_removed_only_with_final_consumer(self):
+        books = WEBSITE_EXTRACTORS_BY_KEY["islamonline-books"]
+        sharia = WEBSITE_EXTRACTORS_BY_KEY["islamonline-sharia"]
+        first_sections = website_sections_to_remove(books, [books, sharia])
+        self.assertNotIn("islamonline-shared-parser", first_sections)
+        final_sections = website_sections_to_remove(sharia, [sharia])
+        self.assertIn("islamonline-shared-parser", final_sections)
+
+    def test_every_profile_can_be_removed_sequentially_and_source_still_compiles(self):
+        source_path = Path(__file__).with_name("article_extractor_gui.py")
+        source = source_path.read_text(encoding="utf-8")
+        installed = list(WEBSITE_EXTRACTORS)
+        for website in tuple(installed):
+            sections = website_sections_to_remove(website, installed)
+            source = remove_managed_website_sections(source, sections)
+            installed = [item for item in installed if item.key != website.key]
+            module_name = "removal_test_" + website.key.replace("-", "_")
+            module = types.ModuleType(module_name)
+            module.__file__ = str(source_path)
+            sys.modules[module_name] = module
+            try:
+                exec(compile(source, str(source_path), "exec"), module.__dict__)
+            finally:
+                sys.modules.pop(module_name, None)
+            self.assertEqual(
+                sorted(module.WEBSITE_EXTRACTORS_BY_KEY),
+                sorted(item.key for item in installed),
+            )
+        self.assertNotIn("# BEGIN WEBSITE CODE: profile-", source)
+
+    def test_permanent_removal_replaces_an_editable_source_atomically(self):
+        website = WEBSITE_EXTRACTORS_BY_KEY["infoq-podcasts"]
+        source = """value = 1
+# BEGIN WEBSITE CODE: infoq-podcasts-parser
+parser_value = 2
+# END WEBSITE CODE: infoq-podcasts-parser
+# BEGIN WEBSITE CODE: infoq-podcasts-adapter
+adapter_value = 3
+# END WEBSITE CODE: infoq-podcasts-adapter
+# BEGIN WEBSITE CODE: profile-infoq-podcasts
+profile_value = 4
+# END WEBSITE CODE: profile-infoq-podcasts
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "editable.py"
+            path.write_text(source, encoding="utf-8")
+            path.chmod(0o755)
+            removed = permanently_remove_website_source(website, [website], path)
+            updated = path.read_text(encoding="utf-8")
+            self.assertEqual(
+                removed,
+                {
+                    "infoq-podcasts-parser",
+                    "infoq-podcasts-adapter",
+                    "profile-infoq-podcasts",
+                },
+            )
+            self.assertEqual(updated, "value = 1\n")
+            self.assertTrue(path.stat().st_mode & 0o100)
+            self.assertFalse(path.with_name(".editable.py.website-removal.tmp").exists())
+
     def test_islamonline_books_is_an_explicit_article_only_profile(self):
         website = WEBSITE_EXTRACTORS_BY_KEY["islamonline-books"]
         self.assertEqual(website.display_name, "islamonline.net/category/books")
@@ -212,15 +295,6 @@ class WebsiteSelectionTests(unittest.TestCase):
         self.assertIsInstance(website.make_adapter(), IslamOnlineShariaAdapter)
         with self.assertRaises(ExtractionError):
             website.validate_url("https://example.com/post")
-
-    def test_islamonline_fiqh_is_bound_to_its_separate_host(self):
-        website = WEBSITE_EXTRACTORS_BY_KEY["islamonline-fiqh"]
-        self.assertEqual(website.display_name, "إسلام أون لاين")
-        self.assertEqual(website.allowed_hosts, ("fiqh.islamonline.net",))
-        self.assertFalse(website.extracts_comments)
-        self.assertIsInstance(website.make_adapter(), FiqhIslamOnlineAdapter)
-        with self.assertRaises(ExtractionError):
-            website.validate_url("https://islamonline.net/article/")
 
     def test_infoq_podcasts_is_a_separate_explicit_profile(self):
         website = WEBSITE_EXTRACTORS_BY_KEY["infoq-podcasts"]
@@ -381,64 +455,6 @@ class IslamOnlineShariaTests(unittest.TestCase):
             with self.assertRaisesRegex(ExtractionError, "Sharia category"):
                 IslamOnlineShariaAdapter().extract(
                     "https://islamonline.net/book/", lambda _message: None
-                )
-
-
-class FiqhIslamOnlineTests(unittest.TestCase):
-    def test_adapter_ignores_site_logo_and_numbers_only_body_media(self):
-        page = """
-        <html><head>
-          <link rel="canonical" href="https://fiqh.islamonline.net/example/" />
-          <meta property="og:image" content="https://cdn.example/site-logo.png" />
-          <meta property="article:published_time" content="2026-07-31T12:55:48+03:00" />
-        </head><body>
-          <h1 itemprop="headline name">مسألة فقهية</h1>
-          <article id="article" itemprop="articleBody">
-            <p>مقدمة المسألة.</p>
-            <figure><img src="https://cdn.example/body-image.jpg" alt="توضيح"></figure>
-            <h2>التفصيل</h2>
-            <ul><li>الحكم الأول</li><li>الحكم الثاني</li></ul>
-            <table><tr><td>بيانات</td></tr></table>
-            <blockquote><p>نص مقتبس.</p></blockquote>
-          </article>
-        </body></html>
-        """
-        with patch("article_extractor_gui.fetch_text", return_value=page):
-            article = FiqhIslamOnlineAdapter().extract(
-                "https://fiqh.islamonline.net/example/", lambda _message: None
-            )
-
-        self.assertEqual(article.title, "مسألة فقهية")
-        self.assertEqual(article.author, "")
-        self.assertEqual(article.comments, [])
-        self.assertEqual(
-            article.blocks,
-            [
-                "مقدمة المسألة.",
-                "IMAGE-01",
-                "## التفصيل",
-                "- الحكم الأول",
-                "- الحكم الثاني",
-                "IMAGE-02",
-                "> نص مقتبس.",
-            ],
-        )
-        self.assertEqual(
-            [(item.placeholder, item.kind, item.source) for item in article.media],
-            [
-                ("IMAGE-01", "image", "https://cdn.example/body-image.jpg"),
-                ("IMAGE-02", "table", ""),
-            ],
-        )
-        self.assertNotIn("site-logo.png", str(article.media))
-
-    def test_adapter_rejects_pages_without_canonical_article_body(self):
-        page = "<html><body><main><h1>Category</h1></main></body></html>"
-        with patch("article_extractor_gui.fetch_text", return_value=page):
-            with self.assertRaisesRegex(ExtractionError, "no recognizable article body"):
-                FiqhIslamOnlineAdapter().extract(
-                    "https://fiqh.islamonline.net/category/example/",
-                    lambda _message: None,
                 )
 
 

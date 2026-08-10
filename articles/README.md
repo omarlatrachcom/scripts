@@ -15,12 +15,24 @@ Current website menu:
 - **islamonline.net/category/sharia:** complete public Sharia-category articles
   from `islamonline.net`. This is a separate article-only extractor and creates
   no comments file.
-- **إسلام أون لاين:** complete public articles from the separate
-  `fiqh.islamonline.net` publication. It exports article text only and does not
-  treat the publication's generic social-sharing logo as article media.
 - **InfoQ:** complete public podcast articles from `infoq.com`, including the
   introduction, key takeaways, direct podcast audio, and full transcript. It
   does not extract comments.
+
+## Deleting a website extractor
+
+Select a website on the first screen and use the red **Delete website** button
+beside **Open selected website extractor**. After an explicit warning and
+confirmation, the application atomically edits `article_extractor_gui.py` and
+physically removes that website's profile and dedicated adapter code. Code still
+used by another installed website is retained; shared IslamOnline parsing code,
+for example, is removed only after its final dependent website is deleted.
+
+Existing extraction folders and their media are never touched. Website deletion
+cannot be undone inside the GUI. Restore the script from GitHub or reinstall it
+to bring a deleted extractor back. The operation requires the Python source file
+to be writable and validates that the remaining program still compiles before
+replacing it.
 
 Each future source with a distinct article or comment system gets its own small
 adapter. Adding one does not require another GUI or changes to the output and
@@ -173,15 +185,6 @@ IslamOnline Sharia article-only example:
 python3 article_extractor_gui.py \
   --website "islamonline-sharia" \
   --url "https://islamonline.net/%d9%81%d8%ac%d8%a3%d8%a9-%d9%86%d9%82%d9%85%d8%a9-%d8%a7%d9%84%d9%84%d9%87-%d8%b9%d8%b2-%d9%88%d8%ac%d9%84/" \
-  --output "$HOME/Downloads"
-```
-
-IslamOnline Fiqh article-only example:
-
-```bash
-python3 article_extractor_gui.py \
-  --website "islamonline-fiqh" \
-  --url "https://fiqh.islamonline.net/%d8%a5%d8%b9%d8%b7%d8%a7%d8%a1-%d8%a7%d9%84%d9%81%d9%82%d9%8a%d8%b1-%d9%85%d9%86-%d8%a7%d9%84%d8%b2%d9%83%d8%a7%d8%a9-%d9%84%d9%84%d8%b2%d9%88%d8%a7%d8%ac/" \
   --output "$HOME/Downloads"
 ```
 

@@ -19,7 +19,6 @@ import tkinter as tk
 import urllib.error
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from html.parser import HTMLParser
@@ -55,6 +54,10 @@ class ExtractionError(RuntimeError):
 
 class OversizedBlockError(ExtractionError):
     """A source paragraph cannot fit without violating paragraph boundaries."""
+
+
+class WebsiteRemovalError(ExtractionError):
+    """A website's managed source sections could not be removed safely."""
 
 
 @dataclass
@@ -318,6 +321,7 @@ def html_to_blocks(
     return parser.blocks, parser.media
 
 
+# BEGIN WEBSITE CODE: ana-toledo-support
 @dataclass
 class _CommentBuilder:
     author: str
@@ -530,6 +534,7 @@ class SubstackRichTextConverter:
             document.get("content") if document.get("type") == "doc" else [document]
         )
         return blocks, self.media
+# END WEBSITE CODE: ana-toledo-support
 
 
 class GenericPageParser(HTMLParser):
@@ -609,6 +614,7 @@ class GenericPageParser(HTMLParser):
         return "".join(self._fragment)
 
 
+# BEGIN WEBSITE CODE: islamonline-shared-parser
 class IslamOnlinePageParser(HTMLParser):
     """Capture IslamOnline metadata and only its canonical article-body element."""
 
@@ -740,12 +746,17 @@ class IslamOnlinePageParser(HTMLParser):
     @property
     def body_html(self) -> str:
         return "".join(self._body_parts)
+# END WEBSITE CODE: islamonline-shared-parser
 
 
+# BEGIN WEBSITE CODE: infoq-podcasts-parser
 class InfoQPodcastPageParser(HTMLParser):
     """Capture InfoQ's editorial podcast sections without surrounding page UI."""
 
-    VOID_TAGS = IslamOnlinePageParser.VOID_TAGS
+    VOID_TAGS = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "source", "track", "wbr",
+    }
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -855,6 +866,7 @@ class InfoQPodcastPageParser(HTMLParser):
             if item.get("@type") in {"NewsArticle", "Article", "PodcastEpisode"}:
                 return item
         return {}
+# END WEBSITE CODE: infoq-podcasts-parser
 
 
 def fetch_text(url: str, timeout: int = 40) -> str:
@@ -1004,6 +1016,7 @@ class ArticleAdapter(Protocol):
     def extract(self, url: str, progress: Callable[[str], None]) -> ExtractedArticle: ...
 
 
+# BEGIN WEBSITE CODE: ana-toledo-adapter
 class SubstackAdapter:
     name = "Substack"
 
@@ -1154,6 +1167,7 @@ class SubstackAdapter:
             media=media,
             adapter_name=self.name,
         )
+# END WEBSITE CODE: ana-toledo-adapter
 
 
 class GenericArticleAdapter:
@@ -1191,6 +1205,7 @@ class GenericArticleAdapter:
         )
 
 
+# BEGIN WEBSITE CODE: islamonline-books-adapter
 class IslamOnlineBooksAdapter:
     name = "IslamOnline Books"
 
@@ -1252,8 +1267,10 @@ class IslamOnlineBooksAdapter:
             media=media,
             adapter_name=self.name,
         )
+# END WEBSITE CODE: islamonline-books-adapter
 
 
+# BEGIN WEBSITE CODE: islamonline-sharia-adapter
 class IslamOnlineShariaAdapter:
     """Dedicated article-only adapter for IslamOnline's Sharia category."""
 
@@ -1317,56 +1334,12 @@ class IslamOnlineShariaAdapter:
             media=media,
             adapter_name=self.name,
         )
+# END WEBSITE CODE: islamonline-sharia-adapter
 
 
-class FiqhIslamOnlineAdapter:
-    """Article-only adapter for the separate fiqh.islamonline.net publication."""
-
-    name = "IslamOnline Fiqh"
-
-    @classmethod
-    def matches(cls, url: str) -> bool:
-        host = (urllib.parse.urlparse(url).hostname or "").lower()
-        return host == "fiqh.islamonline.net"
-
-    def extract(self, url: str, progress: Callable[[str], None]) -> ExtractedArticle:
-        progress("Downloading the IslamOnline Fiqh article page…")
-        page = fetch_text(url)
-        parser = IslamOnlinePageParser()
-        parser.feed(page)
-        parser.close()
-        if not parser.body_html:
-            raise ExtractionError(
-                "IslamOnline Fiqh returned no recognizable article body. Make sure the URL "
-                "points to a public article rather than the homepage, category, or search page."
-            )
-
-        # This publication advertises a generic site logo through og:image even
-        # when no cover is rendered. Only media actually present in articleBody
-        # belongs in the article's reading order.
-        blocks, media = html_to_blocks(parser.body_html)
-        if not blocks:
-            raise ExtractionError(
-                "The IslamOnline Fiqh article contained no readable public content."
-            )
-
-        title = parser.title or "IslamOnline Fiqh article"
-        parsed_url = urllib.parse.urlparse(parser.canonical or url)
-        decoded_slug = urllib.parse.unquote(Path(parsed_url.path.rstrip("/")).name)
-        return ExtractedArticle(
-            title=title,
-            subtitle="",
-            author=parser.author,
-            published=parser.published,
-            canonical_url=parser.canonical or url,
-            slug=decoded_slug or title,
-            blocks=blocks,
-            comments=[],
-            media=media,
-            adapter_name=self.name,
-        )
 
 
+# BEGIN WEBSITE CODE: infoq-podcasts-adapter
 INFOQ_PODCAST_FEED = (
     "https://feeds.soundcloud.com/users/soundcloud:users:215740450/sounds.rss"
 )
@@ -1374,13 +1347,15 @@ INFOQ_PODCAST_FEED = (
 
 def _infoq_direct_audio_url(player_url: str, feed_xml: str) -> str:
     """Resolve an InfoQ SoundCloud player track to its public MP3 enclosure."""
+    import xml.etree.ElementTree as element_tree
+
     match = re.search(r"api\.soundcloud\.com/tracks/(\d+)", player_url)
     if not match:
         return ""
     track_id = match.group(1)
     try:
-        root = ET.fromstring(feed_xml)
-    except ET.ParseError:
+        root = element_tree.fromstring(feed_xml)
+    except element_tree.ParseError:
         return ""
     for item in root.iter("item"):
         guid = item.findtext("guid") or ""
@@ -1489,6 +1464,7 @@ class InfoQPodcastAdapter:
             media=media,
             adapter_name=self.name,
         )
+# END WEBSITE CODE: infoq-podcasts-adapter
 
 
 @dataclass(frozen=True)
@@ -1503,6 +1479,8 @@ class WebsiteExtractorDefinition:
     allowed_hosts: tuple[str, ...]
     adapter_type: type
     extracts_comments: bool = False
+    removable_sections: tuple[str, ...] = ()
+    shared_sections: tuple[str, ...] = ()
 
     def validate_url(self, url: str) -> str:
         cleaned = url.strip()
@@ -1524,6 +1502,7 @@ class WebsiteExtractorDefinition:
 # This is the website menu shown before any extractor opens. Future sources get
 # their own entry and adapter here; the GUI never guesses from a pasted URL.
 WEBSITE_EXTRACTORS: tuple[WebsiteExtractorDefinition, ...] = (
+    # BEGIN WEBSITE CODE: profile-ana-toledo
     WebsiteExtractorDefinition(
         key="ana-toledo",
         display_name="Ana Toledo — Mira!",
@@ -1533,7 +1512,10 @@ WEBSITE_EXTRACTORS: tuple[WebsiteExtractorDefinition, ...] = (
         allowed_hosts=("anatoledo.substack.com",),
         adapter_type=SubstackAdapter,
         extracts_comments=True,
+        removable_sections=("ana-toledo-support", "ana-toledo-adapter"),
     ),
+    # END WEBSITE CODE: profile-ana-toledo
+    # BEGIN WEBSITE CODE: profile-islamonline-books
     WebsiteExtractorDefinition(
         key="islamonline-books",
         display_name="islamonline.net/category/books",
@@ -1549,7 +1531,11 @@ WEBSITE_EXTRACTORS: tuple[WebsiteExtractorDefinition, ...] = (
         ),
         allowed_hosts=("islamonline.net", "www.islamonline.net"),
         adapter_type=IslamOnlineBooksAdapter,
+        removable_sections=("islamonline-books-adapter",),
+        shared_sections=("islamonline-shared-parser",),
     ),
+    # END WEBSITE CODE: profile-islamonline-books
+    # BEGIN WEBSITE CODE: profile-islamonline-sharia
     WebsiteExtractorDefinition(
         key="islamonline-sharia",
         display_name="islamonline.net/category/sharia",
@@ -1564,23 +1550,11 @@ WEBSITE_EXTRACTORS: tuple[WebsiteExtractorDefinition, ...] = (
         ),
         allowed_hosts=("islamonline.net", "www.islamonline.net"),
         adapter_type=IslamOnlineShariaAdapter,
+        removable_sections=("islamonline-sharia-adapter",),
+        shared_sections=("islamonline-shared-parser",),
     ),
-    WebsiteExtractorDefinition(
-        key="islamonline-fiqh",
-        display_name="إسلام أون لاين",
-        homepage="https://fiqh.islamonline.net/",
-        description=(
-            "Extract public articles from the separate IslamOnline Fiqh publication. "
-            "Comments are not extracted."
-        ),
-        example_url=(
-            "https://fiqh.islamonline.net/%d8%a5%d8%b9%d8%b7%d8%a7%d8%a1-"
-            "%d8%a7%d9%84%d9%81%d9%82%d9%8a%d8%b1-%d9%85%d9%86-%d8%a7%d9%84%d8%b2%d9%83%d8%a7%d8%a9-"
-            "%d9%84%d9%84%d8%b2%d9%88%d8%a7%d8%ac/"
-        ),
-        allowed_hosts=("fiqh.islamonline.net",),
-        adapter_type=FiqhIslamOnlineAdapter,
-    ),
+    # END WEBSITE CODE: profile-islamonline-sharia
+    # BEGIN WEBSITE CODE: profile-infoq-podcasts
     WebsiteExtractorDefinition(
         key="infoq-podcasts",
         display_name="InfoQ",
@@ -1592,10 +1566,89 @@ WEBSITE_EXTRACTORS: tuple[WebsiteExtractorDefinition, ...] = (
         example_url="https://www.infoq.com/podcasts/strands-agents/",
         allowed_hosts=("www.infoq.com", "infoq.com"),
         adapter_type=InfoQPodcastAdapter,
+        removable_sections=("infoq-podcasts-parser", "infoq-podcasts-adapter"),
     ),
+    # END WEBSITE CODE: profile-infoq-podcasts
 )
 
 WEBSITE_EXTRACTORS_BY_KEY = {item.key: item for item in WEBSITE_EXTRACTORS}
+
+WEBSITE_CODE_MARKER_PREFIX = "WEBSITE CODE:"
+
+
+def remove_managed_website_sections(source: str, section_names: Iterable[str]) -> str:
+    """Remove exact managed sections, refusing ambiguous or missing boundaries."""
+    updated = source
+    for section_name in sorted(set(section_names)):
+        start = f"# BEGIN {WEBSITE_CODE_MARKER_PREFIX} {section_name}"
+        end = f"# END {WEBSITE_CODE_MARKER_PREFIX} {section_name}"
+        pattern = re.compile(
+            rf"(?m)^[ \t]*{re.escape(start)}[ \t]*\n"
+            rf".*?"
+            rf"^[ \t]*{re.escape(end)}[ \t]*(?:\n|$)",
+            re.DOTALL,
+        )
+        matches = tuple(pattern.finditer(updated))
+        if len(matches) != 1:
+            raise WebsiteRemovalError(
+                f"The managed source section {section_name!r} was missing or ambiguous. "
+                "No website code was removed."
+            )
+        updated = pattern.sub("", updated, count=1)
+    return updated
+
+
+def website_sections_to_remove(
+    website: WebsiteExtractorDefinition,
+    installed_websites: Iterable[WebsiteExtractorDefinition],
+) -> set[str]:
+    """Include shared code only when the selected website is its final consumer."""
+    installed = tuple(installed_websites)
+    sections = set(website.removable_sections)
+    sections.add(f"profile-{website.key}")
+    for shared_section in website.shared_sections:
+        used_elsewhere = any(
+            candidate.key != website.key
+            and shared_section in candidate.shared_sections
+            for candidate in installed
+        )
+        if not used_elsewhere:
+            sections.add(shared_section)
+    return sections
+
+
+def permanently_remove_website_source(
+    website: WebsiteExtractorDefinition,
+    installed_websites: Iterable[WebsiteExtractorDefinition],
+    source_path: Path | None = None,
+) -> set[str]:
+    """Atomically remove one profile and its now-unneeded adapter source code."""
+    path = (source_path or Path(__file__)).resolve()
+    if path.suffix != ".py" or not path.is_file():
+        raise WebsiteRemovalError(
+            "The application is not running from an editable Python source file."
+        )
+    sections = website_sections_to_remove(website, installed_websites)
+    temporary: Path | None = None
+    try:
+        original = path.read_text(encoding="utf-8")
+        updated = remove_managed_website_sections(original, sections)
+        compile(updated, str(path), "exec")
+        original_mode = path.stat().st_mode
+        temporary = path.with_name(f".{path.name}.website-removal.tmp")
+        temporary.write_text(updated, encoding="utf-8")
+        temporary.chmod(original_mode)
+        temporary.replace(path)
+    except WebsiteRemovalError:
+        raise
+    except (OSError, SyntaxError) as exc:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise WebsiteRemovalError(f"Website code could not be removed safely: {exc}") from exc
+    return sections
 
 
 def build_website_extension_prompt(
@@ -2044,6 +2097,140 @@ def extract_to_folder(
     return article, output_dir, files
 
 
+class DangerButton(tk.Canvas):
+    """A consistently red button on macOS, where Aqua ignores Tk button colors."""
+
+    NORMAL_COLOR = "#c62828"
+    HOVER_COLOR = "#a61f1f"
+    PRESSED_COLOR = "#7f1717"
+    DISABLED_COLOR = "#d7aaa8"
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        text: str,
+        command: Callable[[], None],
+        state: str = "normal",
+    ) -> None:
+        frame_background = ttk.Style(parent).lookup("TFrame", "background") or "#f0f0f0"
+        super().__init__(
+            parent,
+            width=148,
+            height=30,
+            background=frame_background,
+            borderwidth=0,
+            highlightthickness=0,
+            takefocus=1,
+            cursor="arrow" if state == "disabled" else "hand2",
+        )
+        self._text = text
+        self._command = command
+        self._state = state
+        self._hovered = False
+        self._pressed = False
+        self.bind("<Configure>", self._redraw)
+        self.bind("<Enter>", self._enter)
+        self.bind("<Leave>", self._leave)
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Key-space>", self._keyboard_activate)
+        self.bind("<Key-Return>", self._keyboard_activate)
+        self.bind("<FocusIn>", self._redraw)
+        self.bind("<FocusOut>", self._redraw)
+        self._redraw()
+
+    def _fill_color(self) -> str:
+        if self._state == "disabled":
+            return self.DISABLED_COLOR
+        if self._pressed:
+            return self.PRESSED_COLOR
+        if self._hovered:
+            return self.HOVER_COLOR
+        return self.NORMAL_COLOR
+
+    def _redraw(self, _event: object = None) -> None:
+        self.delete("all")
+        width = max(2, self.winfo_width() - 1)
+        height = max(2, self.winfo_height() - 1)
+        outline = "#7f1717" if self.focus_get() is self else self._fill_color()
+        self.create_rectangle(
+            1,
+            1,
+            width,
+            height,
+            fill=self._fill_color(),
+            outline=outline,
+            width=2 if self.focus_get() is self else 1,
+            tags=("surface",),
+        )
+        self.create_text(
+            width / 2,
+            height / 2,
+            text=self._text,
+            fill="white",
+            font=("TkDefaultFont", 12, "bold"),
+            tags=("label",),
+        )
+
+    def _enter(self, _event: object) -> None:
+        self._hovered = True
+        self._redraw()
+
+    def _leave(self, _event: object) -> None:
+        self._hovered = False
+        self._pressed = False
+        self._redraw()
+
+    def _press(self, _event: object) -> None:
+        if self._state == "normal":
+            self.focus_set()
+            self._pressed = True
+            self._redraw()
+
+    def _release(self, event: tk.Event) -> None:
+        should_activate = (
+            self._state == "normal"
+            and self._pressed
+            and 0 <= event.x < self.winfo_width()
+            and 0 <= event.y < self.winfo_height()
+        )
+        self._pressed = False
+        self._redraw()
+        if should_activate:
+            self._command()
+
+    def _keyboard_activate(self, _event: object) -> str:
+        if self._state == "normal":
+            self._command()
+        return "break"
+
+    def configure(self, cnf: dict[str, object] | None = None, **kwargs: object) -> object:
+        options = dict(cnf or {})
+        options.update(kwargs)
+        if "state" in options:
+            state = str(options.pop("state"))
+            if state not in {"normal", "disabled"}:
+                raise tk.TclError(f"bad state {state!r}: must be normal or disabled")
+            self._state = state
+            options["cursor"] = "arrow" if state == "disabled" else "hand2"
+        if "text" in options:
+            self._text = str(options.pop("text"))
+        result = super().configure(options) if options else None
+        self._redraw()
+        return result
+
+    config = configure
+
+    def cget(self, key: str) -> object:
+        if key == "state":
+            return self._state
+        if key == "text":
+            return self._text
+        if key == "background":
+            return self._fill_color()
+        return super().cget(key)
+
+
 class ExtractorGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -2077,6 +2264,7 @@ class ExtractorGUI:
         self._draft_save_job: str | None = None
         self._prompt_results: queue.Queue[tuple[str, bool, str]] = queue.Queue()
         self._busy = False
+        self._removed_website_keys: set[str] = set()
         self.active_website: WebsiteExtractorDefinition | None = None
         self.frame: ttk.Frame | None = None
         for variable in (
@@ -2165,19 +2353,32 @@ class ExtractorGUI:
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 12))
 
         ttk.Label(frame, text="Website").grid(row=2, column=0, sticky="w", padx=(0, 10))
-        names = [website.display_name for website in WEBSITE_EXTRACTORS]
+        installed_websites = self._installed_websites()
+        names = [website.display_name for website in installed_websites]
         self.website_combo = ttk.Combobox(
-            frame, textvariable=self.website_var, values=names, state="readonly"
+            frame,
+            textvariable=self.website_var,
+            values=names,
+            state="readonly" if names else "disabled",
         )
         self.website_combo.grid(row=2, column=1, sticky="ew")
         self.website_combo.bind("<<ComboboxSelected>>", self._website_selected)
+        website_actions = ttk.Frame(frame)
+        website_actions.grid(row=2, column=2, padx=(8, 0), sticky="e")
         self.open_extractor_button = ttk.Button(
-            frame,
+            website_actions,
             text="Open selected website extractor",
             command=self._open_selected_extractor,
             state="disabled",
         )
-        self.open_extractor_button.grid(row=2, column=2, padx=(8, 0))
+        self.open_extractor_button.grid(row=0, column=0)
+        self.delete_website_button = DangerButton(
+            website_actions,
+            text="Delete website",
+            command=self._delete_selected_website,
+            state="disabled",
+        )
+        self.delete_website_button.grid(row=0, column=1, padx=(8, 0))
         self.website_description = ttk.Label(frame, text="", wraplength=700)
         self.website_description.grid(
             row=3, column=0, columnspan=3, sticky="nw", pady=(16, 0)
@@ -2195,6 +2396,10 @@ class ExtractorGUI:
             text="Generate prompt to add a website",
             command=self._build_prompt_generator,
         ).grid(row=6, column=0, columnspan=3, sticky="ew")
+        if not names:
+            self.website_description.configure(
+                text="No website extractors remain. Restore the script from GitHub to reinstall them."
+            )
         self.website_combo.focus_set()
 
     def _build_prompt_generator(self) -> None:
@@ -2360,25 +2565,39 @@ class ExtractorGUI:
         self.root.update_idletasks()
         self.prompt_status_var.set("Prompt copied to the clipboard.")
 
-    def _website_selected(self, _event: object = None) -> None:
-        selected_name = self.website_var.get()
-        website = next(
-            (item for item in WEBSITE_EXTRACTORS if item.display_name == selected_name), None
+    def _installed_websites(self) -> tuple[WebsiteExtractorDefinition, ...]:
+        return tuple(
+            website
+            for website in WEBSITE_EXTRACTORS
+            if website.key not in self._removed_website_keys
         )
+
+    def _selected_website(self) -> WebsiteExtractorDefinition | None:
+        selected_name = self.website_var.get()
+        return next(
+            (
+                website
+                for website in self._installed_websites()
+                if website.display_name == selected_name
+            ),
+            None,
+        )
+
+    def _website_selected(self, _event: object = None) -> None:
+        website = self._selected_website()
         if website is None:
             self.open_extractor_button.configure(state="disabled")
+            self.delete_website_button.configure(state="disabled")
             self.website_description.configure(text="")
             return
         self.open_extractor_button.configure(state="normal")
+        self.delete_website_button.configure(state="normal")
         self.website_description.configure(
             text=f"{website.description}\nWebsite: {website.homepage}"
         )
 
     def _open_selected_extractor(self) -> None:
-        selected_name = self.website_var.get()
-        website = next(
-            (item for item in WEBSITE_EXTRACTORS if item.display_name == selected_name), None
-        )
+        website = self._selected_website()
         if website is None:
             messagebox.showerror(APP_NAME, "Select a website first.", parent=self.root)
             return
@@ -2386,6 +2605,43 @@ class ExtractorGUI:
         self.url_var.set("")
         self.status_var.set("Ready")
         self._build_extractor(website)
+
+    def _delete_selected_website(self) -> None:
+        website = self._selected_website()
+        if website is None:
+            messagebox.showerror(APP_NAME, "Select a website first.", parent=self.root)
+            return
+        confirmed = messagebox.askyesno(
+            "Permanently delete website",
+            (
+                f"Permanently delete {website.display_name!r} and its dedicated extractor code?\n\n"
+                "This edits article_extractor_gui.py itself. Code shared with other installed "
+                "websites is preserved. Existing extraction folders are not deleted.\n\n"
+                "The website can only be restored by reinstalling the script or restoring it "
+                "from GitHub."
+            ),
+            icon="warning",
+            default="no",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+        installed = self._installed_websites()
+        try:
+            permanently_remove_website_source(website, installed)
+        except WebsiteRemovalError as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self.root)
+            return
+        self._removed_website_keys.add(website.key)
+        self._build_website_selector()
+        messagebox.showinfo(
+            APP_NAME,
+            (
+                f"{website.display_name} and its dedicated extractor code were deleted.\n\n"
+                "Existing extraction folders were left untouched."
+            ),
+            parent=self.root,
+        )
 
     def _build_extractor(self, website: WebsiteExtractorDefinition) -> None:
         self.root.title(f"{website.display_name} Extractor")
