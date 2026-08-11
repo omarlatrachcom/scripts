@@ -869,6 +869,195 @@ class InfoQPodcastPageParser(HTMLParser):
 # END WEBSITE CODE: infoq-podcasts-parser
 
 
+# BEGIN WEBSITE CODE: infoq-articles-parser
+class InfoQArticleStructuredTextParser(StructuredTextParser):
+    """Use the shared converter with InfoQ-specific media URL handling."""
+
+    VISUAL_TAGS = StructuredTextParser.VISUAL_TAGS | {"object"}
+    EMBED_CLASS_PARTS = StructuredTextParser.EMBED_CLASS_PARTS | {
+        "carousel", "gallery", "interactive",
+    }
+
+    def __init__(self, base_url: str, first_media_number: int = 1) -> None:
+        super().__init__(first_media_number)
+        self.base_url = base_url
+
+    def _add_media(self, kind: str, attrs: dict[str, str | None]) -> None:
+        normalized = dict(attrs)
+        source = (
+            attrs.get("src")
+            or attrs.get("data-src")
+            or attrs.get("data-url")
+            or attrs.get("href")
+            or attrs.get("poster")
+            or ""
+        )
+        if source:
+            normalized["src"] = urllib.parse.urljoin(self.base_url, source)
+        super()._add_media(kind, normalized)
+
+
+def infoq_article_html_to_blocks(
+    fragment: str, base_url: str, first_media_number: int = 1
+) -> tuple[list[str], list[MediaReference]]:
+    parser = InfoQArticleStructuredTextParser(base_url, first_media_number)
+    parser.feed(fragment)
+    parser.close()
+    return parser.blocks, parser.media
+
+
+class InfoQArticlePageParser(HTMLParser):
+    """Capture InfoQ's public article data without page chrome or recommendations."""
+
+    VOID_TAGS = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "source", "track", "wbr",
+    }
+    NON_ARTICLE_CLASSES = {"author-section-full", "related__vc"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.canonical = ""
+        self.is_article = False
+        self.has_audio_player = False
+        self.audio_url = ""
+        self.content_fragments: list[str] = []
+        self.structured_data: list[object] = []
+        self._depth = 0
+        self._article_depth = 0
+        self._capture_depth = 0
+        self._capture_parts: list[str] = []
+        self._capture_skip_depth = 0
+        self._audio_depth = 0
+        self._json_ld_depth = 0
+        self._json_parts: list[str] = []
+
+    @staticmethod
+    def _is_skipped_content(attrs: dict[str, str | None]) -> bool:
+        classes = _class_tokens(attrs)
+        return bool(classes & InfoQArticlePageParser.NON_ARTICLE_CLASSES)
+
+    def _capture_metadata(self, tag: str, attrs: dict[str, str | None]) -> None:
+        if tag == "link" and "canonical" in (attrs.get("rel") or "").lower().split():
+            self.canonical = attrs.get("href") or ""
+        if tag == "script" and (attrs.get("type") or "").lower() == "application/ld+json":
+            self._json_ld_depth = self._depth
+            self._json_parts.clear()
+
+    def _capture_audio(self, tag: str, attrs: dict[str, str | None]) -> None:
+        if not self._article_depth:
+            return
+        if tag == "audio" and attrs.get("id") == "audio-player":
+            self.has_audio_player = True
+            self._audio_depth = self._depth
+            self.audio_url = attrs.get("src") or self.audio_url
+        elif self._audio_depth and tag == "source" and not self.audio_url:
+            self.audio_url = attrs.get("src") or ""
+
+    def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attrs = dict(attrs_list)
+        if tag not in self.VOID_TAGS:
+            self._depth += 1
+        self._capture_metadata(tag, attrs)
+
+        if (
+            not self._article_depth
+            and tag == "article"
+            and attrs.get("data-type") == "article"
+        ):
+            self.is_article = True
+            self._article_depth = self._depth
+            return
+
+        self._capture_audio(tag, attrs)
+        if self._capture_depth:
+            if self._capture_skip_depth:
+                return
+            if self._is_skipped_content(attrs):
+                self._capture_skip_depth = self._depth
+                return
+            raw = self.get_starttag_text()
+            if raw:
+                self._capture_parts.append(raw)
+            return
+
+        if (
+            self._article_depth
+            and tag == "div"
+            and "article__data" in _class_tokens(attrs)
+        ):
+            self._capture_depth = self._depth
+            self._capture_parts.clear()
+
+    def handle_startendtag(
+        self, tag: str, attrs_list: list[tuple[str, str | None]]
+    ) -> None:
+        tag = tag.lower()
+        attrs = dict(attrs_list)
+        self._capture_metadata(tag, attrs)
+        self._capture_audio(tag, attrs)
+        if self._capture_depth and not self._capture_skip_depth:
+            raw = self.get_starttag_text()
+            if raw:
+                self._capture_parts.append(raw)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag == "script" and self._json_ld_depth:
+            try:
+                self.structured_data.append(json.loads("".join(self._json_parts)))
+            except (TypeError, ValueError):
+                pass
+            self._json_ld_depth = 0
+            self._json_parts.clear()
+
+        if self._capture_depth:
+            if self._capture_skip_depth:
+                if self._depth == self._capture_skip_depth:
+                    self._capture_skip_depth = 0
+            elif self._depth == self._capture_depth and tag == "div":
+                self.content_fragments.append("".join(self._capture_parts))
+                self._capture_parts.clear()
+                self._capture_depth = 0
+            else:
+                self._capture_parts.append(f"</{tag}>")
+
+        if self._article_depth and self._depth == self._article_depth and tag == "article":
+            self._article_depth = 0
+        if self._audio_depth and self._depth == self._audio_depth and tag == "audio":
+            self._audio_depth = 0
+        if tag not in self.VOID_TAGS:
+            self._depth = max(0, self._depth - 1)
+
+    def handle_data(self, data: str) -> None:
+        if self._json_ld_depth:
+            self._json_parts.append(data)
+        if self._capture_depth and not self._capture_skip_depth:
+            self._capture_parts.append(data)
+
+    @staticmethod
+    def _schema_items(value: object) -> Iterable[dict[str, object]]:
+        if isinstance(value, list):
+            for item in value:
+                yield from InfoQArticlePageParser._schema_items(item)
+        elif isinstance(value, dict):
+            graph = value.get("@graph")
+            if graph is not None:
+                yield from InfoQArticlePageParser._schema_items(graph)
+            yield value
+
+    def article_schema(self) -> dict[str, object]:
+        for document in self.structured_data:
+            for item in self._schema_items(document):
+                schema_type = item.get("@type")
+                types = schema_type if isinstance(schema_type, list) else [schema_type]
+                if any(kind in {"Article", "NewsArticle"} for kind in types):
+                    return item
+        return {}
+# END WEBSITE CODE: infoq-articles-parser
+
+
 def fetch_text(url: str, timeout: int = 40) -> str:
     request = urllib.request.Request(
         url,
@@ -1270,71 +1459,6 @@ class IslamOnlineBooksAdapter:
 # END WEBSITE CODE: islamonline-books-adapter
 
 
-# BEGIN WEBSITE CODE: islamonline-sharia-adapter
-class IslamOnlineShariaAdapter:
-    """Dedicated article-only adapter for IslamOnline's Sharia category."""
-
-    name = "IslamOnline Sharia"
-
-    @classmethod
-    def matches(cls, url: str) -> bool:
-        host = (urllib.parse.urlparse(url).hostname or "").lower()
-        return host in {"islamonline.net", "www.islamonline.net"}
-
-    def extract(self, url: str, progress: Callable[[str], None]) -> ExtractedArticle:
-        progress("Downloading the IslamOnline Sharia article page…")
-        page = fetch_text(url)
-        parser = IslamOnlinePageParser()
-        parser.feed(page)
-        parser.close()
-        if not parser.body_html:
-            raise ExtractionError(
-                "IslamOnline returned no recognizable article body. Make sure the URL points "
-                "to a public article rather than a category or search page."
-            )
-        if not parser.in_sharia_category:
-            raise ExtractionError(
-                "This IslamOnline extractor is configured for articles in the Sharia category."
-            )
-
-        media: list[MediaReference] = []
-        blocks: list[str] = []
-        next_media = 1
-        if parser.cover_image and parser.cover_image not in parser.body_html:
-            marker = f"IMAGE-{next_media:02d}"
-            media.append(
-                MediaReference(
-                    marker,
-                    "cover image",
-                    parser.cover_image,
-                    parser.cover_alt,
-                    "article cover",
-                )
-            )
-            blocks.append(marker)
-            next_media += 1
-        body_blocks, body_media = html_to_blocks(parser.body_html, next_media)
-        blocks.extend(body_blocks)
-        media.extend(body_media)
-        if not blocks:
-            raise ExtractionError("The IslamOnline article contained no readable public content.")
-
-        title = parser.title or "IslamOnline Sharia article"
-        parsed_url = urllib.parse.urlparse(parser.canonical or url)
-        decoded_slug = urllib.parse.unquote(Path(parsed_url.path.rstrip("/")).name)
-        return ExtractedArticle(
-            title=title,
-            subtitle="",
-            author=parser.author or "إسلام أون لاين",
-            published=parser.published,
-            canonical_url=parser.canonical or url,
-            slug=decoded_slug or title,
-            blocks=blocks,
-            comments=[],
-            media=media,
-            adapter_name=self.name,
-        )
-# END WEBSITE CODE: islamonline-sharia-adapter
 
 
 
@@ -1467,6 +1591,83 @@ class InfoQPodcastAdapter:
 # END WEBSITE CODE: infoq-podcasts-adapter
 
 
+# BEGIN WEBSITE CODE: infoq-articles-adapter
+class InfoQArticleAdapter:
+    """Dedicated article-only adapter for InfoQ's public /articles/ pages."""
+
+    name = "InfoQ Articles"
+
+    @classmethod
+    def matches(cls, url: str) -> bool:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+        return host in {"infoq.com", "www.infoq.com"}
+
+    @staticmethod
+    def _schema_people(value: object) -> list[str]:
+        values = value if isinstance(value, list) else [value]
+        names: list[str] = []
+        for item in values:
+            if isinstance(item, dict):
+                name = _clean_inline(str(item.get("name") or ""))
+                if name:
+                    names.append(name)
+        return names
+
+    def extract(self, url: str, progress: Callable[[str], None]) -> ExtractedArticle:
+        progress("Downloading the InfoQ article page…")
+        page = fetch_text(url)
+        parser = InfoQArticlePageParser()
+        parser.feed(page)
+        parser.close()
+        schema = parser.article_schema()
+        title = _clean_inline(str(schema.get("headline") or ""))
+        if not parser.is_article or not title or not parser.content_fragments:
+            raise ExtractionError(
+                "InfoQ returned no recognizable public article. Make sure the URL points "
+                "to an individual /articles/ page rather than a podcast, news item, or index."
+            )
+
+        canonical = parser.canonical or url
+        blocks: list[str] = []
+        media: list[MediaReference] = []
+        if parser.has_audio_player:
+            marker = "IMAGE-01"
+            audio_url = (
+                urllib.parse.urljoin(canonical, parser.audio_url)
+                if parser.audio_url
+                else ""
+            )
+            blocks.append(marker)
+            media.append(
+                MediaReference(marker, "audio player", audio_url, title, "article audio")
+            )
+
+        for fragment in parser.content_fragments:
+            fragment_blocks, fragment_media = infoq_article_html_to_blocks(
+                fragment, canonical, len(media) + 1
+            )
+            blocks.extend(fragment_blocks)
+            media.extend(fragment_media)
+        if not blocks:
+            raise ExtractionError("The InfoQ article contained no readable public content.")
+
+        parsed_url = urllib.parse.urlparse(canonical)
+        slug = Path(parsed_url.path.rstrip("/")).name or title
+        return ExtractedArticle(
+            title=title,
+            subtitle="",
+            author=", ".join(self._schema_people(schema.get("author"))),
+            published=_clean_inline(str(schema.get("datePublished") or "")),
+            canonical_url=canonical,
+            slug=slug,
+            blocks=blocks,
+            comments=[],
+            media=media,
+            adapter_name=self.name,
+        )
+# END WEBSITE CODE: infoq-articles-adapter
+
+
 @dataclass(frozen=True)
 class WebsiteExtractorDefinition:
     """One user-selectable website and the adapter that powers its extractor."""
@@ -1535,25 +1736,6 @@ WEBSITE_EXTRACTORS: tuple[WebsiteExtractorDefinition, ...] = (
         shared_sections=("islamonline-shared-parser",),
     ),
     # END WEBSITE CODE: profile-islamonline-books
-    # BEGIN WEBSITE CODE: profile-islamonline-sharia
-    WebsiteExtractorDefinition(
-        key="islamonline-sharia",
-        display_name="islamonline.net/category/sharia",
-        homepage="https://islamonline.net/category/sharia/",
-        description=(
-            "Extract public IslamOnline Sharia articles as structured article text. "
-            "Comments are not extracted."
-        ),
-        example_url=(
-            "https://islamonline.net/%d9%81%d8%ac%d8%a3%d8%a9-%d9%86%d9%82%d9%85%d8%a9-"
-            "%d8%a7%d9%84%d9%84%d9%87-%d8%b9%d8%b2-%d9%88%d8%ac%d9%84/"
-        ),
-        allowed_hosts=("islamonline.net", "www.islamonline.net"),
-        adapter_type=IslamOnlineShariaAdapter,
-        removable_sections=("islamonline-sharia-adapter",),
-        shared_sections=("islamonline-shared-parser",),
-    ),
-    # END WEBSITE CODE: profile-islamonline-sharia
     # BEGIN WEBSITE CODE: profile-infoq-podcasts
     WebsiteExtractorDefinition(
         key="infoq-podcasts",
@@ -1569,6 +1751,23 @@ WEBSITE_EXTRACTORS: tuple[WebsiteExtractorDefinition, ...] = (
         removable_sections=("infoq-podcasts-parser", "infoq-podcasts-adapter"),
     ),
     # END WEBSITE CODE: profile-infoq-podcasts
+    # BEGIN WEBSITE CODE: profile-infoq-articles
+    WebsiteExtractorDefinition(
+        key="infoq-articles",
+        display_name="InfoQ Articles",
+        homepage="https://www.infoq.com/articles/",
+        description=(
+            "Extract complete public InfoQ articles with ordered placeholders for audio, "
+            "images, diagrams, tables, and other non-linear content. Comments are not extracted."
+        ),
+        example_url=(
+            "https://www.infoq.com/articles/system-comprehension-evolutionary-architecture/"
+        ),
+        allowed_hosts=("www.infoq.com", "infoq.com"),
+        adapter_type=InfoQArticleAdapter,
+        removable_sections=("infoq-articles-parser", "infoq-articles-adapter"),
+    ),
+    # END WEBSITE CODE: profile-infoq-articles
 )
 
 WEBSITE_EXTRACTORS_BY_KEY = {item.key: item for item in WEBSITE_EXTRACTORS}

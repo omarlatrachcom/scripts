@@ -9,9 +9,9 @@ from article_extractor_gui import (
     Comment,
     ExtractedArticle,
     ExtractionError,
+    InfoQArticleAdapter,
     InfoQPodcastAdapter,
     IslamOnlineBooksAdapter,
-    IslamOnlineShariaAdapter,
     MediaReference,
     SubstackCommentsParser,
     SubstackAdapter,
@@ -217,12 +217,9 @@ after
         with self.assertRaisesRegex(ExtractionError, "missing or ambiguous"):
             remove_managed_website_sections(source + source, {"example-adapter"})
 
-    def test_shared_islamonline_parser_is_removed_only_with_final_consumer(self):
+    def test_shared_islamonline_parser_is_removed_with_its_final_consumer(self):
         books = WEBSITE_EXTRACTORS_BY_KEY["islamonline-books"]
-        sharia = WEBSITE_EXTRACTORS_BY_KEY["islamonline-sharia"]
-        first_sections = website_sections_to_remove(books, [books, sharia])
-        self.assertNotIn("islamonline-shared-parser", first_sections)
-        final_sections = website_sections_to_remove(sharia, [sharia])
+        final_sections = website_sections_to_remove(books, [books])
         self.assertIn("islamonline-shared-parser", final_sections)
 
     def test_every_profile_can_be_removed_sequentially_and_source_still_compiles(self):
@@ -288,14 +285,6 @@ profile_value = 4
         with self.assertRaises(ExtractionError):
             website.validate_url("https://example.com/post")
 
-    def test_islamonline_sharia_is_a_separate_explicit_profile(self):
-        website = WEBSITE_EXTRACTORS_BY_KEY["islamonline-sharia"]
-        self.assertEqual(website.display_name, "islamonline.net/category/sharia")
-        self.assertFalse(website.extracts_comments)
-        self.assertIsInstance(website.make_adapter(), IslamOnlineShariaAdapter)
-        with self.assertRaises(ExtractionError):
-            website.validate_url("https://example.com/post")
-
     def test_infoq_podcasts_is_a_separate_explicit_profile(self):
         website = WEBSITE_EXTRACTORS_BY_KEY["infoq-podcasts"]
         self.assertEqual(website.display_name, "InfoQ")
@@ -303,6 +292,18 @@ profile_value = 4
         self.assertIsInstance(website.make_adapter(), InfoQPodcastAdapter)
         with self.assertRaises(ExtractionError):
             website.validate_url("https://example.com/podcasts/episode/")
+
+    def test_infoq_articles_is_a_separate_explicit_article_only_profile(self):
+        website = WEBSITE_EXTRACTORS_BY_KEY["infoq-articles"]
+        self.assertEqual(website.display_name, "InfoQ Articles")
+        self.assertFalse(website.extracts_comments)
+        self.assertIsInstance(website.make_adapter(), InfoQArticleAdapter)
+        self.assertEqual(
+            website.validate_url("https://www.infoq.com/articles/example/"),
+            "https://www.infoq.com/articles/example/",
+        )
+        with self.assertRaises(ExtractionError):
+            website.validate_url("https://example.com/articles/example/")
 
 
 class IslamOnlineBooksTests(unittest.TestCase):
@@ -380,81 +381,6 @@ class IslamOnlineBooksTests(unittest.TestCase):
             with self.assertRaisesRegex(ExtractionError, "Books category"):
                 IslamOnlineBooksAdapter().extract(
                     "https://islamonline.net/other/", lambda _message: None
-                )
-
-
-class IslamOnlineShariaTests(unittest.TestCase):
-    def test_dedicated_adapter_uses_sharia_breadcrumb_and_shared_structure(self):
-        page = """
-        <html><head>
-          <link rel="canonical" href="https://islamonline.net/sharia-example/" />
-          <meta property="og:image" content="https://cdn.example/sharia-cover.jpg" />
-          <meta property="og:image:alt" content="صورة المقال" />
-          <meta property="article:published_time" content="2026-08-10T10:48:57+03:00" />
-        </head><body>
-          <nav id="main-menu">
-            <a href="https://islamonline.net/category/books/">كتب</a>
-          </nav>
-          <nav id="breadcrumb"><ol><li>
-            <a href="https://islamonline.net/category/sharia/">شريعة</a>
-          </li><li>
-            <a href="https://islamonline.net/category/sharia/taz/">تزكية</a>
-          </li></ol></nav>
-          <h1 itemprop="headline name">فجأة نقمة الله عز وجل</h1>
-          <span itemprop="author">كاتب المثال</span>
-          <picture id="postImg"><img src="https://cdn.example/sharia-cover.jpg"></picture>
-          <article id="article" itemprop="articleBody">
-            <p>الفقرة الأولى.</p>
-            <h2>عنوان فرعي</h2>
-            <ol><li>البند الأول</li><li>البند الثاني</li></ol>
-            <blockquote><p>نص مقتبس.</p></blockquote>
-            <div class="content-in-middle cards"><article>اقرأ أيضا</article></div>
-            <p>الفقرة الأخيرة.</p>
-          </article>
-        </body></html>
-        """
-        with patch("article_extractor_gui.fetch_text", return_value=page):
-            article = IslamOnlineShariaAdapter().extract(
-                "https://islamonline.net/sharia-example/", lambda _message: None
-            )
-
-        self.assertEqual(article.title, "فجأة نقمة الله عز وجل")
-        self.assertEqual(article.author, "كاتب المثال")
-        self.assertEqual(article.comments, [])
-        self.assertEqual(
-            article.blocks,
-            [
-                "IMAGE-01",
-                "الفقرة الأولى.",
-                "## عنوان فرعي",
-                "1. البند الأول",
-                "2. البند الثاني",
-                "> نص مقتبس.",
-                "IMAGE-02",
-                "الفقرة الأخيرة.",
-            ],
-        )
-        self.assertEqual(
-            [(item.placeholder, item.source) for item in article.media],
-            [
-                ("IMAGE-01", "https://cdn.example/sharia-cover.jpg"),
-                ("IMAGE-02", ""),
-            ],
-        )
-
-    def test_sharia_adapter_rejects_books_breadcrumb(self):
-        page = """
-        <html><body>
-        <nav id="main-menu"><a href="https://islamonline.net/category/sharia/">Sharia</a></nav>
-        <nav id="breadcrumb"><a href="https://islamonline.net/category/books/">Books</a></nav>
-        <h1 itemprop="headline name">Book</h1>
-        <article id="article" itemprop="articleBody"><p>Text.</p></article>
-        </body></html>
-        """
-        with patch("article_extractor_gui.fetch_text", return_value=page):
-            with self.assertRaisesRegex(ExtractionError, "Sharia category"):
-                IslamOnlineShariaAdapter().extract(
-                    "https://islamonline.net/book/", lambda _message: None
                 )
 
 
@@ -546,6 +472,106 @@ class InfoQPodcastTests(unittest.TestCase):
             with self.assertRaisesRegex(ExtractionError, "no recognizable public podcast"):
                 InfoQPodcastAdapter().extract(
                     "https://www.infoq.com/news/example/", lambda _message: None
+                )
+
+
+class InfoQArticleTests(unittest.TestCase):
+    def test_adapter_preserves_live_article_structure_and_nonlinear_order(self):
+        page = """
+        <html><head>
+          <link rel="canonical" href="https://www.infoq.com/articles/example/">
+          <script type="application/ld+json">
+          {
+            "@context": "https://schema.org",
+            "@type": "NewsArticle",
+            "headline": "Example InfoQ Article",
+            "datePublished": "2026-08-10T11:00:00+0000",
+            "author": [
+              {"@type": "Person", "name": "First Author"},
+              {"@type": "Person", "name": "Second Author"}
+            ]
+          }
+          </script>
+        </head><body>
+          <article data-type="article" class="article">
+            <div class="article__content">
+              <div class="article__actions">
+                <audio id="audio-player"><source src=""></audio>
+              </div>
+              <div class="article__data">
+                <div class="takeaways">
+                  <h3>Key Takeaways</h3>
+                  <ul><li>First takeaway.</li><li>Second takeaway.</li></ul>
+                </div>
+                <p>Opening paragraph.</p>
+                <h2>Main Section</h2>
+                <blockquote><p>A quotation.</p></blockquote>
+                <p><img data-src="/media/diagram.png" alt="Architecture diagram"></p>
+                <p>Diagram caption.</p>
+                <table><tr><td>Nonlinear table data</td></tr></table>
+                <iframe src="/embeds/demo"></iframe>
+                <div class="related__group related__vc"><h4>Related Sponsors</h4></div>
+                <p>Closing paragraph.</p>
+                <div class="author-section-full">
+                  <h2>About the Authors</h2><p>Frontend biography UI.</p>
+                </div>
+              </div>
+            </div>
+          </article>
+        </body></html>
+        """
+        with patch("article_extractor_gui.fetch_text", return_value=page):
+            article = InfoQArticleAdapter().extract(
+                "https://www.infoq.com/articles/example/", lambda _message: None
+            )
+
+        self.assertEqual(article.title, "Example InfoQ Article")
+        self.assertEqual(article.author, "First Author, Second Author")
+        self.assertEqual(article.published, "2026-08-10T11:00:00+0000")
+        self.assertEqual(article.canonical_url, "https://www.infoq.com/articles/example/")
+        self.assertEqual(article.comments, [])
+        self.assertEqual(
+            article.blocks,
+            [
+                "IMAGE-01",
+                "### Key Takeaways",
+                "- First takeaway.",
+                "- Second takeaway.",
+                "Opening paragraph.",
+                "## Main Section",
+                "> A quotation.",
+                "IMAGE-02",
+                "Diagram caption.",
+                "IMAGE-03",
+                "IMAGE-04",
+                "Closing paragraph.",
+            ],
+        )
+        self.assertEqual(
+            [(item.placeholder, item.kind, item.source) for item in article.media],
+            [
+                ("IMAGE-01", "audio player", ""),
+                ("IMAGE-02", "image", "https://www.infoq.com/media/diagram.png"),
+                ("IMAGE-03", "table", ""),
+                ("IMAGE-04", "iframe", "https://www.infoq.com/embeds/demo"),
+            ],
+        )
+        joined = "\n".join(article.blocks)
+        self.assertNotIn("Related Sponsors", joined)
+        self.assertNotIn("About the Authors", joined)
+
+    def test_adapter_rejects_non_article_infoq_pages(self):
+        page = """
+        <html><head><script type="application/ld+json">
+        {"@type":"NewsArticle","headline":"Podcast"}
+        </script></head><body>
+          <article data-type="podcast"><div class="article__data"><p>Audio.</p></div></article>
+        </body></html>
+        """
+        with patch("article_extractor_gui.fetch_text", return_value=page):
+            with self.assertRaisesRegex(ExtractionError, "no recognizable public article"):
+                InfoQArticleAdapter().extract(
+                    "https://www.infoq.com/podcasts/example/", lambda _message: None
                 )
 
 

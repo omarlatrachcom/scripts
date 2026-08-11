@@ -12,12 +12,12 @@ Current website menu:
 - **islamonline.net/category/books:** complete public book-category articles from
   `islamonline.net`. This dedicated extractor exports the article only; it does
   not create a comments file.
-- **islamonline.net/category/sharia:** complete public Sharia-category articles
-  from `islamonline.net`. This is a separate article-only extractor and creates
-  no comments file.
 - **InfoQ:** complete public podcast articles from `infoq.com`, including the
   introduction, key takeaways, direct podcast audio, and full transcript. It
   does not extract comments.
+- **InfoQ Articles:** complete public articles from `infoq.com/articles/`, with
+  article audio, images, diagrams, tables, embeds, and other non-linear elements
+  represented by ordered placeholders. It does not extract comments.
 
 ## Deleting a website extractor
 
@@ -25,8 +25,8 @@ Select a website on the first screen and use the red **Delete website** button
 beside **Open selected website extractor**. After an explicit warning and
 confirmation, the application atomically edits `article_extractor_gui.py` and
 physically removes that website's profile and dedicated adapter code. Code still
-used by another installed website is retained; shared IslamOnline parsing code,
-for example, is removed only after its final dependent website is deleted.
+used by another installed website is retained and is removed only after its
+final dependent website is deleted.
 
 Existing extraction folders and their media are never touched. Website deletion
 cannot be undone inside the GUI. Restore the script from GitHub or reinstall it
@@ -91,17 +91,21 @@ The app creates a new subfolder named from the article slug. Repeated extraction
 use `-2`, `-3`, and so on, so an earlier extraction is never overwritten.
 The initial output folder is `~/Downloads`.
 
-For **islamonline.net/category/books** or **islamonline.net/category/sharia**,
-use an individual article from the selected category. Their buttons read
-**Extract article**, and their exports contain no comments file.
-
-For **إسلام أون لاين**, use an individual article hosted specifically on
-`fiqh.islamonline.net`. This explicit choice does not accept main-site
-`islamonline.net` URLs and does not create comments files.
+For **islamonline.net/category/books**, use an individual article from the Books
+category. Its button reads **Extract article**, and its exports contain no
+comments file.
 
 For **InfoQ**, use an individual URL under `/podcasts/`. The extractor omits
 page controls and recommendations, preserves the editorial transcript, and
 uses InfoQ's public podcast feed to resolve a downloadable MP3 when available.
+
+For **InfoQ Articles**, use an individual URL under `/articles/`. The dedicated
+adapter reads the server-rendered public article body and its embedded
+`NewsArticle` metadata, preserves key takeaways and the full editorial text, and
+omits recommendation and author-profile UI. InfoQ's visible article-audio control
+is kept at its original position as an `IMAGE-XX` placeholder. If InfoQ does not
+expose a public audio source URL to a logged-out visitor, no source line is
+invented. This extractor creates no comments file.
 
 Enable **Download media files when a direct file is available** if image, audio,
 or video files should also be saved. It is off by default. Downloaded files go in
@@ -179,21 +183,21 @@ python3 article_extractor_gui.py \
   --output "$HOME/Downloads"
 ```
 
-IslamOnline Sharia article-only example:
-
-```bash
-python3 article_extractor_gui.py \
-  --website "islamonline-sharia" \
-  --url "https://islamonline.net/%d9%81%d8%ac%d8%a3%d8%a9-%d9%86%d9%82%d9%85%d8%a9-%d8%a7%d9%84%d9%84%d9%87-%d8%b9%d8%b2-%d9%88%d8%ac%d9%84/" \
-  --output "$HOME/Downloads"
-```
-
 InfoQ podcast article-only example:
 
 ```bash
 python3 article_extractor_gui.py \
   --website "infoq-podcasts" \
   --url "https://www.infoq.com/podcasts/strands-agents/" \
+  --output "$HOME/Downloads"
+```
+
+InfoQ article-only example:
+
+```bash
+python3 article_extractor_gui.py \
+  --website "infoq-articles" \
+  --url "https://www.infoq.com/articles/system-comprehension-evolutionary-architecture/" \
   --output "$HOME/Downloads"
 ```
 
