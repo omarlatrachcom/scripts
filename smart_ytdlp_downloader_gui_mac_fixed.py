@@ -820,7 +820,7 @@ def build_youtube_dl(ydl_opts: dict) -> YoutubeDL:
     return ydl
 
 
-def run_download(urls: list[str], ydl_opts: dict, *, retry_without_cookies: bool, logger) -> int:
+def _run_download(urls: list[str], ydl_opts: dict, *, retry_without_cookies: bool, logger) -> int:
     try:
         with build_youtube_dl(ydl_opts) as ydl:
             result = ydl.download(urls)
@@ -895,6 +895,14 @@ class SubtitleCleanupStats:
     scanned_files: int = 0
     adjusted_files: int = 0
     changed_cues: int = 0
+    failed_files: int = 0
+
+
+@dataclass
+class VttConversionStats:
+    scanned_files: int = 0
+    converted_files: int = 0
+    removed_redundant_files: int = 0
     failed_files: int = 0
 
 
@@ -1100,6 +1108,163 @@ def snapshot_srt_files(directory: str | Path) -> set[Path]:
     if not base.exists():
         return set()
     return {path.resolve() for path in base.rglob("*.srt") if path.is_file()}
+
+
+def snapshot_vtt_files(directory: str | Path) -> set[Path]:
+    base = Path(directory).expanduser()
+    if not base.exists():
+        return set()
+    return {path.resolve() for path in base.rglob("*.vtt") if path.is_file()}
+
+
+def convert_vtt_to_srt_file(vtt_path: Path, srt_path: Path | None = None) -> Path:
+    """Convert one completed WebVTT subtitle to clean, normalized SubRip."""
+    vtt_path = vtt_path.expanduser().resolve()
+    srt_path = (srt_path or vtt_path.with_suffix(".srt")).expanduser().resolve()
+    if srt_path.exists():
+        raise FileExistsError(f"SRT destination already exists: {srt_path}")
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{srt_path.name}.",
+        suffix=".tmp.srt",
+        dir=str(srt_path.parent),
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(vtt_path),
+                "-map",
+                "0:s:0",
+                "-c:s",
+                "srt",
+                str(tmp_path),
+            ],
+            text=True,
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()
+            raise RuntimeError(detail or f"ffmpeg exited with code {proc.returncode}")
+
+        # FFmpeg represents WebVTT non-breaking spaces as the ASS escape \h,
+        # which is not valid SRT markup and can appear literally in players.
+        converted = tmp_path.read_text(encoding="utf-8", errors="replace")
+        converted = converted.replace("\\h", " ").replace("\u00a0", " ")
+        cues = parse_srt_content(converted)
+        if not cues:
+            raise ValueError("The converted file contained no valid subtitle cues.")
+        for cue in cues:
+            cue.text_lines = [line.rstrip() for line in cue.text_lines]
+
+        atomic_write_text(srt_path, write_srt_content(cues), encoding="utf-8")
+        vtt_path.unlink()
+        return srt_path
+    except Exception:
+        # Never leave a partial or unvalidated SRT behind. Keep the VTT so the
+        # user still has the original subtitle and a later run can retry it.
+        try:
+            srt_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def convert_vtt_subtitles_in_directory(
+    directory: str | Path,
+    logger,
+    *,
+    candidates: set[Path] | None = None,
+) -> VttConversionStats:
+    """Recover selected VTT files yt-dlp left instead of requested SRT files."""
+    base = Path(directory).expanduser()
+    if candidates is None:
+        vtt_files = sorted(snapshot_vtt_files(base))
+    else:
+        vtt_files = sorted(path.resolve() for path in candidates if path.is_file())
+    stats = VttConversionStats(scanned_files=len(vtt_files))
+    if not vtt_files:
+        return stats
+
+    logger(f"> Subtitle recovery: found {len(vtt_files)} VTT file(s); converting them to clean SRT...")
+    for vtt_path in vtt_files:
+        srt_path = vtt_path.with_suffix(".srt")
+        if srt_path.exists():
+            try:
+                existing_cues = parse_srt_content(
+                    srt_path.read_text(encoding="utf-8", errors="replace")
+                )
+                if not existing_cues:
+                    raise ValueError("the existing SRT contains no valid cues")
+                vtt_path.unlink()
+            except Exception as exc:
+                stats.failed_files += 1
+                logger(
+                    f"WARNING: Keeping '{vtt_path.name}' because its existing SRT destination "
+                    f"could not be validated: {exc}"
+                )
+            else:
+                stats.removed_redundant_files += 1
+                logger(
+                    f"> Removed redundant VTT subtitle because a valid SRT already exists: "
+                    f"{vtt_path.name}"
+                )
+            continue
+        try:
+            convert_vtt_to_srt_file(vtt_path, srt_path)
+        except Exception as exc:
+            stats.failed_files += 1
+            logger(f"WARNING: Could not convert VTT subtitle '{vtt_path.name}': {exc}")
+        else:
+            stats.converted_files += 1
+            logger(f"> Converted subtitle: {vtt_path.name} -> {srt_path.name}")
+
+    if stats.converted_files:
+        logger(f"> Subtitle recovery converted {stats.converted_files} VTT file(s) to SRT.")
+    if stats.removed_redundant_files:
+        logger(
+            f"> Subtitle recovery removed {stats.removed_redundant_files} redundant VTT file(s)."
+        )
+    if stats.failed_files:
+        logger(f"WARNING: Subtitle recovery could not convert {stats.failed_files} VTT file(s).")
+    return stats
+
+
+def run_download(urls: list[str], ydl_opts: dict, *, retry_without_cookies: bool, logger) -> int:
+    """Run yt-dlp and repair only VTT subtitles created by this operation."""
+    output_dir = ydl_opts.get("paths", {}).get("home")
+    before_vtt_files = snapshot_vtt_files(output_dir) if output_dir else set()
+    result = _run_download(
+        urls,
+        ydl_opts,
+        retry_without_cookies=retry_without_cookies,
+        logger=logger,
+    )
+    if output_dir:
+        new_vtt_files = snapshot_vtt_files(output_dir) - before_vtt_files
+        conversion_stats = convert_vtt_subtitles_in_directory(
+            output_dir,
+            logger,
+            candidates=new_vtt_files,
+        )
+        if result == 0 and conversion_stats.failed_files:
+            # Do not report a fully successful SRT download when recovery left
+            # a VTT behind. The log retains the precise conversion error.
+            return 1
+    return result
 
 
 def run_auto_subtitle_cleanup(new_srt_files: list[Path], logger) -> SubtitleCleanupStats:
