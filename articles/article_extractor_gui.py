@@ -614,6 +614,71 @@ class GenericPageParser(HTMLParser):
         return "".join(self._fragment)
 
 
+# BEGIN WEBSITE CODE: tomatobible-parser
+class TomatoBibleStructuredTextParser(StructuredTextParser):
+    """Preserve TomatoBible's Substack body while marking interactive content."""
+
+    # Let the nested iframe provide the exact public player URL. The shared
+    # parser otherwise stops at Substack's youtube-wrap container, whose own
+    # attributes do not include a normal src/href value.
+    EMBED_CLASS_PARTS = StructuredTextParser.EMBED_CLASS_PARTS - {"youtube-wrap"}
+
+    INTERACTIVE_COMPONENTS = {"ButtonCreateButton"}
+    INTERACTIVE_CLASS_PARTS = {"file-attachment", "image-gallery"}
+
+    @staticmethod
+    def _component_source(attrs: dict[str, str | None]) -> str:
+        raw = attrs.get("data-attrs") or ""
+        if raw:
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+            if isinstance(data, dict):
+                for key in ("url", "src", "href"):
+                    value = data.get(key)
+                    if isinstance(value, str) and value:
+                        return value
+        return attrs.get("src") or attrs.get("href") or ""
+
+    def _add_media(self, kind: str, attrs: dict[str, str | None]) -> None:
+        enriched = dict(attrs)
+        if not enriched.get("src") and not enriched.get("href"):
+            enriched["src"] = self._component_source(enriched)
+        super()._add_media(kind, enriched)
+
+    def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        attrs = dict(attrs_list)
+        component = attrs.get("data-component-name") or ""
+        classes = _class_tokens(attrs)
+        if not self._ignore_depth and not self._skip_depth and (
+            component in self.INTERACTIVE_COMPONENTS
+            or any(
+                part in class_name
+                for part in self.INTERACTIVE_CLASS_PARTS
+                for class_name in classes
+            )
+        ):
+            self._add_media("interactive content", attrs)
+            if tag not in self.VOID_TAGS:
+                self._skip_depth = 1
+            return
+        super().handle_starttag(tag, attrs_list)
+
+
+def tomatobible_html_to_blocks(
+    fragment: str, canonical_url: str, first_media_number: int = 1
+) -> tuple[list[str], list[MediaReference]]:
+    parser = TomatoBibleStructuredTextParser(first_media_number)
+    parser.feed(fragment)
+    parser.close()
+    for item in parser.media:
+        if item.source:
+            item.source = urllib.parse.urljoin(canonical_url, item.source)
+    return parser.blocks, parser.media
+# END WEBSITE CODE: tomatobible-parser
+
+
 
 
 # BEGIN WEBSITE CODE: infoq-podcasts-parser
@@ -1267,6 +1332,95 @@ class GenericArticleAdapter:
 
 
 
+# BEGIN WEBSITE CODE: tomatobible-adapter
+class TomatoBibleAdapter:
+    """Dedicated article-only adapter for TomatoBible's public Substack posts."""
+
+    name = "TomatoBible(トマトバイブル)"
+
+    @classmethod
+    def matches(cls, url: str) -> bool:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+        return host == "tomatobible.substack.com"
+
+    @staticmethod
+    def _normalized_post_url(url: str) -> tuple[str, str, str]:
+        parsed = urllib.parse.urlparse(url)
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) < 2 or parts[0] != "p":
+            raise ExtractionError(
+                "Please paste a TomatoBible article URL in the form "
+                "https://tomatobible.substack.com/p/article-slug"
+            )
+        slug = parts[1]
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        post_url = f"{origin}/p/{urllib.parse.quote(slug)}"
+        return origin, slug, post_url
+
+    @staticmethod
+    def _media_identity(url: str) -> str:
+        decoded = urllib.parse.unquote(html.unescape(url))
+        start = max(decoded.rfind("https://"), decoded.rfind("http://"))
+        return decoded[start:] if start >= 0 else decoded
+
+    def extract(self, url: str, progress: Callable[[str], None]) -> ExtractedArticle:
+        origin, slug, post_url = self._normalized_post_url(url)
+        api_url = f"{origin}/api/v1/posts/{urllib.parse.quote(slug)}"
+        progress("Downloading TomatoBible's public article data…")
+        try:
+            data = json.loads(fetch_text(api_url))
+        except json.JSONDecodeError as exc:
+            raise ExtractionError("TomatoBible returned invalid article data.") from exc
+        if not isinstance(data, dict) or not data.get("body_html"):
+            raise ExtractionError(
+                "No complete public TomatoBible article body was returned. "
+                "The post may be private, paid, or unavailable."
+            )
+
+        canonical = str(data.get("canonical_url") or post_url)
+        body_html = str(data["body_html"])
+        blocks: list[str] = []
+        media: list[MediaReference] = []
+        cover = str(data.get("cover_image") or "")
+        cover_is_in_body = bool(
+            cover
+            and self._media_identity(cover)
+            in urllib.parse.unquote(html.unescape(body_html))
+        )
+        if cover and not cover_is_in_body:
+            marker = "IMAGE-01"
+            blocks.append(marker)
+            media.append(
+                MediaReference(marker, "cover image", cover, location="article cover")
+            )
+
+        body_blocks, body_media = tomatobible_html_to_blocks(
+            body_html, canonical, len(media) + 1
+        )
+        blocks.extend(body_blocks)
+        media.extend(body_media)
+        if not blocks:
+            raise ExtractionError("The TomatoBible article contained no readable public content.")
+
+        bylines = data.get("publishedBylines")
+        author = ""
+        if isinstance(bylines, list) and bylines and isinstance(bylines[0], dict):
+            author = _clean_inline(str(bylines[0].get("name") or ""))
+        return ExtractedArticle(
+            title=_clean_inline(str(data.get("title") or slug)),
+            subtitle=_clean_inline(str(data.get("subtitle") or "")),
+            author=author,
+            published=_clean_inline(str(data.get("post_date") or "")),
+            canonical_url=canonical,
+            slug=str(data.get("slug") or slug),
+            blocks=blocks,
+            comments=[],
+            media=media,
+            adapter_name=self.name,
+        )
+# END WEBSITE CODE: tomatobible-adapter
+
+
 # BEGIN WEBSITE CODE: infoq-podcasts-adapter
 INFOQ_PODCAST_FEED = (
     "https://feeds.soundcloud.com/users/soundcloud:users:215740450/sounds.rss"
@@ -1520,6 +1674,25 @@ WEBSITE_EXTRACTORS: tuple[WebsiteExtractorDefinition, ...] = (
         removable_sections=("ana-toledo-support", "ana-toledo-adapter"),
     ),
     # END WEBSITE CODE: profile-ana-toledo
+    # BEGIN WEBSITE CODE: profile-tomatobible
+    WebsiteExtractorDefinition(
+        key="tomatobible",
+        display_name="TomatoBible(トマトバイブル)",
+        homepage="https://tomatobible.substack.com/archive",
+        description=(
+            "Extract complete public TomatoBible articles with ordered placeholders for "
+            "images, video embeds, interactive buttons, and other non-linear content. "
+            "Comments are not extracted."
+        ),
+        example_url=(
+            "https://tomatobible.substack.com/p/"
+            "predators-among-us-fascists-decodedunderstanding-b3d"
+        ),
+        allowed_hosts=("tomatobible.substack.com",),
+        adapter_type=TomatoBibleAdapter,
+        removable_sections=("tomatobible-parser", "tomatobible-adapter"),
+    ),
+    # END WEBSITE CODE: profile-tomatobible
     # BEGIN WEBSITE CODE: profile-infoq-podcasts
     WebsiteExtractorDefinition(
         key="infoq-podcasts",

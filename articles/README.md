@@ -9,6 +9,10 @@ Current website menu:
 
 - **Ana Toledo — Mira!:** full article plus all publicly accessible comments and
   replies from `anatoledo.substack.com`.
+- **TomatoBible(トマトバイブル):** complete public articles from
+  `tomatobible.substack.com`, with images, video embeds, interactive buttons,
+  tables, and other non-linear content represented by ordered placeholders. It
+  does not extract comments.
 - **islamonline.net/category/books:** complete public book-category articles from
   `islamonline.net`. This dedicated extractor exports the article only; it does
   not create a comments file.
@@ -94,6 +98,13 @@ The initial output folder is `~/Downloads`.
 For **islamonline.net/category/books**, use an individual article from the Books
 category. Its button reads **Extract article**, and its exports contain no
 comments file.
+
+For **TomatoBible(トマトバイブル)**, use an individual URL under `/p/`. The
+dedicated article-only adapter reads the complete public `body_html` from
+Substack's `/api/v1/posts/{slug}` endpoint. It preserves the editorial text and
+code blocks, and replaces figures, YouTube players, tables, interactive buttons,
+and similar non-linear elements in place with `IMAGE-XX` placeholders. It never
+requests or exports comments.
 
 For **InfoQ**, use an individual URL under `/podcasts/`. The extractor omits
 page controls and recommendations, preserves the editorial transcript, and
@@ -198,6 +209,15 @@ InfoQ article-only example:
 python3 article_extractor_gui.py \
   --website "infoq-articles" \
   --url "https://www.infoq.com/articles/system-comprehension-evolutionary-architecture/" \
+  --output "$HOME/Downloads"
+```
+
+TomatoBible article-only example:
+
+```bash
+python3 article_extractor_gui.py \
+  --website "tomatobible" \
+  --url "https://tomatobible.substack.com/p/predators-among-us-fascists-decodedunderstanding-b3d" \
   --output "$HOME/Downloads"
 ```
 
