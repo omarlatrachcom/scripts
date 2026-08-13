@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,48 @@ Hola&nbsp;mundo
 00:00:04.000 --> 00:00:06.125
 Segunda línea&nbsp;&nbsp;
 """
+
+
+class SubtitleLanguageSelectionTests(unittest.TestCase):
+    def test_original_is_available_as_a_subtitle_language_choice(self) -> None:
+        self.assertIn("original", downloader.SUPPORTED_SUBTITLE_LANGUAGES)
+        self.assertEqual(
+            downloader.subtitle_languages_for_choice("original"),
+            [downloader.ORIGINAL_SUBTITLE_PATTERN],
+        )
+
+    def test_original_choice_downloads_originals_in_predefined_languages_too(self) -> None:
+        opts = downloader.build_subtitle_opts(
+            langs=downloader.subtitle_languages_for_choice("original"),
+            auto=True,
+        )
+
+        self.assertEqual(opts["subtitleslangs"], [downloader.ORIGINAL_SUBTITLE_PATTERN])
+        for language in ("fr-orig", "en-orig", "es-orig", "ar-orig"):
+            with self.subTest(language=language):
+                self.assertIsNotNone(re.fullmatch(opts["subtitleslangs"][0], language))
+
+    def test_auto_subtitles_include_originals_outside_predefined_languages(self) -> None:
+        opts = downloader.build_subtitle_opts(langs=["en"], auto=True)
+
+        self.assertEqual(opts["subtitleslangs"][0], "en")
+        original_pattern = opts["subtitleslangs"][1]
+        self.assertIsNotNone(re.fullmatch(original_pattern, "ar-orig"))
+        self.assertIsNotNone(re.fullmatch(original_pattern, "de-orig"))
+        self.assertIsNotNone(re.fullmatch(original_pattern, "ja-orig"))
+
+    def test_auto_subtitle_original_fallback_excludes_predefined_languages(self) -> None:
+        original_pattern = downloader.ORIGINAL_SUBTITLE_FALLBACK_PATTERN
+
+        for language in ("fr-orig", "en-orig", "es-orig", "fr-CA-orig", "es-419-orig"):
+            with self.subTest(language=language):
+                self.assertIsNone(re.fullmatch(original_pattern, language))
+        self.assertIsNone(re.fullmatch(original_pattern, "de"))
+
+    def test_manual_subtitle_selection_remains_exact(self) -> None:
+        opts = downloader.build_subtitle_opts(langs=["es"], auto=False)
+
+        self.assertEqual(opts["subtitleslangs"], ["es"])
 
 
 class VttSubtitleRecoveryTests(unittest.TestCase):

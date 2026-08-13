@@ -37,7 +37,13 @@ APP_STATE_FILE = APP_SUPPORT_DIR / "gui_state.json"
 RESTARTED_AFTER_UPDATE_ENV = "SMART_YTDLP_RESTARTED_AFTER_UPDATE"
 UPDATER_PACKAGES = ["yt-dlp", "yt-dlp-ejs"]
 SUPPORTED_BROWSERS = ("firefox", "chrome", "chromium", "brave", "edge", "safari")
-SUPPORTED_SUBTITLE_LANGUAGES = ("fr", "en", "es")
+PREDEFINED_SUBTITLE_LANGUAGES = ("fr", "en", "es")
+ORIGINAL_SUBTITLE_LANGUAGE = "original"
+SUPPORTED_SUBTITLE_LANGUAGES = (*PREDEFINED_SUBTITLE_LANGUAGES, ORIGINAL_SUBTITLE_LANGUAGE)
+ORIGINAL_SUBTITLE_PATTERN = r".+-orig"
+ORIGINAL_SUBTITLE_FALLBACK_PATTERN = (
+    rf"(?!(?:{'|'.join(map(re.escape, PREDEFINED_SUBTITLE_LANGUAGES))})(?:-|$)).+-orig"
+)
 JOB_MODE_LABELS = {"single": "Single video", "playlist": "Playlist"}
 JOB_MODE_VALUES = {label: mode for mode, label in JOB_MODE_LABELS.items()}
 STARTUP_MESSAGES: list[str] = []
@@ -354,9 +360,30 @@ class GuiLogger:
             self.sink(f"ERROR: {cleaned}")
 
 
+def subtitle_languages_for_choice(language: str) -> list[str]:
+    if language == ORIGINAL_SUBTITLE_LANGUAGE:
+        return [ORIGINAL_SUBTITLE_PATTERN]
+    return [language]
+
+
+def auto_subtitle_languages(langs: list[str]) -> list[str]:
+    """Include YouTube's source captions when their language is unsupported.
+
+    yt-dlp exposes an original automatic-caption track with a language tag that
+    ends in ``-orig``.  The negative lookahead prevents an extra duplicate from
+    being downloaded when that source language is already fr, en, or es.
+    """
+    selected = list(dict.fromkeys(langs))
+    if ORIGINAL_SUBTITLE_PATTERN in selected:
+        return selected
+    if ORIGINAL_SUBTITLE_FALLBACK_PATTERN not in selected:
+        selected.append(ORIGINAL_SUBTITLE_FALLBACK_PATTERN)
+    return selected
+
+
 def build_subtitle_opts(*, langs: list[str], auto: bool, skip_download: bool = False) -> dict:
     opts: dict = {
-        "subtitleslangs": langs,
+        "subtitleslangs": auto_subtitle_languages(langs) if auto else langs,
         "subtitlesformat": "srt",
         "convertsubtitles": "srt",
         "writesubtitles": not auto,
@@ -1319,7 +1346,10 @@ def run_optional_auto_sub_fallback(
         "ignoreerrors": True,
     }
     before_files = snapshot_srt_files(output_dir)
-    logger("> Subtitle fallback pass: trying AUTO-generated subtitles only where manual subtitles were not created...")
+    logger(
+        "> Subtitle fallback pass: trying AUTO-generated subtitles in the selected language, "
+        "plus original-language captions when the source language is outside fr/en/es..."
+    )
     result = run_download(urls, fallback_opts, retry_without_cookies=retry_without_cookies, logger=logger)
     after_files = snapshot_srt_files(output_dir)
     new_auto_srt_files = sorted(after_files - before_files)
@@ -2266,7 +2296,7 @@ class DownloaderGUI:
             if job["want_subs"] and job["subs_lang"] not in SUPPORTED_SUBTITLE_LANGUAGES:
                 messagebox.showwarning(
                     "Missing subtitle language",
-                    f"Choose French (fr), English (en), or Spanish (es) for plan item {position}.",
+                    f"Choose French (fr), English (en), Spanish (es), or original for plan item {position}.",
                 )
                 return
 
@@ -2377,12 +2407,30 @@ class DownloaderGUI:
             subs_langs: list[str] | None = None
             if want_subs:
                 subs_lang = config["subs_lang"]
-                subs_langs = [subs_lang]
-                if media_type == "srt":
-                    logger(f"> Subtitle-only mode: downloading subtitles only for language '{subs_lang}'.")
-                    logger(f"> Subtitle strategy: try MANUAL '{subs_lang}' first, then AUTO-generated '{subs_lang}' only if manual is missing.")
+                subs_langs = subtitle_languages_for_choice(subs_lang)
+                if subs_lang == ORIGINAL_SUBTITLE_LANGUAGE:
+                    if media_type == "srt":
+                        logger("> Subtitle-only mode: downloading the video's original captions.")
+                    logger(
+                        "> Subtitle strategy: download YouTube's original-language "
+                        "automatic-caption track."
+                    )
+                elif media_type == "srt":
+                    logger(
+                        f"> Subtitle-only mode: preferred language '{subs_lang}', with an "
+                        "original-language fallback outside fr/en/es."
+                    )
+                    logger(
+                        f"> Subtitle strategy: try MANUAL '{subs_lang}' first, then AUTO-generated "
+                        f"'{subs_lang}'; also keep original captions when the video's source "
+                        "language is outside fr/en/es."
+                    )
                 else:
-                    logger(f"> Subtitle strategy: try MANUAL '{subs_lang}' first, then AUTO-generated '{subs_lang}' only if manual is missing.")
+                    logger(
+                        f"> Subtitle strategy: try MANUAL '{subs_lang}' first, then AUTO-generated "
+                        f"'{subs_lang}'; also keep original captions when the video's source "
+                        "language is outside fr/en/es."
+                    )
 
             if media_type == "video":
                 format_str = "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"
@@ -2690,12 +2738,18 @@ class DownloaderGUI:
                             [url], manual_opts, retry_without_cookies=True, logger=logger
                         ) or result
 
-                    auto_targets = missing_subtitle_indices()
+                    # Run this pass for every selected item, including ones that
+                    # already received a manual subtitle in the preferred
+                    # language.  An unsupported source-language track has its
+                    # own *-orig filename, so nooverwrites keeps the manual file
+                    # while allowing the original captions to be added.
+                    auto_targets = expected_indices
                     if auto_targets:
                         before_srt_files = snapshot_srt_files(config["output_dir"])
                         logger(
-                            f"> AUTO subtitle repair: manual subtitles are still absent for "
-                            f"{len(auto_targets)} item(s); targeting only: {format_playlist_items(auto_targets)}"
+                            f"> AUTO subtitle pass: trying the selected language where needed "
+                            f"and keeping unsupported original languages for "
+                            f"{len(auto_targets)} item(s): {format_playlist_items(auto_targets)}"
                         )
                         auto_opts = {
                             **ydl_opts,

@@ -67,8 +67,10 @@ What it does:
   available, with automatic fallback to the best lower quality.
 - Supports video downloads and audio-only MP3 downloads while preferring the
   video's original audio track over YouTube dubs.
-- Supports SRT-only subtitle downloads in French (`fr`), English (`en`), or
-  Spanish (`es`).
+- Supports SRT-only subtitle downloads in French (`fr`), English (`en`), Spanish
+  (`es`), or the video's original language. When `fr`, `en`, or `es` is chosen,
+  the automatic-caption fallback also keeps YouTube's original source-caption
+  track if the source language is outside those three predefined languages.
 - Creates media, subtitle, and resumable `.part` files with portable-safe names
   from the start, while preserving readable non-Latin scripts.
 - Supports playlist start/end ranges.
