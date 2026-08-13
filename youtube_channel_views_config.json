@@ -1,5 +1,5 @@
 {
-  "min_views": "4000000",
+  "min_views": "15000",
   "max_videos_per_channel": null,
   "published_after": null,
   "published_before": null,
@@ -7,7 +7,7 @@
   "browser_profile": null,
   "cookies_file": null,
   "open_browser": true,
-  "active_theme": "Documentary_ES",
+  "active_theme": "books",
   "themes": [
     {
       "name": "books",
@@ -26,10 +26,6 @@
         {
           "enabled": true,
           "url": "https://www.youtube.com/@PsalmsOfMeem/videos"
-        },
-        {
-          "enabled": true,
-          "url": "https://www.youtube.com/@Istami3likitab/videos"
         }
       ]
     },
