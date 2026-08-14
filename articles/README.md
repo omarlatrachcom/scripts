@@ -9,6 +9,10 @@ Current website menu:
 
 - **Ana Toledo — Mira!:** full article plus all publicly accessible comments and
   replies from `anatoledo.substack.com`.
+- **The Reese Report:** complete public articles plus all publicly accessible
+  comments and nested replies from `gregreese.substack.com`. Video posts and
+  other non-linear content retain their reading position as ordered
+  `IMAGE-XX` placeholders.
 - **TomatoBible(トマトバイブル):** complete public articles from
   `tomatobible.substack.com`, with images, video embeds, interactive buttons,
   tables, and other non-linear content represented by ordered placeholders. It
@@ -94,6 +98,13 @@ Choose an existing output folder and click **Extract article and comments**.
 The app creates a new subfolder named from the article slug. Repeated extractions
 use `-2`, `-3`, and so on, so an earlier extraction is never overwritten.
 The initial output folder is `~/Downloads`.
+
+For **The Reese Report**, use an individual URL under `/p/`. The dedicated
+adapter reads the complete public article body from Substack's post endpoint,
+represents a post's primary video at the start as `IMAGE-01`, and then preserves
+the remaining text and non-linear content in source order. It also reads the
+public comments endpoint and exports every accessible comment and nested reply,
+including the direct parent comment ID for each reply.
 
 For **islamonline.net/category/books**, use an individual article from the Books
 category. Its button reads **Extract article**, and its exports contain no
@@ -183,6 +194,15 @@ python3 article_extractor_gui.py \
   --download-media \
   --url "https://anatoledo.substack.com/p/freemasons-in-france-convicted" \
   --output "$HOME/Documents"
+```
+
+The Reese Report article-and-comments example:
+
+```bash
+python3 article_extractor_gui.py \
+  --website "reese-report" \
+  --url "https://gregreese.substack.com/p/cymatics-and-the-mysteries-of-the" \
+  --output "$HOME/Downloads"
 ```
 
 IslamOnline Books article-only example:

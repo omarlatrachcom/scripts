@@ -678,9 +678,6 @@ def tomatobible_html_to_blocks(
     return parser.blocks, parser.media
 # END WEBSITE CODE: tomatobible-parser
 
-
-
-
 # BEGIN WEBSITE CODE: infoq-podcasts-parser
 class InfoQPodcastPageParser(HTMLParser):
     """Capture InfoQ's editorial podcast sections without surrounding page UI."""
@@ -988,6 +985,251 @@ class InfoQArticlePageParser(HTMLParser):
                     return item
         return {}
 # END WEBSITE CODE: infoq-articles-parser
+
+# BEGIN WEBSITE CODE: reese-report-support
+class ReeseReportStructuredTextParser(StructuredTextParser):
+    """Preserve Reese Report prose while marking Substack components in place."""
+
+    VISUAL_TAGS = StructuredTextParser.VISUAL_TAGS | {
+        "details", "form", "object", "select", "textarea",
+    }
+    # The iframe inside a YouTube wrapper has the useful source URL. Other
+    # Substack embed wrappers are represented as one component so their chrome
+    # and duplicated preview images do not become separate placeholders.
+    EMBED_CLASS_PARTS = StructuredTextParser.EMBED_CLASS_PARTS - {"youtube-wrap"}
+    INTERACTIVE_TAGS = {"button", "input"}
+    INTERACTIVE_CLASS_PARTS = {
+        "button-wrapper", "carousel", "file-attachment", "image-gallery",
+        "interactive", "link-preview", "subscribe-widget",
+    }
+    INTERACTIVE_COMPONENT_PARTS = {
+        "attachment", "audio", "button", "embed", "gallery", "interactive",
+        "poll", "subscribe", "video",
+    }
+
+    @staticmethod
+    def _component_source(attrs: dict[str, str | None]) -> str:
+        for key in (
+            "src", "data-src", "data-url", "data-href", "href", "poster", "action",
+        ):
+            value = attrs.get(key) or ""
+            if value:
+                return value
+        raw = attrs.get("data-attrs") or ""
+        if raw:
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+            if isinstance(data, dict):
+                for key in (
+                    "url", "src", "href", "base_url", "downloadUrl", "imageUrl",
+                ):
+                    value = data.get(key)
+                    if isinstance(value, str) and value:
+                        return value
+        srcset = attrs.get("srcset") or attrs.get("data-srcset") or ""
+        if srcset:
+            candidates = [
+                part.strip().split()[0]
+                for part in srcset.split(",")
+                if part.strip()
+            ]
+            if candidates:
+                return candidates[-1]
+        return ""
+
+    def _add_media(self, kind: str, attrs: dict[str, str | None]) -> None:
+        enriched = dict(attrs)
+        if not enriched.get("src") and not enriched.get("href"):
+            enriched["src"] = self._component_source(enriched)
+        super()._add_media(kind, enriched)
+
+    def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attrs = dict(attrs_list)
+        classes = _class_tokens(attrs)
+        component = (attrs.get("data-component-name") or "").lower()
+        is_interactive_component = any(
+            part in component for part in self.INTERACTIVE_COMPONENT_PARTS
+        )
+        is_interactive_class = any(
+            part in class_name
+            for part in self.INTERACTIVE_CLASS_PARTS
+            for class_name in classes
+        )
+        if (
+            not self._ignore_depth
+            and not self._skip_depth
+            and (
+                tag in self.INTERACTIVE_TAGS
+                or is_interactive_component
+                or is_interactive_class
+            )
+        ):
+            self._add_media("interactive content", attrs)
+            if tag not in self.VOID_TAGS:
+                self._skip_depth = 1
+            return
+        super().handle_starttag(tag, attrs_list)
+
+
+def reese_report_html_to_blocks(
+    fragment: str, canonical_url: str, first_media_number: int = 1
+) -> tuple[list[str], list[MediaReference]]:
+    parser = ReeseReportStructuredTextParser(first_media_number)
+    parser.feed(fragment)
+    parser.close()
+    for item in parser.media:
+        if item.source:
+            item.source = urllib.parse.urljoin(canonical_url, item.source)
+    return parser.blocks, parser.media
+
+
+class ReeseReportRichTextConverter:
+    """Convert public Substack comment JSON without depending on another site."""
+
+    VISUAL_TYPES = {
+        "attachment", "audio", "button", "canvas", "captioned_image",
+        "captionedImage", "embed", "embedded_post", "embeddedPost", "file",
+        "gallery", "iframe", "image", "image2", "link_preview", "linkPreview",
+        "math", "native_video", "nativeVideo", "note_embed", "noteEmbed",
+        "poll", "table", "tweet", "video", "youtube",
+    }
+
+    def __init__(self) -> None:
+        self.media: list[MediaReference] = []
+        self._next_media = 1
+
+    @staticmethod
+    def _is_media_marker(block: str) -> bool:
+        return bool(re.fullmatch(r"IMAGE-\d+", block.strip()))
+
+    @classmethod
+    def _source_from_attrs(cls, attrs: object) -> str:
+        if not isinstance(attrs, dict):
+            return ""
+        for key in (
+            "src", "url", "href", "base_url", "action", "downloadUrl", "imageUrl",
+            "videoUrl",
+        ):
+            value = attrs.get(key)
+            if isinstance(value, str) and value:
+                return value
+        for value in attrs.values():
+            if isinstance(value, dict):
+                found = cls._source_from_attrs(value)
+                if found:
+                    return found
+        return ""
+
+    def _media_block(self, node: dict) -> str:
+        attrs = node.get("attrs") if isinstance(node.get("attrs"), dict) else {}
+        marker = f"IMAGE-{self._next_media:02d}"
+        self._next_media += 1
+        self.media.append(
+            MediaReference(
+                marker,
+                str(node.get("type") or "embedded content"),
+                self._source_from_attrs(attrs),
+                _clean_inline(str(attrs.get("alt") or attrs.get("title") or "")),
+                "comment body",
+            )
+        )
+        return marker
+
+    def _inline(self, nodes: object) -> list[str]:
+        parts: list[str] = []
+        if not isinstance(nodes, list):
+            return parts
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            kind = str(node.get("type") or "")
+            if kind == "text":
+                parts.append(str(node.get("text") or ""))
+            elif kind in {"hard_break", "hardBreak"}:
+                parts.append("\n")
+            elif kind in self.VISUAL_TYPES:
+                parts.append("\n" + self._media_block(node) + "\n")
+            elif isinstance(node.get("content"), list):
+                parts.extend(self._inline(node["content"]))
+        return parts
+
+    def _nodes(self, nodes: object) -> list[str]:
+        blocks: list[str] = []
+        if not isinstance(nodes, list):
+            return blocks
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            kind = str(node.get("type") or "")
+            content = node.get("content")
+            if kind in self.VISUAL_TYPES:
+                blocks.append(self._media_block(node))
+            elif kind in {"paragraph", "code_block", "codeBlock"}:
+                text = _clean_block("".join(self._inline(content)))
+                if text:
+                    blocks.extend(
+                        part.strip()
+                        for part in re.split(r"(?m)^(IMAGE-\d+)$", text)
+                        if part.strip()
+                    )
+            elif kind == "heading":
+                attrs = node.get("attrs") if isinstance(node.get("attrs"), dict) else {}
+                level = max(1, min(6, int(attrs.get("level") or 2)))
+                text = _clean_block("".join(self._inline(content)))
+                if text:
+                    blocks.append("#" * level + " " + text)
+            elif kind in {"bullet_list", "bulletList", "ordered_list", "orderedList"}:
+                ordered = kind in {"ordered_list", "orderedList"}
+                items = content if isinstance(content, list) else []
+                for index, item in enumerate(items, start=1):
+                    item_blocks = self._nodes(
+                        item.get("content") if isinstance(item, dict) else []
+                    )
+                    if not item_blocks:
+                        continue
+                    prefix = f"{index}. " if ordered else "- "
+                    emitted_text = False
+                    for block in item_blocks:
+                        if self._is_media_marker(block):
+                            blocks.append(block)
+                        elif not emitted_text:
+                            blocks.append(prefix + block)
+                            emitted_text = True
+                        else:
+                            blocks.append("  " + block)
+            elif kind in {"list_item", "listItem", "doc"}:
+                blocks.extend(self._nodes(content))
+            elif kind == "blockquote":
+                for block in self._nodes(content):
+                    if self._is_media_marker(block):
+                        blocks.append(block)
+                    else:
+                        blocks.append(
+                            "\n".join("> " + line for line in block.splitlines())
+                        )
+            elif kind in {"horizontal_rule", "horizontalRule"}:
+                blocks.append("---")
+            elif isinstance(content, list):
+                blocks.extend(self._nodes(content))
+        return blocks
+
+    def convert(self, document: object) -> tuple[list[str], list[MediaReference]]:
+        if not isinstance(document, dict):
+            return [], []
+        blocks = self._nodes(
+            document.get("content") if document.get("type") == "doc" else [document]
+        )
+        return blocks, self.media
+# END WEBSITE CODE: reese-report-support
+
+
+
+
+
+
 
 
 def fetch_text(url: str, timeout: int = 40) -> str:
@@ -1420,7 +1662,6 @@ class TomatoBibleAdapter:
         )
 # END WEBSITE CODE: tomatobible-adapter
 
-
 # BEGIN WEBSITE CODE: infoq-podcasts-adapter
 INFOQ_PODCAST_FEED = (
     "https://feeds.soundcloud.com/users/soundcloud:users:215740450/sounds.rss"
@@ -1625,6 +1866,238 @@ class InfoQArticleAdapter:
         )
 # END WEBSITE CODE: infoq-articles-adapter
 
+# BEGIN WEBSITE CODE: reese-report-adapter
+class ReeseReportAdapter:
+    """Dedicated adapter for The Reese Report's public Substack posts."""
+
+    name = "The Reese Report"
+    HOST = "gregreese.substack.com"
+
+    @classmethod
+    def matches(cls, url: str) -> bool:
+        return (urllib.parse.urlparse(url).hostname or "").lower() == cls.HOST
+
+    @classmethod
+    def _normalized_post_url(cls, url: str) -> tuple[str, str, str]:
+        parsed = urllib.parse.urlparse(url)
+        parts = [part for part in parsed.path.split("/") if part]
+        if (
+            parsed.scheme not in {"http", "https"}
+            or (parsed.hostname or "").lower() != cls.HOST
+            or len(parts) != 2
+            or parts[0] != "p"
+        ):
+            raise ExtractionError(
+                "Please paste a The Reese Report article URL in the form "
+                "https://gregreese.substack.com/p/article-slug"
+            )
+        slug = urllib.parse.unquote(parts[1])
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        post_url = f"{origin}/p/{urllib.parse.quote(slug, safe='')}"
+        return origin, slug, post_url
+
+    @staticmethod
+    def _media_identity(url: str) -> str:
+        decoded = urllib.parse.unquote(html.unescape(url))
+        start = max(decoded.rfind("https://"), decoded.rfind("http://"))
+        return decoded[start:] if start >= 0 else decoded
+
+    @staticmethod
+    def _video_source(video_upload_id: str) -> str:
+        upload_id = urllib.parse.quote(video_upload_id, safe="")
+        return f"https://api.substack.com/api/v1/video/upload/{upload_id}/src"
+
+    @staticmethod
+    def _comments_from_api(payload: object) -> list[Comment]:
+        if not isinstance(payload, dict) or not isinstance(payload.get("comments"), list):
+            raise ExtractionError("The Reese Report returned invalid public comment data.")
+        results: list[Comment] = []
+        seen: set[str] = set()
+
+        def visit(items: object, parent_identifier: str = "") -> None:
+            if not isinstance(items, list):
+                return
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                raw_identifier = item.get("id")
+                identifier = str(raw_identifier) if raw_identifier is not None else ""
+                effective_identifier = identifier or f"position-{len(results) + 1}"
+                children = item.get("children")
+                if item.get("deleted"):
+                    # Keep the public tombstone so every exported reply points
+                    # to an exported parent and the visible thread stays whole.
+                    results.append(
+                        Comment(
+                            identifier=effective_identifier,
+                            author="[Deleted]",
+                            published=str(item.get("date") or ""),
+                            blocks=["[Deleted comment]"],
+                            parent_identifier=parent_identifier,
+                        )
+                    )
+                    seen.add(effective_identifier)
+                    visit(children, identifier or parent_identifier)
+                    continue
+                if effective_identifier in seen:
+                    visit(children, identifier or parent_identifier)
+                    continue
+
+                converter = ReeseReportRichTextConverter()
+                blocks, media = converter.convert(item.get("body_json"))
+                if not blocks:
+                    body = str(item.get("body") or "").strip()
+                    blocks = [
+                        _clean_block(part)
+                        for part in re.split(r"\n\s*\n", body)
+                        if _clean_block(part)
+                    ]
+                if blocks:
+                    ancestor_path = str(item.get("ancestor_path") or "")
+                    inferred_parent = ancestor_path.split(".")[-1] if ancestor_path else ""
+                    results.append(
+                        Comment(
+                            identifier=effective_identifier,
+                            author=str(item.get("name") or item.get("handle") or "Unknown"),
+                            published=str(item.get("date") or ""),
+                            blocks=blocks,
+                            parent_identifier=parent_identifier or inferred_parent,
+                            media=media,
+                        )
+                    )
+                    seen.add(effective_identifier)
+                visit(children, identifier or parent_identifier)
+
+        visit(payload["comments"])
+        return results
+
+    def extract(self, url: str, progress: Callable[[str], None]) -> ExtractedArticle:
+        origin, slug, post_url = self._normalized_post_url(url)
+        article_api_url = f"{origin}/api/v1/posts/{urllib.parse.quote(slug, safe='')}"
+        progress("Downloading The Reese Report's public article data…")
+        try:
+            data = json.loads(fetch_text(article_api_url))
+        except json.JSONDecodeError as exc:
+            raise ExtractionError(
+                "The Reese Report returned invalid public article data."
+            ) from exc
+        if not isinstance(data, dict) or not isinstance(data.get("body_html"), str):
+            raise ExtractionError(
+                "No complete public The Reese Report article body was returned. "
+                "The post may be private, paid, or unavailable."
+            )
+        if data.get("is_geoblocked"):
+            raise ExtractionError("This The Reese Report post is not public in this region.")
+        if data.get("free_unlock_required") or data.get("audience") not in {
+            None,
+            "everyone",
+        }:
+            raise ExtractionError(
+                "The complete The Reese Report post is not publicly accessible."
+            )
+        if not data.get("id"):
+            raise ExtractionError("The Reese Report article data had no public post ID.")
+
+        canonical = str(data.get("canonical_url") or post_url)
+        body_html = str(data["body_html"])
+        blocks: list[str] = []
+        media: list[MediaReference] = []
+
+        # Reese Report video posts render one primary player before the prose.
+        # Its cover image and extracted podcast audio are alternate assets of
+        # that same player, so one placeholder accurately represents the live
+        # reading position without duplicating the component.
+        video_upload_id = str(data.get("video_upload_id") or "")
+        podcast_url = str(data.get("podcast_url") or "")
+        live_stream_id = str(data.get("live_stream_id") or "")
+        cover = str(data.get("cover_image") or "")
+        if video_upload_id:
+            blocks.append("IMAGE-01")
+            media.append(
+                MediaReference(
+                    "IMAGE-01",
+                    "video",
+                    self._video_source(video_upload_id),
+                    location="primary article player",
+                )
+            )
+        elif podcast_url:
+            blocks.append("IMAGE-01")
+            media.append(
+                MediaReference(
+                    "IMAGE-01", "audio", podcast_url, location="primary article player"
+                )
+            )
+        elif live_stream_id:
+            blocks.append("IMAGE-01")
+            media.append(
+                MediaReference(
+                    "IMAGE-01", "live video", "", location="primary article player"
+                )
+            )
+        elif cover and self._media_identity(cover) not in urllib.parse.unquote(
+            html.unescape(body_html)
+        ):
+            blocks.append("IMAGE-01")
+            media.append(
+                MediaReference("IMAGE-01", "cover image", cover, location="article cover")
+            )
+
+        body_blocks, body_media = reese_report_html_to_blocks(
+            body_html, canonical, len(media) + 1
+        )
+        blocks.extend(body_blocks)
+        media.extend(body_media)
+        if not blocks:
+            raise ExtractionError(
+                "The Reese Report article contained no readable public content."
+            )
+
+        progress("Downloading all public comments and nested replies…")
+        comment_params = urllib.parse.urlencode(
+            {
+                "all_comments": "true",
+                "sort": data.get("default_comment_sort") or "best_first",
+            }
+        )
+        comments_api_url = f"{origin}/api/v1/post/{data['id']}/comments?{comment_params}"
+        try:
+            comments_payload = json.loads(fetch_text(comments_api_url))
+        except json.JSONDecodeError as exc:
+            raise ExtractionError(
+                "The Reese Report returned invalid public comment data."
+            ) from exc
+        comments = self._comments_from_api(comments_payload)
+
+        expected_comments = int(data.get("comment_count") or 0)
+        if expected_comments and not comments:
+            progress(
+                "Warning: The Reese Report reported comments, but none were publicly readable."
+            )
+        elif expected_comments and len(comments) < expected_comments:
+            progress(
+                f"Warning: exported {len(comments)} of {expected_comments} reported comments; "
+                "the remainder were deleted, hidden, or not publicly returned."
+            )
+
+        bylines = data.get("publishedBylines")
+        author = ""
+        if isinstance(bylines, list) and bylines and isinstance(bylines[0], dict):
+            author = _clean_inline(str(bylines[0].get("name") or ""))
+        return ExtractedArticle(
+            title=_clean_inline(str(data.get("title") or slug)),
+            subtitle=_clean_inline(str(data.get("subtitle") or "")),
+            author=author,
+            published=_clean_inline(str(data.get("post_date") or "")),
+            canonical_url=canonical,
+            slug=str(data.get("slug") or slug),
+            blocks=blocks,
+            comments=comments,
+            media=media,
+            adapter_name=self.name,
+        )
+# END WEBSITE CODE: reese-report-adapter
+
 
 @dataclass(frozen=True)
 class WebsiteExtractorDefinition:
@@ -1725,6 +2198,26 @@ WEBSITE_EXTRACTORS: tuple[WebsiteExtractorDefinition, ...] = (
         removable_sections=("infoq-articles-parser", "infoq-articles-adapter"),
     ),
     # END WEBSITE CODE: profile-infoq-articles
+    # BEGIN WEBSITE CODE: profile-reese-report
+    WebsiteExtractorDefinition(
+        key="reese-report",
+        display_name="The Reese Report",
+        homepage="https://gregreese.substack.com/archive",
+        description=(
+            "Extract complete public The Reese Report articles plus all publicly "
+            "accessible comments and nested replies. Video, audio, images, embeds, "
+            "tables, and other non-linear content remain in reading order as placeholders."
+        ),
+        example_url=(
+            "https://gregreese.substack.com/p/"
+            "cymatics-and-the-mysteries-of-the"
+        ),
+        allowed_hosts=("gregreese.substack.com",),
+        adapter_type=ReeseReportAdapter,
+        extracts_comments=True,
+        removable_sections=("reese-report-support", "reese-report-adapter"),
+    ),
+    # END WEBSITE CODE: profile-reese-report
 )
 
 WEBSITE_EXTRACTORS_BY_KEY = {item.key: item for item in WEBSITE_EXTRACTORS}

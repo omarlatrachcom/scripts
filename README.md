@@ -33,6 +33,14 @@ your normal terminal PATH. The launcher examples below add common Homebrew paths
 
 ## Scripts
 
+### `book_utils.py`
+
+Book Utils provides local OCR and document conversion tools, including JPG or
+PDF to token-safe TXT chunks. Its `o200k_base` tokenizer vocabulary is bundled
+under `book_utils_assets/`, so token counting works offline even when
+`tiktoken`'s temporary cache has been cleared. Keep that asset folder beside
+`book_utils.py` when moving the script.
+
 ### `prompt_manager_gui_mac_fixed.py`
 
 Prompt Manager is a local GUI for organizing reusable prompts by project.

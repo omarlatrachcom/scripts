@@ -1,9 +1,79 @@
+import hashlib
 import importlib.util
+import os
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
 import book_utils
+
+
+class TokenizerOfflineTests(unittest.TestCase):
+    def test_bundled_o200k_asset_matches_expected_checksum(self) -> None:
+        asset_data = book_utils.TOKENIZER_ASSET_PATH.read_bytes()
+
+        self.assertEqual(
+            hashlib.sha256(asset_data).hexdigest(),
+            book_utils.TOKENIZER_ASSET_SHA256,
+        )
+
+    def test_token_counter_works_with_empty_cache_and_network_blocked(self) -> None:
+        module_dir = Path(book_utils.__file__).resolve().parent
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            empty_cache = temp_path / "empty_tiktoken_cache"
+            empty_cache.mkdir()
+            env = os.environ.copy()
+            env["TIKTOKEN_CACHE_DIR"] = str(empty_cache)
+            env["DATA_GYM_CACHE_DIR"] = str(empty_cache)
+            existing_pythonpath = env.get("PYTHONPATH")
+            env["PYTHONPATH"] = os.pathsep.join(
+                part
+                for part in (str(module_dir), existing_pythonpath)
+                if part
+            )
+            test_script = textwrap.dedent(
+                """
+                import socket
+                import urllib.request
+
+                def network_disabled(*args, **kwargs):
+                    raise AssertionError("network access attempted")
+
+                socket.create_connection = network_disabled
+                socket.getaddrinfo = network_disabled
+                urllib.request.urlopen = network_disabled
+
+                import book_utils
+
+                count_tokens = book_utils.token_counter()
+                assert count_tokens("This is a test.") == 5
+                assert count_tokens("Hello, 世界") == 3
+                assert count_tokens("<|endoftext|>") == 7
+                assert count_tokens("") == 0
+                """
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-c", test_script],
+                cwd=temp_path,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(list(empty_cache.iterdir()), [])
 
 
 class JPGPDFConversionTests(unittest.TestCase):

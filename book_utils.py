@@ -51,7 +51,9 @@ Dependency handling:
 
 from __future__ import annotations
 
+import base64
 import difflib
+import hashlib
 import importlib.util
 import json
 import platform
@@ -68,6 +70,32 @@ from typing import Callable, Iterable
 
 
 DEFAULT_MODEL_TOKEN_CAPACITY = 25_000
+TOKENIZER_ASSET_PATH = (
+    Path(__file__).resolve().parent
+    / "book_utils_assets"
+    / "o200k_base.tiktoken"
+)
+TOKENIZER_ASSET_SHA256 = (
+    "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
+)
+TOKENIZER_MERGEABLE_RANK_COUNT = 199_998
+TOKENIZER_PATTERN = "|".join(
+    (
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*"
+        r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+"
+        r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+        r"\p{N}{1,3}",
+        r" ?[^\s\p{L}\p{N}]+[\r\n/]*",
+        r"\s*[\r\n]+",
+        r"\s+(?!\S)",
+        r"\s+",
+    )
+)
+TOKENIZER_SPECIAL_TOKENS = {
+    "<|endoftext|>": 199_999,
+    "<|endofprompt|>": 200_018,
+}
 OUTPUT_PREFIX = "chatgpt_ocr_chunk"
 ERRORS_FILENAME = "chatgpt_ocr_errors.txt"
 MANIFEST_FILENAME = "chatgpt_ocr_manifest.json"
@@ -275,7 +303,7 @@ JPG_EXTENSIONS = {".jpg", ".jpeg"}
 REQUIRED_MODULES = {
     "Vision": "pyobjc-framework-Vision",
     "Foundation": "pyobjc-framework-Cocoa",
-    "tiktoken": "tiktoken",
+    "tiktoken": "tiktoken==0.13.0",
     "pypdf": "pypdf",
     "fitz": "PyMuPDF",
 }
@@ -2265,16 +2293,61 @@ def clean_txt_files_in_folder(
     )
 
 
-def token_counter() -> Callable[[str], int]:
-    """Return a token-counting function."""
+def load_bundled_token_encoding():
+    """Build the o200k tokenizer entirely from Book Utils' local asset."""
     import tiktoken
 
     try:
-        encoding = tiktoken.get_encoding("o200k_base")
-    except Exception:
-        encoding = tiktoken.get_encoding("cl100k_base")
+        asset_data = TOKENIZER_ASSET_PATH.read_bytes()
+    except OSError as exc:
+        raise OCRChunkerError(
+            "Book Utils is missing its bundled tokenizer data. Keep the "
+            "book_utils_assets folder beside book_utils.py and try again."
+        ) from exc
 
-    return lambda text: len(encoding.encode(text))
+    actual_hash = hashlib.sha256(asset_data).hexdigest()
+    if actual_hash != TOKENIZER_ASSET_SHA256:
+        raise OCRChunkerError(
+            "Book Utils' bundled tokenizer data is damaged. Restore "
+            "book_utils_assets/o200k_base.tiktoken and try again."
+        )
+
+    try:
+        mergeable_ranks = {}
+        for line in asset_data.splitlines():
+            if not line:
+                continue
+            encoded_token, rank = line.split()
+            token = base64.b64decode(encoded_token, validate=True)
+            mergeable_ranks[token] = int(rank)
+    except Exception as exc:
+        raise OCRChunkerError(
+            "Book Utils could not read its bundled tokenizer data."
+        ) from exc
+
+    if len(mergeable_ranks) != TOKENIZER_MERGEABLE_RANK_COUNT:
+        raise OCRChunkerError(
+            "Book Utils' bundled tokenizer data is incomplete."
+        )
+
+    try:
+        return tiktoken.Encoding(
+            name="book_utils_o200k_base",
+            pat_str=TOKENIZER_PATTERN,
+            mergeable_ranks=mergeable_ranks,
+            special_tokens=TOKENIZER_SPECIAL_TOKENS,
+        )
+    except Exception as exc:
+        raise OCRChunkerError(
+            "Book Utils could not initialize its bundled tokenizer."
+        ) from exc
+
+
+def token_counter() -> Callable[[str], int]:
+    """Return an exact token counter that never downloads encoding data."""
+    encoding = load_bundled_token_encoding()
+
+    return lambda text: len(encoding.encode(text, disallowed_special=()))
 
 
 def recognize_text_from_image(image_path: Path) -> str:
