@@ -86,6 +86,146 @@ class SubtitleLanguageSelectionTests(unittest.TestCase):
 
         self.assertEqual(opts["subtitleslangs"], ["es"])
 
+    def test_player_client_override_preserves_other_extractor_args(self) -> None:
+        original = {"youtube": {"player_skip": ["configs"]}, "generic": {"foo": ["bar"]}}
+
+        result = downloader.with_youtube_player_client(original, "web_embedded")
+
+        self.assertEqual(result["youtube"]["player_client"], ["web_embedded"])
+        self.assertEqual(result["youtube"]["player_skip"], ["configs"])
+        self.assertEqual(result["generic"], {"foo": ["bar"]})
+        self.assertNotIn("player_client", original["youtube"])
+
+
+class SubtitleFallbackTests(unittest.TestCase):
+    def test_single_srt_job_fails_when_no_valid_subtitle_was_created(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gui = object.__new__(downloader.DownloaderGUI)
+            gui.queue = mock.Mock()
+            gui.queue_log = lambda _message: None
+            gui.queue_progress = lambda *_args, **_kwargs: None
+            gui.make_progress_hook = lambda: (lambda _data: None)
+            config = {
+                "mode": "single",
+                "media_type": "srt",
+                "url": "https://www.youtube.com/watch?v=5WDBhdPprqw",
+                "output_dir": tmp,
+                "wrap_in_folder": False,
+                "use_cookies": False,
+                "browser": "chrome",
+                "want_subs": True,
+                "subs_lang": "original",
+            }
+
+            with (
+                mock.patch.object(downloader, "run_download", return_value=0),
+                mock.patch.object(
+                    downloader,
+                    "run_optional_auto_sub_fallback",
+                    return_value=downloader.SubtitleCleanupStats(),
+                ),
+            ):
+                success, summary = gui.download_one(config)
+
+            self.assertFalse(success)
+            self.assertIn("Subtitle download failed", summary)
+
+    def test_playlist_completion_ignores_invalid_srt_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "01 - broken.en.srt").write_text("not subtitles", encoding="utf-8")
+            (output_dir / "02 - valid.en.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nCaption\n",
+                encoding="utf-8",
+            )
+
+            completed = downloader.completed_playlist_indices(
+                output_dir,
+                extensions={"srt"},
+            )
+
+            self.assertEqual(completed, {2})
+
+    def test_retries_with_embedded_client_when_defaults_create_no_srt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            calls: list[dict] = []
+
+            def fake_run_download(_urls, opts, **_kwargs) -> int:
+                calls.append(opts)
+                if len(calls) == 2:
+                    (output_dir / "video.ja-orig.srt").write_text(
+                        "1\n00:00:01,000 --> 00:00:02,000\nCaption\n",
+                        encoding="utf-8",
+                    )
+                return 0
+
+            logs: list[str] = []
+            base_opts = {
+                "paths": {"home": str(output_dir)},
+                "subtitleslangs": [downloader.ORIGINAL_SUBTITLE_PATTERN],
+                "extractor_args": {},
+            }
+            with mock.patch.object(downloader, "run_download", side_effect=fake_run_download):
+                stats = downloader.run_optional_auto_sub_fallback(
+                    ["https://example.invalid/video"],
+                    base_opts,
+                    output_dir=output_dir,
+                    retry_without_cookies=False,
+                    logger=logs.append,
+                )
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(
+                calls[1]["extractor_args"]["youtube"]["player_client"],
+                ["web_embedded"],
+            )
+            self.assertTrue(calls[1]["ignore_no_formats_error"])
+            self.assertEqual(stats.scanned_files, 1)
+            self.assertTrue(any("embedded client" in message for message in logs))
+
+    def test_does_not_use_embedded_client_when_default_fallback_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+
+            def fake_run_download(_urls, _opts, **_kwargs) -> int:
+                (output_dir / "video.en.srt").write_text(
+                    "1\n00:00:01,000 --> 00:00:02,000\nCaption\n",
+                    encoding="utf-8",
+                )
+                return 0
+
+            with mock.patch.object(downloader, "run_download", side_effect=fake_run_download) as run_mock:
+                downloader.run_optional_auto_sub_fallback(
+                    ["https://example.invalid/video"],
+                    {
+                        "paths": {"home": str(output_dir)},
+                        "subtitleslangs": ["en"],
+                    },
+                    output_dir=output_dir,
+                    retry_without_cookies=False,
+                    logger=lambda _message: None,
+                )
+
+            self.assertEqual(run_mock.call_count, 1)
+
+    def test_gui_logger_confirms_only_parseable_srt_destinations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            valid_path = output_dir / "valid.en.srt"
+            invalid_path = output_dir / "invalid.en.srt"
+            valid_path.write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nCaption\n",
+                encoding="utf-8",
+            )
+            invalid_path.write_text("not subtitles", encoding="utf-8")
+            logger = downloader.GuiLogger(lambda _message: None)
+
+            logger.info(f"[info] Writing video subtitles to: {valid_path}")
+            logger.info(f"[info] Writing video subtitles to: {invalid_path}")
+
+            self.assertEqual(logger.valid_srt_destinations(), {valid_path.resolve()})
+
 
 class VttSubtitleRecoveryTests(unittest.TestCase):
     def test_converts_vtt_to_normalized_srt_and_removes_source(self) -> None:

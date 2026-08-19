@@ -338,6 +338,26 @@ def build_youtube_extractor_args(logger) -> dict:
 class GuiLogger:
     def __init__(self, sink) -> None:
         self.sink = sink
+        # yt-dlp can return exit code 0 even when the requested subtitle
+        # language was unavailable. Keep the concrete destinations it says it
+        # is writing so the GUI can verify a real SRT before reporting success.
+        self.subtitle_destinations: set[Path] = set()
+
+    def _capture_subtitle_destination(self, msg: str) -> None:
+        marker = "Writing video subtitles to:"
+        if marker not in msg:
+            return
+        raw_path = msg.split(marker, 1)[1].strip()
+        if raw_path:
+            self.subtitle_destinations.add(Path(raw_path).expanduser().resolve())
+
+    def valid_srt_destinations(self) -> set[Path]:
+        valid: set[Path] = set()
+        for destination in self.subtitle_destinations:
+            srt_path = destination if destination.suffix.lower() == ".srt" else destination.with_suffix(".srt")
+            if is_valid_srt_file(srt_path):
+                valid.add(srt_path)
+        return valid
 
     def debug(self, msg: str) -> None:
         cleaned = (msg or "").strip()
@@ -347,6 +367,7 @@ class GuiLogger:
     def info(self, msg: str) -> None:
         cleaned = (msg or "").strip()
         if cleaned:
+            self._capture_subtitle_destination(cleaned)
             self.sink(cleaned)
 
     def warning(self, msg: str) -> None:
@@ -393,6 +414,29 @@ def build_subtitle_opts(*, langs: list[str], auto: bool, skip_download: bool = F
         opts["skip_download"] = True
         opts["nooverwrites"] = True
     return opts
+
+
+def with_youtube_player_client(extractor_args: dict, client: str) -> dict:
+    """Return extractor args that select one YouTube client without mutation."""
+    merged = dict(extractor_args or {})
+    youtube_args = dict(merged.get("youtube") or {})
+    youtube_args["player_client"] = [client]
+    merged["youtube"] = youtube_args
+    return merged
+
+
+def build_embedded_subtitle_fallback_opts(base_opts: dict) -> dict:
+    """Use YouTube's embedded client for a caption-only recovery pass."""
+    return {
+        **base_opts,
+        "extractor_args": with_youtube_player_client(
+            base_opts.get("extractor_args", {}),
+            "web_embedded",
+        ),
+        # This client may expose captions but no media formats. That must not
+        # prevent skip-download subtitle processing from running.
+        "ignore_no_formats_error": True,
+    }
 
 
 def maybe_get_playlist_length(url: str, extractor_args: dict, cookiesfrombrowser, logger) -> int | None:
@@ -528,6 +572,8 @@ def completed_playlist_indices(
         if not path.is_file() or path.stat().st_size <= 0:
             continue
         if path.suffix.lower().lstrip(".") not in normalized_extensions:
+            continue
+        if path.suffix.lower() == ".srt" and not is_valid_srt_file(path):
             continue
         match = PLAYLIST_FILE_INDEX_RE.match(path.name)
         if match:
@@ -1137,6 +1183,20 @@ def snapshot_srt_files(directory: str | Path) -> set[Path]:
     return {path.resolve() for path in base.rglob("*.srt") if path.is_file()}
 
 
+def is_valid_srt_file(path: Path) -> bool:
+    """Return whether *path* is a non-empty SRT containing at least one cue."""
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False
+        return bool(parse_srt_content(path.read_text(encoding="utf-8", errors="replace")))
+    except (OSError, ValueError):
+        return False
+
+
+def snapshot_valid_srt_files(directory: str | Path) -> set[Path]:
+    return {path for path in snapshot_srt_files(directory) if is_valid_srt_file(path)}
+
+
 def snapshot_vtt_files(directory: str | Path) -> set[Path]:
     base = Path(directory).expanduser()
     if not base.exists():
@@ -1345,15 +1405,43 @@ def run_optional_auto_sub_fallback(
         **build_subtitle_opts(langs=base_opts["subtitleslangs"], auto=True, skip_download=True),
         "ignoreerrors": True,
     }
-    before_files = snapshot_srt_files(output_dir)
+    before_files = snapshot_valid_srt_files(output_dir)
     logger(
         "> Subtitle fallback pass: trying AUTO-generated subtitles in the selected language, "
         "plus original-language captions when the source language is outside fr/en/es..."
     )
     result = run_download(urls, fallback_opts, retry_without_cookies=retry_without_cookies, logger=logger)
-    after_files = snapshot_srt_files(output_dir)
+    after_files = snapshot_valid_srt_files(output_dir)
+
+    # YouTube currently withholds some automatic-caption tracks from yt-dlp's
+    # default web clients unless a per-video subtitle PO token is supplied.
+    # The web embedded client can expose those same tracks without a token for
+    # embeddable videos. Keep it as a narrow second pass because the embedded
+    # client is not valid for every video.
+    if not (after_files - before_files):
+        logger(
+            "> Default clients produced no subtitle file. Retrying captions through "
+            "YouTube's embedded client (PO-token workaround)..."
+        )
+        embedded_opts = build_embedded_subtitle_fallback_opts(fallback_opts)
+        embedded_result = run_download(
+            urls,
+            embedded_opts,
+            retry_without_cookies=retry_without_cookies,
+            logger=logger,
+        )
+        # This is the decisive pass after the default clients produced no
+        # file. A successful embedded retry should clear a non-zero result
+        # from the unproductive default attempt.
+        result = embedded_result
+        after_files = snapshot_valid_srt_files(output_dir)
+
     new_auto_srt_files = sorted(after_files - before_files)
     cleanup_stats = run_auto_subtitle_cleanup(new_auto_srt_files, logger)
+    if not new_auto_srt_files:
+        logger(
+            "WARNING: No valid .srt subtitle file was created by either subtitle fallback."
+        )
     if result != 0:
         logger(
             "> Auto-subtitle fallback did not fully succeed. That is not fatal: your media download may still be fine, "
@@ -2454,6 +2542,7 @@ class DownloaderGUI:
                 logger=logger,
             )
             before_files = snapshot_all_files(config["output_dir"])
+            before_valid_srt_files = snapshot_valid_srt_files(config["output_dir"])
 
             ytdlp_logger = GuiLogger(logger)
             common_opts: dict = {
@@ -2549,6 +2638,25 @@ class DownloaderGUI:
                         retry_without_cookies=True,
                         logger=logger,
                     )
+
+                    created_valid_srt_files = (
+                        snapshot_valid_srt_files(config["output_dir"])
+                        - before_valid_srt_files
+                    )
+                    confirmed_srt_files = ytdlp_logger.valid_srt_destinations()
+                    if not created_valid_srt_files and not confirmed_srt_files:
+                        if media_type == "srt":
+                            summary = (
+                                "Subtitle download failed: YouTube exposed no downloadable captions "
+                                "through either the normal or embedded-client fallback."
+                            )
+                        else:
+                            summary = (
+                                f"The {artifact_label} downloaded, but the requested subtitles did not. "
+                                "YouTube exposed no downloadable captions through either fallback."
+                            )
+                        logger(f"ERROR: {summary}")
+                        return False, summary
 
                 residue_stats = cleanup_new_residue_since(before_files, config["output_dir"], logger)
                 if media_type == "srt":
@@ -2763,6 +2871,40 @@ class DownloaderGUI:
                             snapshot_srt_files(config["output_dir"]) - before_srt_files
                         )
                         cleanup_stats = run_auto_subtitle_cleanup(new_auto_srt_files, logger)
+
+                        embedded_targets = missing_subtitle_indices()
+                        if embedded_targets:
+                            logger(
+                                f"> Default clients left {len(embedded_targets)} playlist subtitle(s) "
+                                f"missing. Retrying those captions through YouTube's embedded client "
+                                f"(PO-token workaround): {format_playlist_items(embedded_targets)}"
+                            )
+                            before_embedded_srt_files = snapshot_srt_files(config["output_dir"])
+                            embedded_opts = build_embedded_subtitle_fallback_opts(
+                                {
+                                    **auto_opts,
+                                    "playlist_items": format_playlist_items(embedded_targets),
+                                }
+                            )
+                            embedded_result = run_download(
+                                [url],
+                                embedded_opts,
+                                retry_without_cookies=True,
+                                logger=logger,
+                            )
+                            result = embedded_result or result
+                            new_embedded_srt_files = sorted(
+                                snapshot_srt_files(config["output_dir"])
+                                - before_embedded_srt_files
+                            )
+                            embedded_cleanup = run_auto_subtitle_cleanup(
+                                new_embedded_srt_files,
+                                logger,
+                            )
+                            cleanup_stats.scanned_files += embedded_cleanup.scanned_files
+                            cleanup_stats.adjusted_files += embedded_cleanup.adjusted_files
+                            cleanup_stats.changed_cues += embedded_cleanup.changed_cues
+                            cleanup_stats.failed_files += embedded_cleanup.failed_files
             else:
                 logger(
                     "> Playlist inventory was unavailable; using yt-dlp's safe continuation mode. "
