@@ -69,6 +69,7 @@ class MediaReference:
     location: str = "article body"
     downloaded_file: str = ""
     download_error: str = ""
+    render_source_as_link: bool = False
 
 
 @dataclass
@@ -921,6 +922,132 @@ class ReeseReportRichTextConverter:
 # END WEBSITE CODE: reese-report-support
 
 
+# BEGIN WEBSITE CODE: offguardian-support
+class OffGuardianPageParser(HTMLParser):
+    """Discover OffGuardian's REST post endpoint and page-only byline media."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rest_api_url = ""
+        self.canonical_url = ""
+        self.author = ""
+        self.cover_source = ""
+        self._author_depth = 0
+        self._author_parts: list[str] = []
+        self._cover_depth = 0
+
+    @staticmethod
+    def _media_source(attrs: dict[str, str | None]) -> str:
+        for key in ("src", "data-src", "data-lazy-src"):
+            value = attrs.get(key) or ""
+            if value:
+                return value
+        srcset = attrs.get("srcset") or attrs.get("data-srcset") or ""
+        candidates = [part.strip().split()[0] for part in srcset.split(",") if part.strip()]
+        return candidates[-1] if candidates else ""
+
+    def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attrs = dict(attrs_list)
+        classes = _class_tokens(attrs)
+        href = attrs.get("href") or ""
+
+        if tag == "link":
+            if (attrs.get("rel") or "").lower() == "canonical" and not self.canonical_url:
+                self.canonical_url = href
+            if (
+                (attrs.get("type") or "").lower() == "application/json"
+                and re.search(r"/wp-json/wp/v2/posts/\d+(?:[/?#]|$)", href)
+                and not self.rest_api_url
+            ):
+                self.rest_api_url = href
+
+        if tag == "h6" and "author-cf" in classes and not self._author_depth:
+            self._author_depth = 1
+        elif self._author_depth and tag not in StructuredTextParser.VOID_TAGS:
+            self._author_depth += 1
+
+        if tag == "div" and "title_image_wrap" in classes and not self._cover_depth:
+            self._cover_depth = 1
+        elif self._cover_depth and tag not in StructuredTextParser.VOID_TAGS:
+            self._cover_depth += 1
+        if tag == "img" and self._cover_depth and not self.cover_source:
+            self.cover_source = self._media_source(attrs)
+
+    def handle_data(self, data: str) -> None:
+        if self._author_depth:
+            self._author_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._author_depth:
+            self._author_depth -= 1
+            if not self._author_depth:
+                self.author = _clean_inline("".join(self._author_parts))
+        if self._cover_depth:
+            self._cover_depth -= 1
+
+
+class OffGuardianStructuredTextParser(StructuredTextParser):
+    """Preserve OffGuardian/WordPress text and mark all non-linear elements."""
+
+    VISUAL_TAGS = StructuredTextParser.VISUAL_TAGS | {
+        "details", "form", "object", "select", "textarea",
+    }
+    EMBED_CLASS_PARTS = StructuredTextParser.EMBED_CLASS_PARTS | {
+        "instagram-media", "wp-block-embed", "wp-block-gallery",
+    }
+    VOID_INTERACTIVE_TAGS = {"embed", "input"}
+    INTERACTIVE_TAGS = {"button"}
+
+    @staticmethod
+    def _component_source(attrs: dict[str, str | None]) -> str:
+        for key in (
+            "src", "data-src", "data-lazy-src", "data-url", "href", "poster", "action",
+        ):
+            value = attrs.get(key) or ""
+            if value:
+                return value
+        srcset = attrs.get("srcset") or attrs.get("data-srcset") or ""
+        candidates = [part.strip().split()[0] for part in srcset.split(",") if part.strip()]
+        return candidates[-1] if candidates else ""
+
+    def _add_media(self, kind: str, attrs: dict[str, str | None]) -> None:
+        enriched = dict(attrs)
+        if not enriched.get("src") and not enriched.get("href"):
+            enriched["src"] = self._component_source(enriched)
+        previous_count = len(self.media)
+        super()._add_media(kind, enriched)
+        if len(self.media) > previous_count:
+            self.media[-1].render_source_as_link = True
+
+    def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attrs = dict(attrs_list)
+        if not self._ignore_depth and not self._skip_depth and tag in self.VOID_INTERACTIVE_TAGS:
+            self._add_media("interactive content", attrs)
+            return
+        if not self._ignore_depth and not self._skip_depth and tag in self.INTERACTIVE_TAGS:
+            self._add_media("interactive content", attrs)
+            self._skip_depth = 1
+            return
+        super().handle_starttag(tag, attrs_list)
+
+
+def offguardian_html_to_blocks(
+    fragment: str,
+    canonical_url: str,
+    first_media_number: int = 1,
+) -> tuple[list[str], list[MediaReference]]:
+    parser = OffGuardianStructuredTextParser(first_media_number)
+    parser.feed(fragment)
+    parser.close()
+    for item in parser.media:
+        if item.source:
+            item.source = urllib.parse.urljoin(canonical_url, item.source)
+    return parser.blocks, parser.media
+# END WEBSITE CODE: offguardian-support
+
+
 
 
 
@@ -1593,6 +1720,183 @@ class ReeseReportAdapter:
 # END WEBSITE CODE: reese-report-adapter
 
 
+# BEGIN WEBSITE CODE: offguardian-adapter
+class OffGuardianAdapter:
+    """Dedicated adapter for OffGuardian's public WordPress articles/comments."""
+
+    name = "OffGuardian"
+    HOSTS = {"off-guardian.org", "www.off-guardian.org"}
+    COMMENTS_PAGE_SIZE = 100
+
+    @classmethod
+    def matches(cls, url: str) -> bool:
+        return (urllib.parse.urlparse(url).hostname or "").lower() in cls.HOSTS
+
+    @classmethod
+    def _normalized_article_url(cls, url: str) -> tuple[str, str]:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower()
+        match = re.fullmatch(r"/(\d{4})/(\d{2})/(\d{2})/([^/]+)/?", parsed.path)
+        if parsed.scheme not in {"http", "https"} or host not in cls.HOSTS or not match:
+            raise ExtractionError(
+                "Please paste an OffGuardian article URL in the form "
+                "https://off-guardian.org/YYYY/MM/DD/article-slug/"
+            )
+        slug = urllib.parse.unquote(match.group(4))
+        normalized = "https://off-guardian.org" + parsed.path.rstrip("/") + "/"
+        return normalized, slug
+
+    @staticmethod
+    def _json_payload(text: str, label: str) -> object:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ExtractionError(f"OffGuardian returned invalid {label} data.") from exc
+
+    @staticmethod
+    def _featured_media_source(data: dict) -> str:
+        embedded = data.get("_embedded")
+        if not isinstance(embedded, dict):
+            return ""
+        media_items = embedded.get("wp:featuredmedia")
+        if not isinstance(media_items, list) or not media_items:
+            return ""
+        first = media_items[0]
+        return str(first.get("source_url") or "") if isinstance(first, dict) else ""
+
+    @classmethod
+    def _comments_from_api(
+        cls, payload: object, canonical_url: str
+    ) -> list[Comment]:
+        if not isinstance(payload, list):
+            raise ExtractionError("OffGuardian returned invalid comment data.")
+        comments: list[Comment] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            identifier = str(item.get("id") or "")
+            content = item.get("content")
+            rendered = content.get("rendered") if isinstance(content, dict) else ""
+            blocks, media = offguardian_html_to_blocks(str(rendered or ""), canonical_url)
+            if not blocks:
+                continue
+            parent = str(item.get("parent") or "")
+            comments.append(
+                Comment(
+                    identifier=identifier or f"position-{len(comments) + 1}",
+                    author=_clean_inline(str(item.get("author_name") or "Unknown")),
+                    published=_clean_inline(
+                        str(item.get("date") or item.get("date_gmt") or "")
+                    ),
+                    blocks=blocks,
+                    parent_identifier="" if parent == "0" else parent,
+                    media=media,
+                )
+            )
+        return comments
+
+    @classmethod
+    def _comments_api_url(cls, post_id: int, offset: int) -> str:
+        query = urllib.parse.urlencode(
+            {
+                "post": post_id,
+                "status": "approve",
+                "per_page": cls.COMMENTS_PAGE_SIZE,
+                "offset": offset,
+                "orderby": "date_gmt",
+                "order": "asc",
+            }
+        )
+        return f"https://off-guardian.org/wp-json/wp/v2/comments?{query}"
+
+    def extract(self, url: str, progress: Callable[[str], None]) -> ExtractedArticle:
+        article_url, fallback_slug = self._normalized_article_url(url)
+        progress("Downloading OffGuardian's public article page…")
+        page = fetch_text(article_url)
+        page_parser = OffGuardianPageParser()
+        page_parser.feed(page)
+        page_parser.close()
+        if not page_parser.rest_api_url:
+            raise ExtractionError("The OffGuardian page did not expose its public post endpoint.")
+
+        endpoint = urllib.parse.urlparse(page_parser.rest_api_url)
+        if (
+            (endpoint.hostname or "").lower() not in self.HOSTS
+            or not re.fullmatch(r"/wp-json/wp/v2/posts/\d+", endpoint.path)
+        ):
+            raise ExtractionError("The OffGuardian page exposed an unexpected post endpoint.")
+        post_api_url = urllib.parse.urlunparse(
+            endpoint._replace(query=urllib.parse.urlencode({"_embed": "wp:featuredmedia"}))
+        )
+        progress("Downloading OffGuardian's public article data…")
+        post_data = self._json_payload(fetch_text(post_api_url), "article")
+        if not isinstance(post_data, dict):
+            raise ExtractionError("OffGuardian returned invalid article data.")
+        content = post_data.get("content")
+        body_html = content.get("rendered") if isinstance(content, dict) else ""
+        if not body_html:
+            raise ExtractionError("No complete public OffGuardian article body was returned.")
+
+        canonical = str(post_data.get("link") or page_parser.canonical_url or article_url)
+        blocks: list[str] = []
+        media: list[MediaReference] = []
+        cover = page_parser.cover_source or self._featured_media_source(post_data)
+        if cover:
+            cover = urllib.parse.urljoin(canonical, cover)
+            marker = "IMAGE-01"
+            blocks.append(marker)
+            media.append(
+                MediaReference(
+                    marker,
+                    "cover image",
+                    cover,
+                    location="article cover",
+                    render_source_as_link=True,
+                )
+            )
+
+        body_blocks, body_media = offguardian_html_to_blocks(
+            str(body_html), canonical, len(media) + 1
+        )
+        blocks.extend(body_blocks)
+        media.extend(body_media)
+        if not blocks:
+            raise ExtractionError("The OffGuardian article contained no readable public content.")
+
+        post_id = post_data.get("id")
+        if not isinstance(post_id, int) or post_id <= 0:
+            raise ExtractionError("OffGuardian did not return a valid public post ID.")
+        progress("Downloading all public OffGuardian comments and nested replies…")
+        comments: list[Comment] = []
+        offset = 0
+        while True:
+            payload = self._json_payload(
+                fetch_text(self._comments_api_url(post_id, offset)), "comment"
+            )
+            if not isinstance(payload, list):
+                raise ExtractionError("OffGuardian returned invalid comment data.")
+            comments.extend(self._comments_from_api(payload, canonical))
+            if len(payload) < self.COMMENTS_PAGE_SIZE:
+                break
+            offset += self.COMMENTS_PAGE_SIZE
+
+        title = post_data.get("title")
+        title_html = title.get("rendered") if isinstance(title, dict) else ""
+        return ExtractedArticle(
+            title=_clean_inline(str(title_html or fallback_slug)),
+            subtitle="",
+            author=page_parser.author,
+            published=_clean_inline(str(post_data.get("date") or "")),
+            canonical_url=canonical,
+            slug=str(post_data.get("slug") or fallback_slug),
+            blocks=blocks,
+            comments=comments,
+            media=media,
+            adapter_name=self.name,
+        )
+# END WEBSITE CODE: offguardian-adapter
+
+
 @dataclass(frozen=True)
 class WebsiteExtractorDefinition:
     """One user-selectable website and the adapter that powers its extractor."""
@@ -1680,6 +1984,25 @@ WEBSITE_EXTRACTORS: tuple[WebsiteExtractorDefinition, ...] = (
         removable_sections=("reese-report-support", "reese-report-adapter"),
     ),
     # END WEBSITE CODE: profile-reese-report
+    # BEGIN WEBSITE CODE: profile-offguardian
+    WebsiteExtractorDefinition(
+        key="offguardian",
+        display_name="OffGuardian",
+        homepage="https://off-guardian.org/category/todd-hayen/",
+        description=(
+            "Extract complete public OffGuardian articles plus all publicly accessible "
+            "comments and nested replies. Images, tables, embeds, audio, video, and other "
+            "non-linear content remain in source order as placeholders."
+        ),
+        example_url=(
+            "https://off-guardian.org/2026/07/25/i-no-longer-trust-anyone/"
+        ),
+        allowed_hosts=("off-guardian.org", "www.off-guardian.org"),
+        adapter_type=OffGuardianAdapter,
+        extracts_comments=True,
+        removable_sections=("offguardian-support", "offguardian-adapter"),
+    ),
+    # END WEBSITE CODE: profile-offguardian
 )
 
 WEBSITE_EXTRACTORS_BY_KEY = {item.key: item for item in WEBSITE_EXTRACTORS}
@@ -1970,7 +2293,12 @@ def _media_details(item: MediaReference) -> str:
     """Render a compact placeholder followed by its source URL."""
     lines = [item.placeholder]
     if item.source:
-        lines.extend(["", f"Media source: {item.source}"])
+        source = (
+            f"[{item.source}]({item.source})"
+            if item.render_source_as_link
+            else item.source
+        )
+        lines.extend(["", f"Media source: {source}"])
     return "\n".join(lines)
 
 

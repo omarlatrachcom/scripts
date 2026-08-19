@@ -17,15 +17,10 @@ Current website menu:
   `tomatobible.substack.com`, with images, video embeds, interactive buttons,
   tables, and other non-linear content represented by ordered placeholders. It
   does not extract comments.
-- **islamonline.net/category/books:** complete public book-category articles from
-  `islamonline.net`. This dedicated extractor exports the article only; it does
-  not create a comments file.
-- **InfoQ:** complete public podcast articles from `infoq.com`, including the
-  introduction, key takeaways, direct podcast audio, and full transcript. It
-  does not extract comments.
-- **InfoQ Articles:** complete public articles from `infoq.com/articles/`, with
-  article audio, images, diagrams, tables, embeds, and other non-linear elements
-  represented by ordered placeholders. It does not extract comments.
+- **OffGuardian:** complete public articles plus every publicly accessible
+  comment and nested reply from `off-guardian.org`. The title image and all
+  article-body media stay in reading order as `IMAGE-XX` placeholders, and each
+  reply records its direct parent comment ID.
 
 ## Deleting a website extractor
 
@@ -106,10 +101,6 @@ the remaining text and non-linear content in source order. It also reads the
 public comments endpoint and exports every accessible comment and nested reply,
 including the direct parent comment ID for each reply.
 
-For **islamonline.net/category/books**, use an individual article from the Books
-category. Its button reads **Extract article**, and its exports contain no
-comments file.
-
 For **TomatoBible(トマトバイブル)**, use an individual URL under `/p/`. The
 dedicated article-only adapter reads the complete public `body_html` from
 Substack's `/api/v1/posts/{slug}` endpoint. It preserves the editorial text and
@@ -117,17 +108,12 @@ code blocks, and replaces figures, YouTube players, tables, interactive buttons,
 and similar non-linear elements in place with `IMAGE-XX` placeholders. It never
 requests or exports comments.
 
-For **InfoQ**, use an individual URL under `/podcasts/`. The extractor omits
-page controls and recommendations, preserves the editorial transcript, and
-uses InfoQ's public podcast feed to resolve a downloadable MP3 when available.
-
-For **InfoQ Articles**, use an individual URL under `/articles/`. The dedicated
-adapter reads the server-rendered public article body and its embedded
-`NewsArticle` metadata, preserves key takeaways and the full editorial text, and
-omits recommendation and author-profile UI. InfoQ's visible article-audio control
-is kept at its original position as an `IMAGE-XX` placeholder. If InfoQ does not
-expose a public audio source URL to a logged-out visitor, no source line is
-invented. This extractor creates no comments file.
+For **OffGuardian**, use an individual dated article URL under
+`/YYYY/MM/DD/article-slug/`. The dedicated adapter discovers the post's public
+WordPress REST endpoint from the live page, reads the complete rendered article
+body, and uses the page's real byline and title image. It then paginates the
+public approved-comments endpoint until every accessible comment and reply is
+exported. The comments file records `Reply to comment ID` for every nested reply.
 
 Enable **Download media files when a direct file is available** if image, audio,
 or video files should also be saved. It is off by default. Downloaded files go in
@@ -142,6 +128,8 @@ the extraction's `media/` folder.
   `_comments_part_XX.txt` files, split between complete comments.
 - The source URL appears directly below each `IMAGE-XX` placeholder, separated
   from the placeholder by an empty line. There is no separate media manifest.
+  OffGuardian renders the source as a Markdown link in the exact form
+  `Media source: [URL](URL)`.
 - An optional `media/` folder containing downloaded direct media files.
 - `extraction_summary.json` with counts and the token-counting mode.
 
@@ -205,39 +193,21 @@ python3 article_extractor_gui.py \
   --output "$HOME/Downloads"
 ```
 
-IslamOnline Books article-only example:
-
-```bash
-python3 article_extractor_gui.py \
-  --website "islamonline-books" \
-  --url "https://islamonline.net/%d8%b9%d8%b1%d8%b6-%d9%83%d8%aa%d8%a7%d8%a8-%d8%aa%d9%88%d8%b8%d9%8a%d9%81-%d8%a7%d9%84%d8%b0%d9%83%d8%a7%d8%a1-%d8%a7%d9%84%d8%aa%d9%88%d9%84%d9%8a%d8%af%d9%8a-%d9%81%d9%8a-%d8%a7%d9%84%d8%a7%d8%ac/" \
-  --output "$HOME/Downloads"
-```
-
-InfoQ podcast article-only example:
-
-```bash
-python3 article_extractor_gui.py \
-  --website "infoq-podcasts" \
-  --url "https://www.infoq.com/podcasts/strands-agents/" \
-  --output "$HOME/Downloads"
-```
-
-InfoQ article-only example:
-
-```bash
-python3 article_extractor_gui.py \
-  --website "infoq-articles" \
-  --url "https://www.infoq.com/articles/system-comprehension-evolutionary-architecture/" \
-  --output "$HOME/Downloads"
-```
-
 TomatoBible article-only example:
 
 ```bash
 python3 article_extractor_gui.py \
   --website "tomatobible" \
   --url "https://tomatobible.substack.com/p/predators-among-us-fascists-decodedunderstanding-b3d" \
+  --output "$HOME/Downloads"
+```
+
+OffGuardian article-and-comments example:
+
+```bash
+python3 article_extractor_gui.py \
+  --website "offguardian" \
+  --url "https://off-guardian.org/2026/07/25/i-no-longer-trust-anyone/" \
   --output "$HOME/Downloads"
 ```
 
