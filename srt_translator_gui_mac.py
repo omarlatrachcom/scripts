@@ -142,7 +142,7 @@ Keep brackets/parentheses and translate the content:
 NUMBERS AND UNITS:
 
 Use Western Arabic numerals 0–9 inside Arabic text (e.g. 3، 25، 2049).
-If imperial units appear (feet, miles, pounds, Fahrenheit), convert approximately to metric in Arabic.
+Convert non-metric measurements to metric equivalents in Arabic, rounding sensibly.
 
 Now translate the lines between the markers. Remember: output ONLY the translated L-lines, nothing else."""
 
