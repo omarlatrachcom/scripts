@@ -21,6 +21,14 @@ Current website menu:
   comment and nested reply from `off-guardian.org`. The title image and all
   article-body media stay in reading order as `IMAGE-XX` placeholders, and each
   reply records its direct parent comment ID.
+- **Globalresearch:** complete public articles from `globalresearch.ca`, with
+  the featured image, body images, galleries, tables, embeds, audio, video, and
+  other non-linear elements retained in source order as `IMAGE-XX`
+  placeholders. It does not extract comments.
+- **Food Sovereignty | Agrarian Systems | Development:** Colin Todhunter's
+  `off-guardian.org` archive, exposed as its own explicit extractor choice.
+  Complete public articles, ordered non-linear placeholders, and all public
+  comments and nested replies are exported without URL-based adapter selection.
 
 ## Deleting a website extractor
 
@@ -115,6 +123,25 @@ body, and uses the page's real byline and title image. It then paginates the
 public approved-comments endpoint until every accessible comment and reply is
 exported. The comments file records `Reply to comment ID` for every nested reply.
 
+For **Globalresearch**, use an individual article URL in the form
+`https://www.globalresearch.ca/article-slug/numeric-post-id`. The dedicated
+article-only adapter reads the complete rendered body, author, and featured
+image from the site's public WordPress `/wp-json/wp/v2/posts/{id}?_embed=1`
+endpoint. It tries that first-party endpoint directly; if Globalresearch's
+Cloudflare policy blocks the request, it retries the same public resource
+through Jina Reader. The adapter recognizes the indented paragraphs used by the
+site for quotations, preserves linear structure, and never requests or exports
+comments. When media download is selected, original media URLs are tried first;
+region-blocked Globalresearch files fall back to their latest raw Wayback
+capture without changing the source URL printed in the article text.
+
+For **Food Sovereignty | Agrarian Systems | Development**, explicitly select
+that entry on the first screen, then use a dated Colin Todhunter article URL from
+the archive at `https://off-guardian.org/category/colin-todhunter/`. Its adapter
+uses the post endpoint advertised by the live page and the public WordPress
+approved-comments collection. It preserves each API `parent` value as the
+direct parent comment ID; it does not choose itself from the pasted URL.
+
 Enable **Download media files when a direct file is available** if image, audio,
 or video files should also be saved. It is off by default. Downloaded files go in
 the extraction's `media/` folder.
@@ -124,12 +151,14 @@ the extraction's `media/` folder.
 - One article `.txt` file, or numbered `_part_XX.txt` files when chunking is
   required.
 - One structured `_comments.txt` file containing every public comment and reply.
-  If the combined document exceeds the token ceiling, it becomes numbered
-  `_comments_part_XX.txt` files, split between complete comments.
+  This is created only by comment-enabled extractors. If the combined document
+  exceeds the token ceiling, it becomes numbered `_comments_part_XX.txt` files,
+  split between complete comments.
 - The source URL appears directly below each `IMAGE-XX` placeholder, separated
   from the placeholder by an empty line. There is no separate media manifest.
-  OffGuardian renders the source as a Markdown link in the exact form
-  `Media source: [URL](URL)`.
+  OffGuardian and Food Sovereignty | Agrarian Systems | Development render the
+  source as a Markdown link in the exact form `Media source: [URL](URL)`.
+  Globalresearch uses that exact form as well.
 - An optional `media/` folder containing downloaded direct media files.
 - `extraction_summary.json` with counts and the token-counting mode.
 
@@ -208,6 +237,24 @@ OffGuardian article-and-comments example:
 python3 article_extractor_gui.py \
   --website "offguardian" \
   --url "https://off-guardian.org/2026/07/25/i-no-longer-trust-anyone/" \
+  --output "$HOME/Downloads"
+```
+
+Globalresearch article-only example:
+
+```bash
+python3 article_extractor_gui.py \
+  --website "globalresearch" \
+  --url "https://www.globalresearch.ca/living-most-corrupt-democracy-imagined/5934366" \
+  --output "$HOME/Downloads"
+```
+
+Food Sovereignty | Agrarian Systems | Development article-and-comments example:
+
+```bash
+python3 article_extractor_gui.py \
+  --website "food-sovereignty" \
+  --url "https://off-guardian.org/2026/07/24/manufacturing-inevitability-breaking-the-myth-of-no-alternative/" \
   --output "$HOME/Downloads"
 ```
 

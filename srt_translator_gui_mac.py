@@ -3,7 +3,7 @@
 srt_translator_gui_mac.py
 
 macOS-adapted GUI tool for:
-- Extracting subtitle text lines from <name>.<lang>.srt (lang = en, fr, es)
+- Extracting subtitle text lines from any SRT file
 - Chunking them into groups of 150 lines
 - Adding an embedded ChatGPT translation prompt at the top of each chunk
 - Letting the user Copy / Erase / Paste the content per chunk (for ChatGPT)
@@ -37,9 +37,6 @@ MAX_LINES_PER_CHUNK = 150  # subtitle text lines per tab/chunk
 DEFAULT_MODEL_NAME = "GPT-5.6 Sol High"
 
 VIDEO_EXTENSIONS = [".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".mpeg", ".mpg"]
-
-# Supported source language codes (filename pattern: <base>.<lang>.srt)
-SUPPORTED_LANG_CODES = ["en", "fr", "es"]
 
 TIMECODE_RE = re.compile(
     r"^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}$"
@@ -885,10 +882,7 @@ def rebuild_srt_sequential(srt_path: str, arabic_lines: List[str], target_path: 
 
 
 def find_source_srt_files(base_dir: str) -> List[str]:
-    """
-    Return list of <base>.<lang>.srt files in base_dir
-    where <lang> is one of SUPPORTED_LANG_CODES.
-    """
+    """Return every regular SRT file in ``base_dir``."""
     files: List[str] = []
     try:
         entries = os.listdir(base_dir)
@@ -896,18 +890,46 @@ def find_source_srt_files(base_dir: str) -> List[str]:
         return []
     for f in entries:
         full_path = os.path.join(base_dir, f)
-        if not f.endswith(".srt") or not os.path.isfile(full_path):
-            continue
-        parts = f.rsplit(".", 2)
-        if len(parts) != 3:
-            continue
-        base, lang_code, ext = parts
-        if ext != "srt":
-            continue
-        if lang_code in SUPPORTED_LANG_CODES:
+        if f.casefold().endswith(".srt") and os.path.isfile(full_path):
             files.append(f)
-    files.sort()
+    files.sort(key=str.casefold)
     return files
+
+
+def source_srt_name_parts(filename: str) -> Tuple[str, Optional[str]]:
+    """
+    Return the output base name and optional language label for any SRT name.
+
+    A final label is preserved as language metadata so ``movie.de.srt`` still
+    produces ``movie.ar.srt``. A plain ``movie.srt`` uses ``movie`` as its base.
+    """
+    name = os.path.basename(filename)
+    if not name.casefold().endswith(".srt"):
+        raise ValueError(f"File '{name}' is not an SRT file.")
+
+    stem = name[:-4]
+    if not stem:
+        raise ValueError("An SRT file must have a name before the extension.")
+
+    if "." in stem:
+        base, language_label = stem.rsplit(".", 1)
+        if base and language_label:
+            return base, language_label
+    return stem, None
+
+
+def arabic_srt_output_path(
+    base_dir: str,
+    base_name: str,
+    source_path: Optional[str] = None,
+) -> str:
+    """Build the Arabic output path without ever overwriting the selected source."""
+    output_path = os.path.join(base_dir, base_name + ".ar.srt")
+    source_key = os.path.normcase(os.path.realpath(source_path)).casefold() if source_path else None
+    output_key = os.path.normcase(os.path.realpath(output_path)).casefold()
+    if source_key == output_key:
+        output_path = os.path.join(base_dir, base_name + ".translated.ar.srt")
+    return output_path
 
 
 def find_video_for_base(base_name: str, base_dir: str) -> Optional[str]:
@@ -937,7 +959,7 @@ def open_video_in_vlc(path: str) -> None:
 class SRTTranslatorGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("SRT Translator GUI for macOS (en/fr/es → ar)")
+        self.root.title("SRT Translator GUI for macOS (→ ar)")
         self.root.geometry("1250x780")
 
         self.current_dir = os.path.expanduser(os.environ.get("HOME", "~"))
@@ -991,7 +1013,7 @@ class SRTTranslatorGUI:
         file_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
 
         ttk.Label(
-            file_frame, text="Select <name>.<lang>.srt (lang = en, fr, es):"
+            file_frame, text="Select an SRT file:"
         ).pack(side=tk.LEFT)
 
         self.src_srt_files = find_source_srt_files(self.current_dir)
@@ -1009,7 +1031,7 @@ class SRTTranslatorGUI:
         if self.src_srt_files:
             self.srt_combo.current(0)
         else:
-            self.srt_combo.set("No <name>.<lang>.srt files (en/fr/es) found")
+            self.srt_combo.set("No SRT files found")
 
         self.load_button = ttk.Button(
             file_frame, text="Load & Extract", command=self.load_and_extract
@@ -1081,7 +1103,7 @@ class SRTTranslatorGUI:
         if self.src_srt_files:
             self.srt_combo.current(0)
         else:
-            self.srt_combo.set("No <name>.<lang>.srt files (en/fr/es) found")
+            self.srt_combo.set("No SRT files found")
 
     def clear_tabs(self):
         for tab_id in self.notebook.tabs():
@@ -1097,32 +1119,14 @@ class SRTTranslatorGUI:
             if not selected or selected not in self.src_srt_files:
                 messagebox.showerror(
                     "Error",
-                    "Please select a valid <name>.<lang>.srt file (lang = en, fr, es) from the dropdown.",
+                    "Please select a valid SRT file from the dropdown.",
                 )
                 return
 
             self.current_srt_path = os.path.join(self.current_dir, selected)
             filename = os.path.basename(self.current_srt_path)
 
-            parts = filename.rsplit(".", 2)
-            if len(parts) != 3:
-                messagebox.showerror(
-                    "Error",
-                    f"File '{filename}' does not match '<original_name>.<lang>.srt' pattern.",
-                )
-                return
-
-            base, lang_code, ext = parts
-            if ext != "srt" or lang_code not in SUPPORTED_LANG_CODES:
-                messagebox.showerror(
-                    "Error",
-                    f"File '{filename}' does not match supported pattern '<original_name>.<lang>.srt' "
-                    f"with lang in {SUPPORTED_LANG_CODES}.",
-                )
-                return
-
-            self.original_base = base
-            self.source_lang_code = lang_code
+            self.original_base, self.source_lang_code = source_srt_name_parts(filename)
 
             self.status_var.set(f"Loading and extracting from {selected}...")
 
@@ -1184,9 +1188,10 @@ class SRTTranslatorGUI:
                 self.tab_text_widgets.append(text_widget)
                 self.tab_expected_ids.append(expected_ids)
 
+            language_status = self.source_lang_code or "not specified in filename"
             self.status_var.set(
                 f"Extracted {len(lines_with_ids)} lines into {len(chunks)} chunk(s). "
-                f"Source language code: {self.source_lang_code}"
+                f"Source language: {language_status}"
             )
 
             messagebox.showinfo(
@@ -1211,16 +1216,18 @@ class SRTTranslatorGUI:
     def copy_drift_check_prompt(self):
         """
         Copy a ChatGPT prompt that checks for semantic drift between the source SRT
-        (<name>.<lang>.srt) and the generated Arabic SRT (<name>.ar.srt).
+        and the generated Arabic SRT.
 
         The user should attach BOTH files to the ChatGPT message along with the prompt.
         """
         # Best-effort filenames (the user will attach the actual files in ChatGPT).
-        if self.original_base and self.source_lang_code:
-            original_name = f"{self.original_base}.{self.source_lang_code}.srt"
-            arabic_name = f"{self.original_base}.ar.srt"
+        if self.current_srt_path:
+            original_name = os.path.basename(self.current_srt_path)
+            arabic_name = os.path.basename(
+                arabic_srt_output_path(self.current_dir, self.original_base, self.current_srt_path)
+            )
         else:
-            original_name = "<original_name>.<lang>.srt"
+            original_name = "<source>.srt"
             arabic_name = "<original_name>.ar.srt"
 
         prompt = DRIFT_CHECK_PROMPT_TEXT.format(
@@ -1442,7 +1449,7 @@ class SRTTranslatorGUI:
     def rebuild_srt_only(self):
         try:
             if not self.current_srt_path or not self.original_base:
-                messagebox.showerror("Error", "No SRT has been loaded. Load a <name>.<lang>.srt (en/fr/es) first.")
+                messagebox.showerror("Error", "No SRT has been loaded. Load an SRT file first.")
                 return
 
             expected_lines = extract_text_lines_with_ids(self.current_srt_path)
@@ -1488,7 +1495,7 @@ class SRTTranslatorGUI:
             # Rebuild in the original ID order (prevents drift even if model output order differs)
             arabic_lines = [translations[i].rstrip() for i in expected_ids]
 
-            out_path = os.path.join(self.current_dir, self.original_base + ".ar.srt")
+            out_path = arabic_srt_output_path(self.current_dir, self.original_base, self.current_srt_path)
 
             self.status_var.set("Rebuilding Arabic SRT (.ar.srt)...")
             rebuild_srt_sequential(self.current_srt_path, arabic_lines, out_path)
@@ -1503,11 +1510,13 @@ class SRTTranslatorGUI:
     def create_bilingual_ass_file(self):
         try:
             if not self.current_srt_path or not self.original_base:
-                messagebox.showerror("Error", "Load a <name>.<lang>.srt (en/fr/es) first.")
+                messagebox.showerror("Error", "Load an SRT file first.")
                 return
 
             source_srt_path = self.current_srt_path
-            arabic_srt_path = os.path.join(self.current_dir, self.original_base + ".ar.srt")
+            arabic_srt_path = arabic_srt_output_path(
+                self.current_dir, self.original_base, self.current_srt_path
+            )
             if not os.path.isfile(arabic_srt_path):
                 messagebox.showerror(
                     "Error",
@@ -1602,11 +1611,13 @@ class SRTTranslatorGUI:
     def create_arabic_only_ass_file(self):
         try:
             if not self.current_srt_path or not self.original_base:
-                messagebox.showerror("Error", "Load a <name>.<lang>.srt (en/fr/es) first.")
+                messagebox.showerror("Error", "Load an SRT file first.")
                 return
 
             source_srt_path = self.current_srt_path
-            arabic_srt_path = os.path.join(self.current_dir, self.original_base + ".ar.srt")
+            arabic_srt_path = arabic_srt_output_path(
+                self.current_dir, self.original_base, self.current_srt_path
+            )
             if not os.path.isfile(arabic_srt_path):
                 messagebox.showerror(
                     "Error",
@@ -1699,7 +1710,7 @@ class SRTTranslatorGUI:
     def open_video_only(self):
         try:
             if not self.original_base:
-                messagebox.showerror("Error", "No <original_name> available. Load a <name>.<lang>.srt (en/fr/es) first.")
+                messagebox.showerror("Error", "No source name is available. Load an SRT file first.")
                 return
 
             video_path = find_video_for_base(self.original_base, self.current_dir)

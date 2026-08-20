@@ -70,6 +70,7 @@ class MediaReference:
     downloaded_file: str = ""
     download_error: str = ""
     render_source_as_link: bool = False
+    download_fallback_source: str = ""
 
 
 @dataclass
@@ -1048,20 +1049,132 @@ def offguardian_html_to_blocks(
 # END WEBSITE CODE: offguardian-support
 
 
+# BEGIN WEBSITE CODE: globalresearch-support
+class GlobalResearchStructuredTextParser(StructuredTextParser):
+    """Preserve Globalresearch's WordPress body and mark non-linear content."""
+
+    VISUAL_TAGS = StructuredTextParser.VISUAL_TAGS | {
+        "details", "form", "object", "select", "textarea",
+    }
+    EMBED_CLASS_PARTS = StructuredTextParser.EMBED_CLASS_PARTS | {
+        "instagram-media", "wp-block-embed", "wp-block-gallery",
+        "blocks-gallery-grid", "gallery-columns", "slideshow",
+    }
+    VOID_INTERACTIVE_TAGS = {"embed", "input"}
+    INTERACTIVE_TAGS = {"button"}
+
+    def __init__(self, first_media_number: int = 1) -> None:
+        super().__init__(first_media_number)
+        self._indented_paragraphs: list[bool] = []
+
+    @staticmethod
+    def _component_source(attrs: dict[str, str | None]) -> str:
+        for key in (
+            "src", "data-src", "data-lazy-src", "data-url", "href", "poster", "action",
+        ):
+            value = attrs.get(key) or ""
+            if value:
+                return value
+        srcset = attrs.get("srcset") or attrs.get("data-srcset") or ""
+        candidates = [part.strip().split()[0] for part in srcset.split(",") if part.strip()]
+        return candidates[-1] if candidates else ""
+
+    def _add_media(self, kind: str, attrs: dict[str, str | None]) -> None:
+        enriched = dict(attrs)
+        if not enriched.get("src") and not enriched.get("href"):
+            enriched["src"] = self._component_source(enriched)
+        previous_count = len(self.media)
+        super()._add_media(kind, enriched)
+        if len(self.media) > previous_count:
+            self.media[-1].render_source_as_link = True
+
+    def _flush(self, prefix: str = "") -> None:
+        """Join apostrophes split across Globalresearch's nested inline spans."""
+        text = _clean_block("".join(self._buffer))
+        self._buffer.clear()
+        if not text:
+            return
+        text = re.sub(r"(?<=\w)\s+([\u2018\u2019'])\s*(?=\w)", r"\1", text)
+        if prefix:
+            text = prefix + text
+        if self._blockquote_depth:
+            text = "\n".join("> " + line for line in text.splitlines())
+        if not self.blocks or self.blocks[-1] != text:
+            self.blocks.append(text)
+
+    def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attrs = dict(attrs_list)
+        if not self._ignore_depth and not self._skip_depth and tag in self.VOID_INTERACTIVE_TAGS:
+            self._add_media("interactive content", attrs)
+            return
+        if not self._ignore_depth and not self._skip_depth and tag in self.INTERACTIVE_TAGS:
+            self._add_media("interactive content", attrs)
+            self._skip_depth = 1
+            return
+
+        is_indented_quote = bool(
+            tag == "p"
+            and re.search(
+                r"(?:^|;)\s*padding-left\s*:\s*(?:[1-9]\d*(?:\.\d+)?|0?\.\d*[1-9])",
+                attrs.get("style") or "",
+                re.I,
+            )
+        )
+        if tag == "p":
+            self._indented_paragraphs.append(is_indented_quote)
+        super().handle_starttag(tag, attrs_list)
+        if is_indented_quote and not self._ignore_depth and not self._skip_depth:
+            self._blockquote_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        is_indented_quote = bool(
+            tag == "p" and self._indented_paragraphs and self._indented_paragraphs[-1]
+        )
+        super().handle_endtag(tag)
+        if tag == "p" and self._indented_paragraphs:
+            self._indented_paragraphs.pop()
+        if is_indented_quote:
+            self._blockquote_depth = max(0, self._blockquote_depth - 1)
+
+
+def globalresearch_html_to_blocks(
+    fragment: str,
+    canonical_url: str,
+    first_media_number: int = 1,
+) -> tuple[list[str], list[MediaReference]]:
+    parser = GlobalResearchStructuredTextParser(first_media_number)
+    parser.feed(fragment)
+    parser.close()
+    for item in parser.media:
+        if item.source:
+            item.source = urllib.parse.urljoin(canonical_url, item.source)
+    return parser.blocks, parser.media
+# END WEBSITE CODE: globalresearch-support
 
 
 
 
 
 
-def fetch_text(url: str, timeout: int = 40) -> str:
+
+
+def fetch_text(
+    url: str,
+    timeout: int = 40,
+    request_headers: dict[str, str] | None = None,
+) -> str:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if request_headers:
+        headers.update(request_headers)
     request = urllib.request.Request(
         url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -1897,6 +2010,200 @@ class OffGuardianAdapter:
 # END WEBSITE CODE: offguardian-adapter
 
 
+# BEGIN WEBSITE CODE: globalresearch-adapter
+class GlobalResearchAdapter:
+    """Dedicated article-only adapter for Globalresearch's public WordPress posts."""
+
+    name = "Globalresearch"
+    HOSTS = {"globalresearch.ca", "www.globalresearch.ca"}
+    READER_PREFIX = "https://r.jina.ai/"
+
+    @classmethod
+    def matches(cls, url: str) -> bool:
+        return (urllib.parse.urlparse(url).hostname or "").lower() in cls.HOSTS
+
+    @classmethod
+    def _normalized_article_url(cls, url: str) -> tuple[str, str, int]:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower()
+        match = re.fullmatch(r"/([^/]+)/(\d+)/?", parsed.path)
+        if parsed.scheme not in {"http", "https"} or host not in cls.HOSTS or not match:
+            raise ExtractionError(
+                "Please paste a Globalresearch article URL in the form "
+                "https://www.globalresearch.ca/article-slug/1234567"
+            )
+        slug = urllib.parse.unquote(match.group(1))
+        post_id = int(match.group(2))
+        if post_id <= 0:
+            raise ExtractionError("The Globalresearch article URL has an invalid post ID.")
+        canonical = (
+            "https://www.globalresearch.ca/"
+            + urllib.parse.quote(slug, safe="%")
+            + f"/{post_id}"
+        )
+        return canonical, slug, post_id
+
+    @staticmethod
+    def _json_payload(text: str) -> dict:
+        candidates = [text.strip()]
+        marker = "\nMarkdown Content:\n"
+        if marker in text:
+            candidates.insert(0, text.split(marker, 1)[1].strip())
+        for candidate in candidates:
+            try:
+                payload = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                return payload
+        raise ExtractionError("Globalresearch returned invalid public article data.")
+
+    @classmethod
+    def _fetch_post_data(
+        cls,
+        api_url: str,
+        progress: Callable[[str], None],
+    ) -> dict:
+        try:
+            return cls._json_payload(fetch_text(api_url))
+        except ExtractionError as direct_error:
+            progress(
+                "The first-party endpoint blocked this request; retrying its public data "
+                "through Jina Reader…"
+            )
+            reader_url = cls.READER_PREFIX + api_url
+            try:
+                return cls._json_payload(
+                    fetch_text(
+                        reader_url,
+                        request_headers={
+                            "User-Agent": "ArticleExtractor/1.0",
+                            "Accept": "text/plain,application/json;q=0.9,*/*;q=0.8",
+                        },
+                    )
+                )
+            except ExtractionError as reader_error:
+                raise ExtractionError(
+                    "Could not read Globalresearch's public WordPress article endpoint. "
+                    f"Direct request: {direct_error}; reader fallback: {reader_error}"
+                ) from reader_error
+
+    @staticmethod
+    def _embedded_first(data: dict, key: str) -> dict:
+        embedded = data.get("_embedded")
+        values = embedded.get(key) if isinstance(embedded, dict) else None
+        if isinstance(values, list) and values and isinstance(values[0], dict):
+            return values[0]
+        return {}
+
+    @classmethod
+    def _featured_media_source(cls, data: dict) -> str:
+        media = cls._embedded_first(data, "wp:featuredmedia")
+        details = media.get("media_details")
+        sizes = details.get("sizes") if isinstance(details, dict) else None
+        if isinstance(sizes, dict):
+            displayed = sizes.get("single-post-thumbnail")
+            if isinstance(displayed, dict) and displayed.get("source_url"):
+                return str(displayed["source_url"])
+        return str(media.get("source_url") or "")
+
+    @staticmethod
+    def _media_identity(url: str) -> str:
+        parsed = urllib.parse.urlparse(html.unescape(url))
+        return urllib.parse.unquote(parsed.path).lower()
+
+    def extract(self, url: str, progress: Callable[[str], None]) -> ExtractedArticle:
+        article_url, fallback_slug, post_id = self._normalized_article_url(url)
+        api_url = (
+            f"https://www.globalresearch.ca/wp-json/wp/v2/posts/{post_id}?_embed=1"
+        )
+        progress("Downloading Globalresearch's complete public WordPress article data…")
+        post_data = self._fetch_post_data(api_url, progress)
+        if post_data.get("id") != post_id or post_data.get("status") != "publish":
+            raise ExtractionError("Globalresearch did not return the requested public post.")
+
+        content = post_data.get("content")
+        body_html = content.get("rendered") if isinstance(content, dict) else ""
+        if not body_html:
+            raise ExtractionError(
+                "No complete public Globalresearch article body was returned."
+            )
+
+        canonical = str(post_data.get("link") or article_url)
+        parsed_canonical = urllib.parse.urlparse(canonical)
+        if (parsed_canonical.hostname or "").lower() not in self.HOSTS:
+            canonical = article_url
+
+        blocks: list[str] = []
+        media: list[MediaReference] = []
+        cover = self._featured_media_source(post_data)
+        decoded_body = urllib.parse.unquote(html.unescape(str(body_html))).lower()
+        cover_identity = self._media_identity(cover)
+        cover_in_body = bool(
+            cover_identity and cover_identity in decoded_body
+        )
+        if cover and not cover_in_body:
+            cover = urllib.parse.urljoin(canonical, cover)
+            marker = "IMAGE-01"
+            blocks.append(marker)
+            media.append(
+                MediaReference(
+                    marker,
+                    "cover image",
+                    cover,
+                    location="article cover",
+                    render_source_as_link=True,
+                )
+            )
+
+        body_blocks, body_media = globalresearch_html_to_blocks(
+            str(body_html), canonical, len(media) + 1
+        )
+        blocks.extend(body_blocks)
+        media.extend(body_media)
+        if not blocks:
+            raise ExtractionError(
+                "The Globalresearch article contained no readable public content."
+            )
+        for item in media:
+            media_host = (urllib.parse.urlparse(item.source).hostname or "").lower()
+            downloadable_kind = any(
+                word in item.kind.lower() for word in ("image", "audio", "video")
+            )
+            if item.source and media_host in self.HOSTS and downloadable_kind:
+                # Cloudflare may region-block wp-content even when a direct file exists.
+                # Wayback's id_ form returns the captured file bytes without page chrome.
+                item.download_fallback_source = (
+                    "https://web.archive.org/web/2id_/" + item.source
+                )
+
+        title = post_data.get("title")
+        title_html = title.get("rendered") if isinstance(title, dict) else ""
+        title_blocks, _title_media = html_to_blocks(str(title_html or fallback_slug))
+        author_data = self._embedded_first(post_data, "author")
+        return ExtractedArticle(
+            title=_clean_inline(" ".join(title_blocks) or fallback_slug),
+            subtitle="",
+            author=_clean_inline(str(author_data.get("name") or "")),
+            published=_clean_inline(str(post_data.get("date") or "")),
+            canonical_url=canonical,
+            slug=str(post_data.get("slug") or fallback_slug),
+            blocks=blocks,
+            comments=[],
+            media=media,
+            adapter_name=self.name,
+        )
+# END WEBSITE CODE: globalresearch-adapter
+
+
+# BEGIN WEBSITE CODE: food-sovereignty-adapter
+class FoodSovereigntyAdapter(OffGuardianAdapter):
+    """Dedicated Colin Todhunter archive adapter on OffGuardian."""
+
+    name = "Food Sovereignty | Agrarian Systems | Development"
+# END WEBSITE CODE: food-sovereignty-adapter
+
+
 @dataclass(frozen=True)
 class WebsiteExtractorDefinition:
     """One user-selectable website and the adapter that powers its extractor."""
@@ -2000,9 +2307,49 @@ WEBSITE_EXTRACTORS: tuple[WebsiteExtractorDefinition, ...] = (
         allowed_hosts=("off-guardian.org", "www.off-guardian.org"),
         adapter_type=OffGuardianAdapter,
         extracts_comments=True,
-        removable_sections=("offguardian-support", "offguardian-adapter"),
+        shared_sections=("offguardian-support", "offguardian-adapter"),
     ),
     # END WEBSITE CODE: profile-offguardian
+    # BEGIN WEBSITE CODE: profile-globalresearch
+    WebsiteExtractorDefinition(
+        key="globalresearch",
+        display_name="Globalresearch",
+        homepage="https://www.globalresearch.ca/latest-news-and-top-stories",
+        description=(
+            "Extract complete public Globalresearch articles with the featured image and "
+            "all body media preserved in reading order as IMAGE-XX placeholders. "
+            "Comments are not extracted."
+        ),
+        example_url=(
+            "https://www.globalresearch.ca/"
+            "living-most-corrupt-democracy-imagined/5934366"
+        ),
+        allowed_hosts=("globalresearch.ca", "www.globalresearch.ca"),
+        adapter_type=GlobalResearchAdapter,
+        removable_sections=("globalresearch-support", "globalresearch-adapter"),
+    ),
+    # END WEBSITE CODE: profile-globalresearch
+    # BEGIN WEBSITE CODE: profile-food-sovereignty
+    WebsiteExtractorDefinition(
+        key="food-sovereignty",
+        display_name="Food Sovereignty | Agrarian Systems | Development",
+        homepage="https://off-guardian.org/category/colin-todhunter/",
+        description=(
+            "Extract complete public Colin Todhunter articles plus all publicly "
+            "accessible comments and nested replies. Images, tables, embeds, audio, "
+            "video, and other non-linear content remain in source order as placeholders."
+        ),
+        example_url=(
+            "https://off-guardian.org/2026/07/24/"
+            "manufacturing-inevitability-breaking-the-myth-of-no-alternative/"
+        ),
+        allowed_hosts=("off-guardian.org", "www.off-guardian.org"),
+        adapter_type=FoodSovereigntyAdapter,
+        extracts_comments=True,
+        removable_sections=("food-sovereignty-adapter",),
+        shared_sections=("offguardian-support", "offguardian-adapter"),
+    ),
+    # END WEBSITE CODE: profile-food-sovereignty
 )
 
 WEBSITE_EXTRACTORS_BY_KEY = {item.key: item for item in WEBSITE_EXTRACTORS}
@@ -2351,32 +2698,38 @@ def _download_media_item(
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or not downloadable_kind:
         item.download_error = "No direct downloadable media file was available."
         return None
-    request = urllib.request.Request(
-        item.source,
-        headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
-    )
-    part_path: Path | None = None
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            content_type = response.headers.get("Content-Type", "")
-            extension = _media_extension(item.source, content_type)
-            media_dir.mkdir(parents=True, exist_ok=True)
-            destination = media_dir / f"{filename_stem}{extension}"
-            part_path = media_dir / f".{filename_stem}{extension}.part"
-            with part_path.open("wb") as handle:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    handle.write(chunk)
-            part_path.replace(destination)
-            item.downloaded_file = destination.relative_to(output_dir).as_posix()
-            return destination
-    except Exception as exc:
-        if part_path is not None:
-            part_path.unlink(missing_ok=True)
-        item.download_error = f"Download failed: {exc}"
-        return None
+    sources = [item.source]
+    if item.download_fallback_source:
+        sources.append(item.download_fallback_source)
+    failures: list[str] = []
+    for source in sources:
+        request = urllib.request.Request(
+            source,
+            headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
+        )
+        part_path: Path | None = None
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                content_type = response.headers.get("Content-Type", "")
+                extension = _media_extension(source, content_type)
+                media_dir.mkdir(parents=True, exist_ok=True)
+                destination = media_dir / f"{filename_stem}{extension}"
+                part_path = media_dir / f".{filename_stem}{extension}.part"
+                with part_path.open("wb") as handle:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                part_path.replace(destination)
+                item.downloaded_file = destination.relative_to(output_dir).as_posix()
+                return destination
+        except Exception as exc:
+            if part_path is not None:
+                part_path.unlink(missing_ok=True)
+            failures.append(str(exc))
+    item.download_error = "Download failed: " + "; fallback: ".join(failures)
+    return None
 
 
 def _download_article_media(
