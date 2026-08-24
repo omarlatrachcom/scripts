@@ -226,6 +226,61 @@ class SubtitleFallbackTests(unittest.TestCase):
 
             self.assertEqual(logger.valid_srt_destinations(), {valid_path.resolve()})
 
+    def test_gui_logger_confirms_relative_srt_that_is_already_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            valid_path = output_dir / "video.en.srt"
+            valid_path.write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nCaption\n",
+                encoding="utf-8",
+            )
+            logger = downloader.GuiLogger(lambda _message: None, output_dir)
+
+            logger.info("[info] video.en.srt is already present")
+
+            self.assertEqual(logger.valid_srt_destinations(), {valid_path.resolve()})
+
+    def test_single_video_resume_accepts_existing_valid_subtitle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "video.en.srt").write_text(
+                "1\n00:00:01,000 --> 00:00:02,000\nCaption\n",
+                encoding="utf-8",
+            )
+            gui = object.__new__(downloader.DownloaderGUI)
+            gui.queue = mock.Mock()
+            gui.queue_log = lambda _message: None
+            gui.queue_progress = lambda *_args, **_kwargs: None
+            gui.make_progress_hook = lambda: (lambda _data: None)
+            config = {
+                "mode": "single",
+                "media_type": "video",
+                "url": "https://www.youtube.com/watch?v=2Jn2iAvFg-U",
+                "output_dir": tmp,
+                "wrap_in_folder": False,
+                "use_cookies": False,
+                "browser": "chrome",
+                "want_subs": True,
+                "subs_lang": "en",
+            }
+
+            def fake_run_download(_urls, opts, **_kwargs) -> int:
+                opts["logger"].info("[info] video.en.srt is already present")
+                return 0
+
+            with (
+                mock.patch.object(downloader, "run_download", side_effect=fake_run_download),
+                mock.patch.object(
+                    downloader,
+                    "run_optional_auto_sub_fallback",
+                    return_value=downloader.SubtitleCleanupStats(),
+                ),
+            ):
+                success, summary = gui.download_one(config)
+
+            self.assertTrue(success)
+            self.assertIn("All done", summary)
+
 
 class VttSubtitleRecoveryTests(unittest.TestCase):
     def test_converts_vtt_to_normalized_srt_and_removes_source(self) -> None:

@@ -1154,6 +1154,296 @@ def globalresearch_html_to_blocks(
 # END WEBSITE CODE: globalresearch-support
 
 
+# BEGIN WEBSITE CODE: telquel-support
+class TelQuelPageParser(HTMLParser):
+    """Capture TelQuel's server-rendered article body and its real metadata."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title = ""
+        self.subtitle = ""
+        self.author = ""
+        self.published = ""
+        self.canonical_url = ""
+        self._depth = 0
+        self._open_tags: list[str] = []
+        self._post_depth = 0
+        self._title_depth = 0
+        self._subtitle_depth = 0
+        self._author_depth = 0
+        self._published_depth = 0
+        self._first_content_depth = 0
+        self._body_depth = 0
+        self._body_done = False
+        self._title_parts: list[str] = []
+        self._subtitle_parts: list[str] = []
+        self._author_parts: list[str] = []
+        self._published_parts: list[str] = []
+        self._body_parts: list[str] = []
+
+    @staticmethod
+    def _is_void(tag: str) -> bool:
+        return tag in StructuredTextParser.VOID_TAGS
+
+    def _inside_post(self, tag_depth: int) -> bool:
+        return bool(self._post_depth and tag_depth > self._post_depth)
+
+    def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attrs = dict(attrs_list)
+        classes = _class_tokens(attrs)
+        tag_depth = self._depth + 1
+
+        if tag == "link" and "canonical" in (attrs.get("rel") or "").lower().split():
+            self.canonical_url = attrs.get("href") or self.canonical_url
+
+        if (
+            not self._post_depth
+            and tag == "main"
+            and {"main", "post"}.issubset(classes)
+        ):
+            self._post_depth = tag_depth
+        elif self._inside_post(tag_depth):
+            if tag == "h2" and "article-heading" in classes and not self.title:
+                self._title_depth = tag_depth
+            elif tag == "div" and "single-pre-content" in classes and not self.subtitle:
+                self._subtitle_depth = tag_depth
+            elif tag == "a" and "article-editor-name" in classes and not self.author:
+                self._author_depth = tag_depth
+            elif tag == "time" and "article-publish" in classes and not self.published:
+                self._published_depth = tag_depth
+
+            if (
+                not self._first_content_depth
+                and not self._body_done
+                and tag == "div"
+                and "single-content" in classes
+            ):
+                self._first_content_depth = tag_depth
+            elif (
+                self._first_content_depth
+                and not self._body_depth
+                and not self._body_done
+                and tag == "div"
+                and "col-large" in classes
+                and tag_depth == self._first_content_depth + 1
+            ):
+                self._body_depth = tag_depth
+            elif self._body_depth and tag_depth > self._body_depth:
+                raw = self.get_starttag_text()
+                if raw:
+                    self._body_parts.append(raw)
+
+        if not self._is_void(tag):
+            self._open_tags.append(tag)
+            self._depth = len(self._open_tags)
+
+    def handle_startendtag(
+        self, tag: str, attrs_list: list[tuple[str, str | None]]
+    ) -> None:
+        if self._body_depth and len(self._open_tags) + 1 > self._body_depth:
+            raw = self.get_starttag_text()
+            if raw:
+                self._body_parts.append(raw)
+
+    def handle_data(self, data: str) -> None:
+        if self._title_depth:
+            self._title_parts.append(data)
+        if self._subtitle_depth:
+            self._subtitle_parts.append(data)
+        if self._author_depth:
+            self._author_parts.append(data)
+        if self._published_depth:
+            self._published_parts.append(data)
+        if self._body_depth:
+            self._body_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        try:
+            reverse_index = self._open_tags[::-1].index(tag)
+        except ValueError:
+            # TelQuel currently emits a stray </p> after its related-story box.
+            # Ignore unmatched closes instead of letting them corrupt the real
+            # article-container boundary.
+            return
+        open_index = len(self._open_tags) - reverse_index - 1
+        closing_depth = open_index + 1
+        if self._body_depth:
+            if closing_depth == self._body_depth and tag == "div":
+                self._body_depth = 0
+                self._body_done = True
+            elif closing_depth > self._body_depth:
+                self._body_parts.append(f"</{tag}>")
+
+        if self._title_depth and closing_depth == self._title_depth:
+            self.title = _clean_inline("".join(self._title_parts))
+            self._title_depth = 0
+        if self._subtitle_depth and closing_depth == self._subtitle_depth:
+            self.subtitle = _clean_inline("".join(self._subtitle_parts))
+            self._subtitle_depth = 0
+        if self._author_depth and closing_depth == self._author_depth:
+            author = _clean_inline("".join(self._author_parts))
+            self.author = re.sub(r"^Par\s+", "", author, flags=re.I)
+            self._author_depth = 0
+        if self._published_depth and closing_depth == self._published_depth:
+            self.published = _clean_inline("".join(self._published_parts))
+            self._published_depth = 0
+        if self._first_content_depth and closing_depth == self._first_content_depth:
+            self._first_content_depth = 0
+        if self._post_depth and closing_depth == self._post_depth and tag == "main":
+            self._post_depth = 0
+        del self._open_tags[open_index:]
+        self._depth = len(self._open_tags)
+
+    @property
+    def body_html(self) -> str:
+        return "".join(self._body_parts)
+
+
+class TelQuelStructuredTextParser(StructuredTextParser):
+    """Preserve TelQuel prose and replace in-body components in source order."""
+
+    VISUAL_TAGS = StructuredTextParser.VISUAL_TAGS | {
+        "details", "form", "object", "select", "textarea",
+    }
+    COMPONENT_CLASS_PARTS = {
+        "carousel", "gallery", "instagram-media", "newsletter-desktop",
+        "related-in-article", "slider", "tiktok-embed", "twitter-tweet",
+        "wp-block-embed", "wp-block-gallery",
+    }
+    INTERACTIVE_TAGS = {"button", "input"}
+
+    def __init__(self, first_media_number: int = 1) -> None:
+        super().__init__(first_media_number)
+        self._component_media_index: int | None = None
+
+    @staticmethod
+    def _component_source(attrs: dict[str, str | None]) -> str:
+        for key in (
+            "data-src", "data-lazy-src", "data-url", "data-href", "src",
+            "href", "poster", "action",
+        ):
+            value = attrs.get(key) or ""
+            if value and not value.lower().startswith("data:"):
+                return value
+        for key in ("data-srcset", "srcset"):
+            candidates = [
+                part.strip().split()[0]
+                for part in (attrs.get(key) or "").split(",")
+                if part.strip() and not part.strip().lower().startswith("data:")
+            ]
+            if candidates:
+                return candidates[-1]
+        return ""
+
+    def _add_media(self, kind: str, attrs: dict[str, str | None]) -> None:
+        enriched = dict(attrs)
+        source = self._component_source(enriched)
+        if source:
+            enriched["src"] = source
+        previous_count = len(self.media)
+        super()._add_media(kind, enriched)
+        if len(self.media) > previous_count:
+            self.media[-1].render_source_as_link = True
+
+    def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attrs = dict(attrs_list)
+        classes = _class_tokens(attrs)
+
+        if self._skip_depth:
+            if self._component_media_index is not None:
+                item = self.media[self._component_media_index]
+                if not item.source:
+                    item.source = self._component_source(attrs)
+            super().handle_starttag(tag, attrs_list)
+            return
+
+        component_id = attrs.get("id") or ""
+        is_ad = component_id == "inneradsholder" or component_id.startswith("div-gpt-ad-")
+        is_component = any(
+            part in class_name
+            for part in self.COMPONENT_CLASS_PARTS
+            for class_name in classes
+        )
+        if not self._ignore_depth and (
+            is_ad or is_component or tag in self.INTERACTIVE_TAGS
+        ):
+            kind = "embedded content" if is_ad or is_component else "interactive content"
+            self._add_media(kind, attrs)
+            self._component_media_index = len(self.media) - 1
+            if tag not in self.VOID_TAGS:
+                self._skip_depth = 1
+            else:
+                self._component_media_index = None
+            return
+        super().handle_starttag(tag, attrs_list)
+
+    def handle_endtag(self, tag: str) -> None:
+        was_skipping = bool(self._skip_depth)
+        super().handle_endtag(tag)
+        if was_skipping and not self._skip_depth:
+            self._component_media_index = None
+
+    def handle_data(self, data: str) -> None:
+        if self._ignore_depth or self._skip_depth:
+            return
+        if self._pre_depth:
+            self._buffer.append(data)
+            return
+        if not data:
+            return
+        if (
+            self._buffer
+            and not self._buffer[-1].endswith((" ", "\n"))
+            and not data[0].isspace()
+            and data[0] not in ".,;:!?)]}%»”’“«"
+        ):
+            self._buffer.append(" ")
+        self._buffer.append(data)
+
+
+def telquel_html_to_blocks(
+    fragment: str,
+    canonical_url: str,
+    first_media_number: int = 1,
+) -> tuple[list[str], list[MediaReference]]:
+    parser = TelQuelStructuredTextParser(first_media_number)
+    parser.feed(fragment)
+    parser.close()
+    for item in parser.media:
+        if item.source:
+            item.source = urllib.parse.urljoin(canonical_url, item.source)
+    return parser.blocks, parser.media
+
+
+def fetch_telquel_page(url: str, timeout: int = 40) -> str:
+    """Fetch TelQuel with a browser TLS profile accepted by its Cloudflare edge."""
+    try:
+        from curl_cffi import requests as curl_requests  # type: ignore
+    except ImportError as exc:
+        raise ExtractionError(
+            "TelQuel requires curl-cffi for its Cloudflare-protected public pages. "
+            "Open the app through its launcher or install the requirements file."
+        ) from exc
+    try:
+        response = curl_requests.get(
+            url,
+            headers={"User-Agent": USER_AGENT, "Accept-Language": "fr-FR,fr;q=0.9"},
+            impersonate="chrome",
+            timeout=timeout,
+        )
+    except Exception as exc:
+        raise ExtractionError(f"Could not reach {url}: {exc}") from exc
+    if response.status_code >= 400:
+        raise ExtractionError(
+            f"TelQuel returned HTTP {response.status_code} for its public article page."
+        )
+    return response.text
+# END WEBSITE CODE: telquel-support
+
+
 
 
 
@@ -2196,6 +2486,84 @@ class GlobalResearchAdapter:
 # END WEBSITE CODE: globalresearch-adapter
 
 
+# BEGIN WEBSITE CODE: telquel-adapter
+class TelQuelAdapter:
+    """Dedicated article-only adapter for TelQuel's public dated posts."""
+
+    name = "Telquel.ma"
+    HOSTS = {"telquel.ma", "www.telquel.ma"}
+    ARTICLE_PATH_RE = re.compile(
+        r"/(\d{4})/(\d{2})/(\d{2})/([^/]+)_(\d+)/?"
+    )
+
+    @classmethod
+    def matches(cls, url: str) -> bool:
+        return (urllib.parse.urlparse(url).hostname or "").lower() in cls.HOSTS
+
+    @classmethod
+    def _normalized_article_url(cls, url: str) -> tuple[str, str, int]:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower()
+        match = cls.ARTICLE_PATH_RE.fullmatch(parsed.path)
+        if parsed.scheme not in {"http", "https"} or host not in cls.HOSTS or not match:
+            raise ExtractionError(
+                "Please paste a Telquel.ma article URL in the form "
+                "https://telquel.ma/YYYY/MM/DD/article-slug_numeric-id"
+            )
+        slug = urllib.parse.unquote(match.group(4))
+        post_id = int(match.group(5))
+        if not slug or post_id <= 0:
+            raise ExtractionError("The Telquel.ma article URL is invalid.")
+        path = (
+            f"/{match.group(1)}/{match.group(2)}/{match.group(3)}/"
+            f"{urllib.parse.quote(slug, safe='%')}_{post_id}"
+        )
+        return "https://telquel.ma" + path, slug, post_id
+
+    def extract(self, url: str, progress: Callable[[str], None]) -> ExtractedArticle:
+        article_url, slug, post_id = self._normalized_article_url(url)
+        progress("Downloading TelQuel's complete public article page…")
+        page = fetch_telquel_page(article_url)
+        parser = TelQuelPageParser()
+        try:
+            parser.feed(page)
+            parser.close()
+        except Exception as exc:
+            raise ExtractionError(f"TelQuel returned malformed article HTML: {exc}") from exc
+        if not parser.body_html:
+            raise ExtractionError(
+                "No complete public TelQuel article body was found. "
+                "The page may be unavailable or its layout may have changed."
+            )
+
+        canonical = parser.canonical_url or article_url
+        parsed_canonical = urllib.parse.urlparse(canonical)
+        canonical_match = self.ARTICLE_PATH_RE.fullmatch(parsed_canonical.path)
+        if (
+            (parsed_canonical.hostname or "").lower() not in self.HOSTS
+            or not canonical_match
+            or int(canonical_match.group(5)) != post_id
+        ):
+            canonical = article_url
+
+        blocks, media = telquel_html_to_blocks(parser.body_html, canonical)
+        if not blocks:
+            raise ExtractionError("The TelQuel article contained no readable public content.")
+        return ExtractedArticle(
+            title=parser.title or slug.replace("-", " "),
+            subtitle=parser.subtitle,
+            author=parser.author,
+            published=parser.published,
+            canonical_url=canonical,
+            slug=slug,
+            blocks=blocks,
+            comments=[],
+            media=media,
+            adapter_name=self.name,
+        )
+# END WEBSITE CODE: telquel-adapter
+
+
 # BEGIN WEBSITE CODE: food-sovereignty-adapter
 class FoodSovereigntyAdapter(OffGuardianAdapter):
     """Dedicated Colin Todhunter archive adapter on OffGuardian."""
@@ -2329,6 +2697,25 @@ WEBSITE_EXTRACTORS: tuple[WebsiteExtractorDefinition, ...] = (
         removable_sections=("globalresearch-support", "globalresearch-adapter"),
     ),
     # END WEBSITE CODE: profile-globalresearch
+    # BEGIN WEBSITE CODE: profile-telquel
+    WebsiteExtractorDefinition(
+        key="telquel",
+        display_name="Telquel.ma",
+        homepage="https://telquel.ma/categorie/opinions",
+        description=(
+            "Extract complete public TelQuel articles with quotations, headings, lists, "
+            "and paragraphs preserved in reading order. Images, tables, embeds, ads, "
+            "related-content cards, and other non-linear elements become ordered "
+            "IMAGE-XX placeholders. Comments are not extracted."
+        ),
+        example_url=(
+            "https://telquel.ma/2026/07/24/le-reflexe-jettou_2001434"
+        ),
+        allowed_hosts=("telquel.ma", "www.telquel.ma"),
+        adapter_type=TelQuelAdapter,
+        removable_sections=("telquel-support", "telquel-adapter"),
+    ),
+    # END WEBSITE CODE: profile-telquel
     # BEGIN WEBSITE CODE: profile-food-sovereignty
     WebsiteExtractorDefinition(
         key="food-sovereignty",

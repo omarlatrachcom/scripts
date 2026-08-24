@@ -25,6 +25,11 @@ Current website menu:
   the featured image, body images, galleries, tables, embeds, audio, video, and
   other non-linear elements retained in source order as `IMAGE-XX`
   placeholders. It does not extract comments.
+- **Telquel.ma:** complete public dated articles from `telquel.ma`, preserving
+  the standfirst, paragraphs, headings, lists, and quotations. Lazy-loaded
+  images, tables, embeds, in-body ad/newsletter components, and related-story
+  cards stay in source order as `IMAGE-XX` placeholders. It does not extract
+  comments.
 - **Food Sovereignty | Agrarian Systems | Development:** Colin Todhunter's
   `off-guardian.org` archive, exposed as its own explicit extractor choice.
   Complete public articles, ordered non-linear placeholders, and all public
@@ -76,7 +81,8 @@ depend on Terminal profile files and performs these steps automatically:
 2. If necessary and Homebrew is available, installs `python` and `python-tk`.
 3. Creates a private environment under
    `~/Library/Application Support/ArticleExtractor`.
-4. Installs the exact token-counting dependency in that private environment.
+4. Installs the exact token counter and TelQuel's browser-compatible HTTP
+   transport in that private environment.
 5. Opens the GUI.
 
 It writes startup and dependency details to
@@ -135,6 +141,18 @@ comments. When media download is selected, original media URLs are tried first;
 region-blocked Globalresearch files fall back to their latest raw Wayback
 capture without changing the source URL printed in the article text.
 
+For **Telquel.ma**, use an individual dated article URL in the form
+`https://telquel.ma/YYYY/MM/DD/article-slug_numeric-id`. TelQuel advertises a
+WordPress REST API, but its public REST and oEmbed routes currently answer with
+`401 Unauthorized`, while its category RSS exposes only article excerpts. The
+dedicated article-only adapter therefore reads the complete server-rendered
+body from the live page's first `.single-content > .col-large` article column.
+It excludes navigation, sharing controls, the repeated author footer, tags, and
+recommendation rails; non-linear components inside the article column retain
+their exact position as placeholders. The launcher installs `curl-cffi`, whose
+browser-compatible transport is required by TelQuel's Cloudflare edge. No
+comment endpoint is requested.
+
 For **Food Sovereignty | Agrarian Systems | Development**, explicitly select
 that entry on the first screen, then use a dated Colin Todhunter article URL from
 the archive at `https://off-guardian.org/category/colin-todhunter/`. Its adapter
@@ -158,7 +176,7 @@ the extraction's `media/` folder.
   from the placeholder by an empty line. There is no separate media manifest.
   OffGuardian and Food Sovereignty | Agrarian Systems | Development render the
   source as a Markdown link in the exact form `Media source: [URL](URL)`.
-  Globalresearch uses that exact form as well.
+  Globalresearch and Telquel.ma use that exact form as well.
 - An optional `media/` folder containing downloaded direct media files.
 - `extraction_summary.json` with counts and the token-counting mode.
 
@@ -174,16 +192,16 @@ between paragraph-like blocks, and headings stay with the following block. If a
 single source paragraph itself exceeds the limit, extraction stops with a clear
 error rather than cutting through the paragraph.
 
-The launcher installs the optional `tiktoken` counter in an isolated environment
+The launcher installs `tiktoken` and `curl-cffi` in an isolated environment
 under `~/Library/Application Support/ArticleExtractor`. With `tiktoken`, the app
 counts using `cl100k_base`; otherwise it uses UTF-8 byte length as a conservative
 upper bound. The fallback can produce smaller chunks but will not undercount a
-byte-based GPT tokenizer.
+byte-based GPT tokenizer. `curl-cffi` is only required by the TelQuel adapter.
 
-Optional exact token counter:
+Manual dependency installation:
 
 ```bash
-python3 -m pip install tiktoken
+python3 -m pip install -r requirements.txt
 ```
 
 ## Automator
@@ -246,6 +264,15 @@ Globalresearch article-only example:
 python3 article_extractor_gui.py \
   --website "globalresearch" \
   --url "https://www.globalresearch.ca/living-most-corrupt-democracy-imagined/5934366" \
+  --output "$HOME/Downloads"
+```
+
+TelQuel article-only example:
+
+```bash
+python3 article_extractor_gui.py \
+  --website "telquel" \
+  --url "https://telquel.ma/2026/07/24/le-reflexe-jettou_2001434" \
   --output "$HOME/Downloads"
 ```
 

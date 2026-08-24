@@ -336,20 +336,39 @@ def build_youtube_extractor_args(logger) -> dict:
 
 
 class GuiLogger:
-    def __init__(self, sink) -> None:
+    def __init__(self, sink, output_dir: str | Path | None = None) -> None:
         self.sink = sink
+        self.output_dir = Path(output_dir).expanduser().resolve() if output_dir else None
         # yt-dlp can return exit code 0 even when the requested subtitle
         # language was unavailable. Keep the concrete destinations it says it
         # is writing so the GUI can verify a real SRT before reporting success.
         self.subtitle_destinations: set[Path] = set()
 
+    def _remember_subtitle_destination(self, raw_path: str) -> None:
+        path = Path(raw_path).expanduser()
+        if path.suffix.lower() not in {".srt", ".vtt"}:
+            return
+        if not path.is_absolute() and self.output_dir is not None:
+            path = self.output_dir / path
+        self.subtitle_destinations.add(path.resolve())
+
     def _capture_subtitle_destination(self, msg: str) -> None:
         marker = "Writing video subtitles to:"
-        if marker not in msg:
+        if marker in msg:
+            raw_path = msg.split(marker, 1)[1].strip()
+            if raw_path:
+                self._remember_subtitle_destination(raw_path)
             return
-        raw_path = msg.split(marker, 1)[1].strip()
-        if raw_path:
-            self.subtitle_destinations.add(Path(raw_path).expanduser().resolve())
+
+        # On resumed runs yt-dlp does not emit "Writing video subtitles to".
+        # It reports the already-complete file instead. Remember that concrete
+        # path too so a valid subtitle is not mistaken for a permanent failure.
+        already_present_marker = " is already present"
+        if already_present_marker in msg:
+            raw_path = msg.split(already_present_marker, 1)[0].strip()
+            if raw_path.startswith("[info]"):
+                raw_path = raw_path[len("[info]") :].strip()
+            self._remember_subtitle_destination(raw_path)
 
     def valid_srt_destinations(self) -> set[Path]:
         valid: set[Path] = set()
@@ -2544,7 +2563,7 @@ class DownloaderGUI:
             before_files = snapshot_all_files(config["output_dir"])
             before_valid_srt_files = snapshot_valid_srt_files(config["output_dir"])
 
-            ytdlp_logger = GuiLogger(logger)
+            ytdlp_logger = GuiLogger(logger, config["output_dir"])
             common_opts: dict = {
                 "continuedl": True,
                 "overwrites": False,

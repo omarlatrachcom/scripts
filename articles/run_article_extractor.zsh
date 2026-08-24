@@ -103,12 +103,13 @@ if ! python_has_tk "$VENV_PYTHON"; then
   fi
 fi
 
-# Retry optional dependency setup on later launches if a previous attempt was
-# offline. Extraction can still run with its conservative built-in counter.
-if ! "$VENV_PYTHON" -c 'import tiktoken' >/dev/null 2>&1; then
-  print "Installing the exact token counter in the private environment…"
+# Retry dependency setup on later launches if a previous attempt was offline.
+# Extraction can still use its conservative built-in counter without tiktoken,
+# while TelQuel pages specifically require curl-cffi's browser transport.
+if ! "$VENV_PYTHON" -c 'import tiktoken, curl_cffi' >/dev/null 2>&1; then
+  print "Installing Article Extractor dependencies in the private environment…"
   if ! "$VENV_PYTHON" -m pip install --quiet -r "$SCRIPT_DIR/requirements.txt"; then
-    print "Warning: tiktoken installation failed; using the safe UTF-8 byte counter."
+    print "Warning: dependency installation failed. The safe UTF-8 token counter remains available, but TelQuel extraction requires curl-cffi."
   fi
 fi
 
