@@ -305,5 +305,47 @@ class SrtTranslatorGuiTests(unittest.TestCase):
         info.assert_not_called()
         gui.close_tab.assert_called_once_with(tab_frame)
 
+    def test_arabic_only_ass_rebuilds_arabic_srt_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source_path = str(Path(tmp, "episode.en.srt"))
+            arabic_path = str(Path(tmp, "episode.ar.srt"))
+            gui = SRTTranslatorGUI.__new__(SRTTranslatorGUI)
+            gui.current_srt_path = source_path
+            gui.current_dir = tmp
+            gui.original_base = "episode"
+            gui.rebuild_srt_only = Mock(return_value=arabic_path)
+            gui.status_var = Mock()
+            gui.root = Mock()
+
+            with (
+                patch("srt_translator_gui_mac.simpledialog.askstring", return_value="model"),
+                patch("srt_translator_gui_mac.create_arabic_only_ass") as create_ass,
+                patch("srt_translator_gui_mac.archive_srt_files") as archive,
+            ):
+                gui.create_arabic_only_ass_file()
+
+            gui.rebuild_srt_only.assert_called_once_with()
+            create_ass.assert_called_once_with(
+                arabic_srt_path=arabic_path,
+                output_ass_path=str(Path(tmp, "episode.arabic-only.ass")),
+                model_text="model",
+            )
+            archive.assert_called_once_with([source_path, arabic_path], tmp)
+
+    def test_bilingual_ass_stops_when_automatic_rebuild_fails(self) -> None:
+        gui = SRTTranslatorGUI.__new__(SRTTranslatorGUI)
+        gui.current_srt_path = "/subs/episode.en.srt"
+        gui.current_dir = "/subs"
+        gui.original_base = "episode"
+        gui.rebuild_srt_only = Mock(return_value=None)
+        gui.status_var = Mock()
+        gui.root = Mock()
+
+        with patch("srt_translator_gui_mac.create_bilingual_ass") as create_ass:
+            gui.create_bilingual_ass_file()
+
+        gui.rebuild_srt_only.assert_called_once_with()
+        create_ass.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

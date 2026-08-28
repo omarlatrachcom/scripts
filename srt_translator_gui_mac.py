@@ -1152,13 +1152,6 @@ class SRTTranslatorGUI:
         bottom_frame = ttk.Frame(root)
         bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
 
-        self.rebuild_button = ttk.Button(
-            bottom_frame,
-            text="Rebuild Arabic SRT (.ar.srt)",
-            command=self.rebuild_srt_only,
-        )
-        self.rebuild_button.pack(side=tk.LEFT, padx=5)
-
         self.bilingual_ass_button = ttk.Button(
             bottom_frame,
             text="Bilingual ASS",
@@ -1600,7 +1593,7 @@ class SRTTranslatorGUI:
         return out
 
 
-    def rebuild_srt_only(self):
+    def rebuild_srt_only(self) -> Optional[str]:
         try:
             if not self.current_srt_path or not self.original_base:
                 messagebox.showerror("Error", "No SRT has been loaded. Load an SRT file first.")
@@ -1655,6 +1648,7 @@ class SRTTranslatorGUI:
             rebuild_srt_sequential(self.current_srt_path, arabic_lines, out_path)
 
             self.status_var.set(f"Rebuilt SRT: {os.path.basename(out_path)}")
+            return out_path
 
         except Exception as e:
             messagebox.showerror("Error during rebuild", str(e))
@@ -1668,14 +1662,8 @@ class SRTTranslatorGUI:
                 return
 
             source_srt_path = self.current_srt_path
-            arabic_srt_path = arabic_srt_output_path(
-                self.current_dir, self.original_base, self.current_srt_path
-            )
-            if not os.path.isfile(arabic_srt_path):
-                messagebox.showerror(
-                    "Error",
-                    f"Arabic SRT not found:\n{arabic_srt_path}\n\nPlease rebuild the Arabic SRT (.ar.srt) first.",
-                )
+            arabic_srt_path = self.rebuild_srt_only()
+            if not arabic_srt_path:
                 return
 
             default_model = default_model_text()
@@ -1719,14 +1707,8 @@ class SRTTranslatorGUI:
                 return
 
             source_srt_path = self.current_srt_path
-            arabic_srt_path = arabic_srt_output_path(
-                self.current_dir, self.original_base, self.current_srt_path
-            )
-            if not os.path.isfile(arabic_srt_path):
-                messagebox.showerror(
-                    "Error",
-                    f"Arabic SRT not found:\n{arabic_srt_path}\n\nPlease rebuild the Arabic SRT (.ar.srt) first.",
-                )
+            arabic_srt_path = self.rebuild_srt_only()
+            if not arabic_srt_path:
                 return
 
             default_model = default_model_text()
