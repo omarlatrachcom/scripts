@@ -6,7 +6,7 @@ macOS-adapted GUI tool for:
 - Extracting subtitle text lines from any SRT file
 - Chunking them into groups of 150 lines
 - Adding an embedded ChatGPT translation prompt at the top of each chunk
-- Letting the user Copy-and-clear / Paste content per chunk (for ChatGPT)
+- Letting the user Copy / Erase / Paste the content per chunk (for ChatGPT)
 - Rebuilding a perfectly synced Arabic SRT: <name>.ar.srt
 - Creating a bilingual ASS file that shows Arabic + original subtitles together
 - Opening the related video in VLC (separate button)
@@ -1129,7 +1129,7 @@ class SRTTranslatorGUI:
         self.tab_expected_ids: List[List[str]] = []
         # Store translations from tabs the user closes (so rebuild still works)
         self.saved_translations: Dict[str, str] = {}
-        # Preserve the content replaced through Copy/Paste so failed validation
+        # Preserve the content replaced through Erase/Paste so failed validation
         # can restore it as one logical undo operation.
         self.pre_replace_contents: Dict[tk.Text, str] = {}
         dir_frame = ttk.Frame(root)
@@ -1296,6 +1296,7 @@ class SRTTranslatorGUI:
                 text_widget.edit_reset()
 
                 ttk.Button(btn_frame, text="Copy", command=lambda tw=text_widget: self.copy_text(tw)).pack(side=tk.LEFT, padx=4)
+                ttk.Button(btn_frame, text="Erase", command=lambda tw=text_widget: self.erase_text(tw)).pack(side=tk.LEFT, padx=4)
                 ttk.Button(btn_frame, text="Paste", command=lambda tw=text_widget: self.paste_text(tw)).pack(side=tk.LEFT, padx=4)
 
                 expected_ids = [ln.split("|", 1)[0] for ln in chunk]
@@ -1334,13 +1335,10 @@ class SRTTranslatorGUI:
             self.status_var.set("Error during extraction.")
 
     def copy_text(self, text_widget: tk.Text):
-        content = text_widget.get("1.0", "end-1c")
-        if text_widget not in self.pre_replace_contents:
-            self.pre_replace_contents[text_widget] = content
+        content = text_widget.get("1.0", tk.END)
         self.root.clipboard_clear()
         self.root.clipboard_append(content)
-        text_widget.delete("1.0", tk.END)
-        self.status_var.set("Chunk copied to clipboard and cleared.")
+        self.status_var.set("Chunk copied to clipboard.")
 
     @staticmethod
     def scroll_to_bottom(text_widget: tk.Text) -> None:
@@ -1373,6 +1371,12 @@ class SRTTranslatorGUI:
         self.root.clipboard_clear()
         self.root.clipboard_append(prompt)
         self.status_var.set("Drift-check prompt copied. Attach both SRT files in ChatGPT and paste.")
+
+    def erase_text(self, text_widget: tk.Text):
+        if text_widget not in self.pre_replace_contents:
+            self.pre_replace_contents[text_widget] = text_widget.get("1.0", "end-1c")
+        text_widget.delete("1.0", tk.END)
+        self.status_var.set("Chunk erased.")
 
     def paste_text(self, text_widget: tk.Text):
         try:

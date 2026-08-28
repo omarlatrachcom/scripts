@@ -224,21 +224,6 @@ class VlcTests(unittest.TestCase):
 
 
 class SrtTranslatorGuiTests(unittest.TestCase):
-    def test_copy_places_chunk_on_clipboard_and_clears_editor(self) -> None:
-        gui = SRTTranslatorGUI.__new__(SRTTranslatorGUI)
-        gui.root = Mock()
-        gui.status_var = Mock()
-        gui.pre_replace_contents = {}
-        text_widget = Mock()
-        text_widget.get.return_value = "prompt and subtitle lines"
-
-        gui.copy_text(text_widget)
-
-        gui.root.clipboard_append.assert_called_once_with("prompt and subtitle lines")
-        text_widget.delete.assert_called_once_with("1.0", "end")
-        self.assertEqual(gui.pre_replace_contents[text_widget], "prompt and subtitle lines")
-        gui.status_var.set.assert_called_once_with("Chunk copied to clipboard and cleared.")
-
     def test_scroll_to_bottom_moves_text_view_to_end(self) -> None:
         text_widget = Mock()
 
@@ -266,7 +251,7 @@ class SrtTranslatorGuiTests(unittest.TestCase):
             "Validation warnings in Chunk 1. Previous content restored."
         )
 
-    def test_failed_validation_restores_content_from_before_copy_and_paste(self) -> None:
+    def test_failed_validation_restores_content_from_before_erase_and_paste(self) -> None:
         gui = SRTTranslatorGUI.__new__(SRTTranslatorGUI)
         gui.root = Mock()
         gui.root.clipboard_get.return_value = "L000001|Incomplete translation"
@@ -278,7 +263,7 @@ class SrtTranslatorGuiTests(unittest.TestCase):
             "L000001|Incomplete translation\n",
         ]
 
-        gui.copy_text(text_widget)
+        gui.erase_text(text_widget)
         gui.paste_text(text_widget)
         with patch("srt_translator_gui_mac.messagebox.showwarning"):
             gui.validate_tab(
