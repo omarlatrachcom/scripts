@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import shutil
+import sys
 import tkinter as tk
 from dataclasses import dataclass
 from datetime import date
@@ -43,6 +44,9 @@ TIMECODE_RE = re.compile(
 )
 
 LINE_ID_RE = re.compile(r"^L\d{6}$")
+EPISODE_CODE_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])S(?P<season>\d{1,2})[ ._-]*E(?P<episode>\d{1,3})(?!\d)"
+)
 
 
 # ---------- RTL / BiDi forcing ----------
@@ -140,7 +144,7 @@ Keep brackets/parentheses and translate the content:
 NUMBERS AND UNITS:
 
 Use Western Arabic numerals 0–9 inside Arabic text (e.g. 3، 25، 2049).
-Convert non-metric measurements to metric equivalents in Arabic, rounding sensibly.
+MANDATORY: Convert every US measurement to metric units used in Morocco—in/ft/yd → cm/m, mi/mph → km/km/h, oz/lb → g/kg, cup/pint/quart/gallon → mL/L, acre → m²/ha, and °F → °C. Round naturally and NEVER retain the original US unit (e.g. 5 miles → 8 كم; 70°F → 21°م).
 
 Now translate the lines between the markers. Remember: output ONLY the translated L-lines, nothing else."""
 
@@ -919,6 +923,48 @@ def source_srt_name_parts(filename: str) -> Tuple[str, Optional[str]]:
     return stem, None
 
 
+def infer_media_context(srt_path: str) -> Optional[str]:
+    """Infer ``Series — SxxExx — Title`` from a conventional episode filename."""
+    stem = os.path.basename(srt_path)
+    if stem.casefold().endswith(".srt"):
+        stem = stem[:-4]
+    stem = re.sub(r"\.[a-z]{2,3}(?:-[a-z]{2,4})?$", "", stem, flags=re.IGNORECASE)
+
+    match = EPISODE_CODE_RE.search(stem)
+    if not match:
+        return None
+
+    def clean(part: str) -> str:
+        part = part.replace("_", " ").strip(" .-")
+        return re.sub(r"\s+", " ", part)
+
+    series = clean(stem[:match.start()])
+    title = re.sub(r"^[ ._-]+", "", stem[match.end():])
+    title = re.sub(
+        r"[ ._-]*[\[(]?\s*(?:2160p|1080p|720p|480p|BluRay|WEB[ ._-]*DL|WEBRip|HDTV|DVDRip|x26[45]|HEVC)(?![A-Za-z0-9]).*$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = clean(title)
+
+    code = f"S{int(match.group('season')):02d}E{int(match.group('episode')):02d}"
+    parts = [part for part in (series, code, title) if part]
+    return " — ".join(parts)
+
+
+def translation_prompt_for_srt(srt_path: str) -> str:
+    """Return the base prompt with concise inferred episode context when available."""
+    context = infer_media_context(srt_path)
+    if not context:
+        return PROMPT_TEXT
+    return (
+        PROMPT_TEXT
+        + f"\n\nMEDIA CONTEXT (metadata only): {context}. "
+        "Use it for names, tone, and wordplay; never add content absent from the supplied lines."
+    )
+
+
 def arabic_srt_output_path(
     base_dir: str,
     base_name: str,
@@ -934,25 +980,58 @@ def arabic_srt_output_path(
 
 
 def find_video_for_base(base_name: str, base_dir: str) -> Optional[str]:
-    """Try to find a video file named <base_name><ext> in base_dir."""
+    """Find a regular video file named <base_name><ext>, case-insensitively."""
+    try:
+        entries = {
+            entry.name.casefold(): entry.path
+            for entry in os.scandir(base_dir)
+            if entry.is_file()
+        }
+    except OSError:
+        return None
+
     for ext in VIDEO_EXTENSIONS:
-        candidate = os.path.join(base_dir, base_name + ext)
-        if os.path.isfile(candidate):
+        candidate = entries.get((base_name + ext).casefold())
+        if candidate:
             return candidate
     return None
 
 
-def open_video_in_vlc(path: str) -> None:
-    """Try to open video file in VLC."""
-    try:
-        subprocess.Popen(["vlc", path])
-    except FileNotFoundError:
-        messagebox.showwarning(
-            "VLC not found",
-            "Could not run 'vlc'. Make sure VLC is installed and in your PATH.",
-        )
-    except Exception as e:
-        messagebox.showwarning("Error launching VLC", f"Could not open video in VLC:\n{e}")
+def open_video_in_vlc(path: str) -> bool:
+    """Open a video in VLC, using Launch Services first on macOS."""
+    errors: List[str] = []
+
+    if sys.platform == "darwin":
+        try:
+            subprocess.run(
+                ["/usr/bin/open", "-a", "VLC", path],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return True
+        except subprocess.CalledProcessError as error:
+            detail = (error.stderr or error.stdout or str(error)).strip()
+            errors.append(detail)
+        except OSError as error:
+            errors.append(str(error))
+
+    # Keep a CLI fallback for nonstandard macOS installations and other systems.
+    vlc_executable = shutil.which("vlc")
+    if vlc_executable:
+        try:
+            subprocess.Popen([vlc_executable, path])
+            return True
+        except OSError as error:
+            errors.append(str(error))
+
+    details = f"\n\nDetails: {errors[-1]}" if errors else ""
+    messagebox.showwarning(
+        "VLC not found",
+        "Could not launch VLC. Make sure VLC is installed in Applications."
+        + details,
+    )
+    return False
 
 
 # ------------- GUI APP -------------
@@ -996,6 +1075,9 @@ class SRTTranslatorGUI:
         self.tab_expected_ids: List[List[str]] = []
         # Store translations from tabs the user closes (so rebuild still works)
         self.saved_translations: Dict[str, str] = {}
+        # Preserve the content replaced through Erase/Paste so failed validation
+        # can restore it as one logical undo operation.
+        self.pre_replace_contents: Dict[tk.Text, str] = {}
         dir_frame = ttk.Frame(root)
         dir_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
 
@@ -1113,6 +1195,7 @@ class SRTTranslatorGUI:
         self.tab_frames.clear()
         self.tab_expected_ids.clear()
         self.saved_translations.clear()
+        self.pre_replace_contents.clear()
 
     def load_and_extract(self):
         try:
@@ -1138,6 +1221,7 @@ class SRTTranslatorGUI:
                 return
 
             chunks = split_into_chunks_by_lines(lines_with_ids, MAX_LINES_PER_CHUNK)
+            translation_prompt = translation_prompt_for_srt(self.current_srt_path)
 
             self.clear_tabs()
 
@@ -1160,7 +1244,7 @@ class SRTTranslatorGUI:
                     fg="#ffffff",
                     insertbackground="#ffffff",
                 )
-                initial_text = PROMPT_TEXT + "\n\n### START LINES\n" + "\n".join(chunk) + "\n### END LINES\n"
+                initial_text = translation_prompt + "\n\n### START LINES\n" + "\n".join(chunk) + "\n### END LINES\n"
                 text_widget.insert("1.0", initial_text)
 
                 ttk.Button(btn_frame, text="Copy", command=lambda tw=text_widget: self.copy_text(tw)).pack(side=tk.LEFT, padx=4)
@@ -1180,11 +1264,19 @@ class SRTTranslatorGUI:
                     command=self.copy_drift_check_prompt,
                 ).pack(side=tk.LEFT, padx=4)
 
+                # Pack the rightmost button first: tkinter places each later
+                # RIGHT-packed widget immediately to its left.
+                ttk.Button(
+                    btn_frame,
+                    text="Scroll to Bottom",
+                    command=lambda tw=text_widget: self.scroll_to_bottom(tw),
+                ).pack(side=tk.RIGHT, padx=4)
+
                 ttk.Button(
                     btn_frame,
                     text="Close Tab",
                     command=lambda tf=tab_frame: self.close_tab(tf),
-                ).pack(side=tk.LEFT, padx=4)
+                ).pack(side=tk.RIGHT, padx=4)
 
                 self.tab_text_widgets.append(text_widget)
                 self.tab_expected_ids.append(expected_ids)
@@ -1212,6 +1304,11 @@ class SRTTranslatorGUI:
         self.root.clipboard_clear()
         self.root.clipboard_append(content)
         self.status_var.set("Chunk copied to clipboard.")
+
+    @staticmethod
+    def scroll_to_bottom(text_widget: tk.Text) -> None:
+        """Scroll a chunk editor to its lowest possible vertical position."""
+        text_widget.yview_moveto(1.0)
 
 
     def copy_drift_check_prompt(self):
@@ -1241,6 +1338,8 @@ class SRTTranslatorGUI:
         self.status_var.set("Drift-check prompt copied. Attach both SRT files in ChatGPT and paste.")
 
     def erase_text(self, text_widget: tk.Text):
+        if text_widget not in self.pre_replace_contents:
+            self.pre_replace_contents[text_widget] = text_widget.get("1.0", "end-1c")
         text_widget.delete("1.0", tk.END)
         self.status_var.set("Chunk erased.")
 
@@ -1250,9 +1349,26 @@ class SRTTranslatorGUI:
         except tk.TclError:
             messagebox.showerror("Clipboard error", "Clipboard is empty or not accessible.")
             return
+        if text_widget not in self.pre_replace_contents:
+            self.pre_replace_contents[text_widget] = text_widget.get("1.0", "end-1c")
         text_widget.delete("1.0", tk.END)
         text_widget.insert("1.0", content)
         self.status_var.set("Pasted clipboard content into chunk.")
+
+    def restore_previous_content(self, text_widget: tk.Text) -> bool:
+        """Restore a button-replaced snapshot, or fall back to one editor undo."""
+        previous_content = self.pre_replace_contents.pop(text_widget, None)
+        if previous_content is not None:
+            text_widget.delete("1.0", tk.END)
+            text_widget.insert("1.0", previous_content)
+            return True
+
+        try:
+            text_widget.edit_undo()
+        except tk.TclError:
+            return False
+        return True
+
     def validate_tab(self, text_widget: tk.Text, expected_ids: List[str], title: str = ""):
         """
         Validate that the pasted model output contains exactly one translated line per expected ID.
@@ -1308,8 +1424,16 @@ class SRTTranslatorGUI:
         header = f"Validation: {title}" if title else "Validation"
         if problems:
             messagebox.showwarning(header, "\n\n".join(problems))
-            self.status_var.set(f"Validation warnings in {title or 'chunk'}.")
+            if not self.restore_previous_content(text_widget):
+                self.status_var.set(
+                    f"Validation warnings in {title or 'chunk'}; no previous edit was available to restore."
+                )
+            else:
+                self.status_var.set(
+                    f"Validation warnings in {title or 'chunk'}. Previous content restored."
+                )
         else:
+            self.pre_replace_contents.pop(text_widget, None)
             messagebox.showinfo(header, "OK — all IDs are present exactly once and translations are non-empty.")
             self.status_var.set(f"Validation OK in {title or 'chunk'}.")
 
@@ -1396,6 +1520,7 @@ class SRTTranslatorGUI:
             self.notebook.forget(tab_frame)
             self.tab_frames.pop(idx)
             self.tab_text_widgets.pop(idx)
+            self.pre_replace_contents.pop(text_widget, None)
             if idx < len(self.tab_expected_ids):
                 self.tab_expected_ids.pop(idx)
 
@@ -1716,7 +1841,10 @@ class SRTTranslatorGUI:
 
             video_path = find_video_for_base(self.original_base, self.current_dir)
             if video_path:
-                open_video_in_vlc(video_path)
+                if open_video_in_vlc(video_path):
+                    self.status_var.set(f"Opened {os.path.basename(video_path)} in VLC.")
+                else:
+                    self.status_var.set("Could not open the video in VLC.")
             else:
                 messagebox.showwarning(
                     "Video not found",
