@@ -44,6 +44,7 @@ class SrtFileDiscoveryTests(unittest.TestCase):
                 (directory / name).write_text("", encoding="utf-8")
             (directory / "notes.txt").write_text("", encoding="utf-8")
             (directory / "fake.srt.backup").write_text("", encoding="utf-8")
+            (directory / ".hidden.tmp.srt").write_text("", encoding="utf-8")
             (directory / "folder.srt").mkdir()
 
             self.assertEqual(

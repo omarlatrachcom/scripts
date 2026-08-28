@@ -888,13 +888,15 @@ def rebuild_srt_sequential(srt_path: str, arabic_lines: List[str], target_path: 
 
 
 def find_source_srt_files(base_dir: str) -> List[str]:
-    """Return every regular SRT file in ``base_dir``."""
+    """Return every visible regular SRT file in ``base_dir``."""
     files: List[str] = []
     try:
         entries = os.listdir(base_dir)
     except FileNotFoundError:
         return []
     for f in entries:
+        if f.startswith("."):
+            continue
         full_path = os.path.join(base_dir, f)
         if f.casefold().endswith(".srt") and os.path.isfile(full_path):
             files.append(f)
