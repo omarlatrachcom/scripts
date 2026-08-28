@@ -8,6 +8,7 @@ from srt_translator_gui_mac import (
     SRTTranslatorGUI,
     arabic_srt_output_path,
     archive_srt_files,
+    default_working_directory,
     find_source_srt_files,
     find_video_for_base,
     infer_media_context,
@@ -18,6 +19,19 @@ from srt_translator_gui_mac import (
 
 
 class SrtFileDiscoveryTests(unittest.TestCase):
+    def test_downloads_is_the_default_working_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = Path(tmp, "Downloads")
+            downloads.mkdir()
+
+            with patch("srt_translator_gui_mac.os.path.expanduser", return_value=tmp):
+                self.assertEqual(default_working_directory(), str(downloads))
+
+    def test_home_is_used_when_downloads_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("srt_translator_gui_mac.os.path.expanduser", return_value=tmp):
+                self.assertEqual(default_working_directory(), tmp)
+
     def test_finds_every_regular_srt_file_regardless_of_name_or_case(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)

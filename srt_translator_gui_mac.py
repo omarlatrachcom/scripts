@@ -902,6 +902,13 @@ def find_source_srt_files(base_dir: str) -> List[str]:
     return files
 
 
+def default_working_directory() -> str:
+    """Use the user's Downloads directory when available, otherwise their home."""
+    home_dir = os.path.expanduser("~")
+    downloads_dir = os.path.join(home_dir, "Downloads")
+    return downloads_dir if os.path.isdir(downloads_dir) else home_dir
+
+
 def source_srt_name_parts(filename: str) -> Tuple[str, Optional[str]]:
     """
     Return the output base name and optional language label for any SRT name.
@@ -1067,7 +1074,7 @@ class SRTTranslatorGUI:
         self.root.title("SRT Translator GUI for macOS (→ ar)")
         self.root.geometry("1250x780")
 
-        self.current_dir = os.path.expanduser(os.environ.get("HOME", "~"))
+        self.current_dir = default_working_directory()
 
         base_font = ("Arial", 12)
         big_font = ("Arial", 13)
