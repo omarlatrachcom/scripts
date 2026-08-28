@@ -44,6 +44,7 @@ TIMECODE_RE = re.compile(
 )
 
 LINE_ID_RE = re.compile(r"^L\d{6}$")
+LANGUAGE_LABEL_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?$")
 EPISODE_CODE_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9])S(?P<season>\d{1,2})[ ._-]*E(?P<episode>\d{1,3})(?!\d)"
 )
@@ -918,7 +919,7 @@ def source_srt_name_parts(filename: str) -> Tuple[str, Optional[str]]:
 
     if "." in stem:
         base, language_label = stem.rsplit(".", 1)
-        if base and language_label:
+        if base and LANGUAGE_LABEL_RE.fullmatch(language_label):
             return base, language_label
     return stem, None
 
@@ -977,6 +978,30 @@ def arabic_srt_output_path(
     if source_key == output_key:
         output_path = os.path.join(base_dir, base_name + ".translated.ar.srt")
     return output_path
+
+
+def archive_srt_files(srt_paths: List[str], base_dir: str) -> List[str]:
+    """Move existing SRT files into ``base_dir/srt`` without overwriting files."""
+    archive_dir = os.path.join(base_dir, "srt")
+    os.makedirs(archive_dir, exist_ok=True)
+    moved_paths: List[str] = []
+
+    for source_path in srt_paths:
+        if not os.path.isfile(source_path):
+            continue
+
+        filename = os.path.basename(source_path)
+        destination = os.path.join(archive_dir, filename)
+        stem, suffix = os.path.splitext(filename)
+        counter = 1
+        while os.path.exists(destination):
+            destination = os.path.join(archive_dir, f"{stem}.{counter}{suffix}")
+            counter += 1
+
+        shutil.move(source_path, destination)
+        moved_paths.append(destination)
+
+    return moved_paths
 
 
 def find_video_for_base(base_name: str, base_dir: str) -> Optional[str]:
@@ -1246,16 +1271,20 @@ class SRTTranslatorGUI:
                 )
                 initial_text = translation_prompt + "\n\n### START LINES\n" + "\n".join(chunk) + "\n### END LINES\n"
                 text_widget.insert("1.0", initial_text)
+                text_widget.edit_reset()
 
                 ttk.Button(btn_frame, text="Copy", command=lambda tw=text_widget: self.copy_text(tw)).pack(side=tk.LEFT, padx=4)
                 ttk.Button(btn_frame, text="Erase", command=lambda tw=text_widget: self.erase_text(tw)).pack(side=tk.LEFT, padx=4)
                 ttk.Button(btn_frame, text="Paste", command=lambda tw=text_widget: self.paste_text(tw)).pack(side=tk.LEFT, padx=4)
 
                 expected_ids = [ln.split("|", 1)[0] for ln in chunk]
+                source_text_by_id = dict(ln.split("|", 1) for ln in chunk)
                 ttk.Button(
                     btn_frame,
                     text="Validate",
-                    command=lambda tw=text_widget, ids=expected_ids, title=tab_title: self.validate_tab(tw, ids, title),
+                    command=lambda tw=text_widget, ids=expected_ids, title=tab_title, source=source_text_by_id: self.validate_tab(
+                        tw, ids, title, source
+                    ),
                 ).pack(side=tk.LEFT, padx=4)
 
                 ttk.Button(
@@ -1285,14 +1314,6 @@ class SRTTranslatorGUI:
             self.status_var.set(
                 f"Extracted {len(lines_with_ids)} lines into {len(chunks)} chunk(s). "
                 f"Source language: {language_status}"
-            )
-
-            messagebox.showinfo(
-                "Extraction complete",
-                "Chunks are ready.\n\nFor each tab:\n"
-                "- Click 'Copy' and paste into a NEW ChatGPT chat.\n"
-                "- Let ChatGPT translate according to the built-in prompt.\n"
-                "- Copy ChatGPT's output and use 'Erase' then 'Paste' to replace the content.",
             )
 
         except Exception as e:
@@ -1369,7 +1390,13 @@ class SRTTranslatorGUI:
             return False
         return True
 
-    def validate_tab(self, text_widget: tk.Text, expected_ids: List[str], title: str = ""):
+    def validate_tab(
+        self,
+        text_widget: tk.Text,
+        expected_ids: List[str],
+        title: str = "",
+        source_text_by_id: Optional[Dict[str, str]] = None,
+    ):
         """
         Validate that the pasted model output contains exactly one translated line per expected ID.
         Only lines of the form: L000001|... are considered.
@@ -1418,6 +1445,12 @@ class SRTTranslatorGUI:
             problems.append("Duplicate IDs (first 30): " + ", ".join(duplicates[:30]))
         if empty:
             problems.append("Empty translations (first 30): " + ", ".join(empty[:30]))
+        unchanged = bool(source_text_by_id) and not (missing or extra or duplicates or empty) and all(
+            id_to_text[line_id].strip() == source_text_by_id.get(line_id, "").strip()
+            for line_id in expected_ids
+        )
+        if unchanged:
+            problems.append("No translation detected: all subtitle lines are unchanged from the source.")
         if not order_matches and not (missing or extra or duplicates):
             problems.append("Note: ID order differs from the expected order (this is OK for rebuild-by-ID).")
 
@@ -1434,8 +1467,11 @@ class SRTTranslatorGUI:
                 )
         else:
             self.pre_replace_contents.pop(text_widget, None)
-            messagebox.showinfo(header, "OK — all IDs are present exactly once and translations are non-empty.")
-            self.status_var.set(f"Validation OK in {title or 'chunk'}.")
+            if text_widget in self.tab_text_widgets:
+                tab_index = self.tab_text_widgets.index(text_widget)
+                self.close_tab(self.tab_frames[tab_index])
+            else:
+                self.status_var.set(f"Validation OK in {title or 'chunk'}.")
 
     def close_tab(self, tab_frame: ttk.Frame):
         """
@@ -1623,15 +1659,15 @@ class SRTTranslatorGUI:
 
             out_path = arabic_srt_output_path(self.current_dir, self.original_base, self.current_srt_path)
 
-            self.status_var.set("Rebuilding Arabic SRT (.ar.srt)...")
+            self.status_var.set("Rebuilding Arabic SRT...")
             rebuild_srt_sequential(self.current_srt_path, arabic_lines, out_path)
 
             self.status_var.set(f"Rebuilt SRT: {os.path.basename(out_path)}")
-            messagebox.showinfo("Rebuild complete", f"Arabic SRT created:\n{out_path}")
 
         except Exception as e:
             messagebox.showerror("Error during rebuild", str(e))
             self.status_var.set("Error during rebuild.")
+            return None
 
     def create_bilingual_ass_file(self):
         try:
@@ -1674,61 +1710,11 @@ class SRTTranslatorGUI:
                 model_text=model_text,
             )
 
-            self.status_var.set(f"Created bilingual ASS: {os.path.basename(output_ass_path)}")
-            messagebox.showinfo(
-                "Bilingual ASS created",
-                f"Created bilingual ASS file:\n{output_ass_path}\n\n"
-                f"Source SRT:\n{source_srt_path}\n\n"
-                f"Arabic SRT:\n{arabic_srt_path}",
+            archive_srt_files(
+                [source_srt_path, arabic_srt_path],
+                self.current_dir,
             )
-
-            delete_srts = messagebox.askyesno(
-                "Delete SRT files?",
-                "The bilingual ASS file was created successfully.\n\n"
-                "Do you want to delete both SRT files?\n\n"
-                f"Source SRT:\n{source_srt_path}\n\n"
-                f"Arabic SRT:\n{arabic_srt_path}",
-            )
-
-            if delete_srts:
-                deleted_paths = []
-                missing_paths = []
-                failed_paths = []
-
-                for srt_path in (source_srt_path, arabic_srt_path):
-                    try:
-                        if os.path.isfile(srt_path):
-                            os.remove(srt_path)
-                            deleted_paths.append(srt_path)
-                        else:
-                            missing_paths.append(srt_path)
-                    except Exception as delete_error:
-                        failed_paths.append((srt_path, str(delete_error)))
-
-                if failed_paths:
-                    details = "\n\n".join(
-                        f"{file_path}\n{error_msg}" for file_path, error_msg in failed_paths
-                    )
-                    self.status_var.set("Bilingual ASS created, but some SRT files could not be deleted.")
-                    messagebox.showwarning(
-                        "Delete SRT files",
-                        "The bilingual ASS file was created, but some SRT files could not be deleted.\n\n"
-                        + details,
-                    )
-                else:
-                    details = []
-                    if deleted_paths:
-                        details.append("Deleted files:\n" + "\n".join(deleted_paths))
-                    if missing_paths:
-                        details.append("Already missing:\n" + "\n".join(missing_paths))
-
-                    self.status_var.set("Bilingual ASS created and SRT files deleted.")
-                    messagebox.showinfo(
-                        "Delete SRT files",
-                        "SRT cleanup complete.\n\n" + "\n\n".join(details),
-                    )
-            else:
-                self.status_var.set("Created bilingual ASS and kept both SRT files.")
+            self.status_var.set("Bilingual ASS created; SRT files moved to srt/.")
 
         except Exception as e:
             messagebox.showerror("Error creating bilingual ASS", str(e))
@@ -1774,59 +1760,11 @@ class SRTTranslatorGUI:
                 model_text=model_text,
             )
 
-            self.status_var.set(f"Created Arabic-only ASS: {os.path.basename(output_ass_path)}")
-            messagebox.showinfo(
-                "Arabic-only ASS created",
-                f"Created Arabic-only ASS file:\n{output_ass_path}\n\nArabic SRT:\n{arabic_srt_path}",
+            archive_srt_files(
+                [source_srt_path, arabic_srt_path],
+                self.current_dir,
             )
-
-            delete_srts = messagebox.askyesno(
-                "Delete SRT files?",
-                "The Arabic-only ASS file was created successfully.\n\n"
-                "Do you want to delete both SRT files?\n\n"
-                f"Source SRT:\n{source_srt_path}\n\n"
-                f"Arabic SRT:\n{arabic_srt_path}",
-            )
-
-            if delete_srts:
-                deleted_paths = []
-                missing_paths = []
-                failed_paths = []
-
-                for srt_path in (source_srt_path, arabic_srt_path):
-                    try:
-                        if os.path.isfile(srt_path):
-                            os.remove(srt_path)
-                            deleted_paths.append(srt_path)
-                        else:
-                            missing_paths.append(srt_path)
-                    except Exception as delete_error:
-                        failed_paths.append((srt_path, str(delete_error)))
-
-                if failed_paths:
-                    details = "\n\n".join(
-                        f"{file_path}\n{error_msg}" for file_path, error_msg in failed_paths
-                    )
-                    self.status_var.set("Arabic-only ASS created, but some SRT files could not be deleted.")
-                    messagebox.showwarning(
-                        "Delete SRT files",
-                        "The Arabic-only ASS file was created, but some SRT files could not be deleted.\n\n"
-                        + details,
-                    )
-                else:
-                    details = []
-                    if deleted_paths:
-                        details.append("Deleted files:\n" + "\n".join(deleted_paths))
-                    if missing_paths:
-                        details.append("Already missing:\n" + "\n".join(missing_paths))
-
-                    self.status_var.set("Arabic-only ASS created and SRT files deleted.")
-                    messagebox.showinfo(
-                        "Delete SRT files",
-                        "SRT cleanup complete.\n\n" + "\n\n".join(details),
-                    )
-            else:
-                self.status_var.set("Created Arabic-only ASS and kept both SRT files.")
+            self.status_var.set("Arabic-only ASS created; SRT files moved to srt/.")
 
         except Exception as e:
             messagebox.showerror("Error creating Arabic-only ASS", str(e))
