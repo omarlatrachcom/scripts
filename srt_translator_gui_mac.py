@@ -112,6 +112,7 @@ TRANSLATION QUALITY (professional subtitles):
 Modern Standard Arabic only (no dialect).
 Natural, fluent, broadcast-quality Arabic suitable for subtitles.
 Preserve meaning, tone, sarcasm, humor, tension, and character voice.
+Keep proper nouns exactly as written; do not translate or transliterate them.
 Use context ONLY from PREVIOUS lines (1–2 cues back) to resolve pronouns/names.
 NEVER use future lines (no look-ahead). Do not pull meaning, objects, verbs, or sentence endings from the next cue.
 Preserve cue boundary feel: if the English cue is an incomplete fragment, the Arabic MUST also remain an incomplete fragment.
