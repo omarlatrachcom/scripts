@@ -1293,18 +1293,10 @@ class SRTTranslatorGUI:
                     command=self.copy_drift_check_prompt,
                 ).pack(side=tk.LEFT, padx=4)
 
-                # Pack the rightmost button first: tkinter places each later
-                # RIGHT-packed widget immediately to its left.
                 ttk.Button(
                     btn_frame,
                     text="Scroll to Bottom",
                     command=lambda tw=text_widget: self.scroll_to_bottom(tw),
-                ).pack(side=tk.RIGHT, padx=4)
-
-                ttk.Button(
-                    btn_frame,
-                    text="Close Tab",
-                    command=lambda tf=tab_frame: self.close_tab(tf),
                 ).pack(side=tk.RIGHT, padx=4)
 
                 self.tab_text_widgets.append(text_widget)
