@@ -6,7 +6,7 @@ macOS-adapted GUI tool for:
 - Extracting subtitle text lines from any SRT file
 - Chunking them into groups of 150 lines
 - Adding an embedded ChatGPT translation prompt at the top of each chunk
-- Letting the user Copy / Erase / Paste the content per chunk (for ChatGPT)
+- Letting the user Copy-and-clear / Paste content per chunk (for ChatGPT)
 - Rebuilding a perfectly synced Arabic SRT: <name>.ar.srt
 - Creating a bilingual ASS file that shows Arabic + original subtitles together
 - Opening the related video in VLC (separate button)
@@ -934,44 +934,64 @@ def source_srt_name_parts(filename: str) -> Tuple[str, Optional[str]]:
 
 
 def infer_media_context(srt_path: str) -> Optional[str]:
-    """Infer ``Series — SxxExx — Title`` from a conventional episode filename."""
+    """Infer concise media context from an episode or other descriptive filename."""
     stem = os.path.basename(srt_path)
     if stem.casefold().endswith(".srt"):
         stem = stem[:-4]
     stem = re.sub(r"\.[a-z]{2,3}(?:-[a-z]{2,4})?$", "", stem, flags=re.IGNORECASE)
 
     match = EPISODE_CODE_RE.search(stem)
-    if not match:
-        return None
 
     def clean(part: str) -> str:
-        part = part.replace("_", " ").strip(" .-")
+        part = re.sub(r"^\d{6}[ ._-]+", "", part)
+        part = re.sub(r"[._]+", " ", part).strip(" .-")
         return re.sub(r"\s+", " ", part)
 
-    series = clean(stem[:match.start()])
-    title = re.sub(r"^[ ._-]+", "", stem[match.end():])
+    series = clean(stem[:match.start()]) if match else ""
+    title = re.sub(r"^[ ._-]+", "", stem[match.end():] if match else stem)
     title = re.sub(
         r"[ ._-]*[\[(]?\s*(?:2160p|1080p|720p|480p|BluRay|WEB[ ._-]*DL|WEBRip|HDTV|DVDRip|x26[45]|HEVC)(?![A-Za-z0-9]).*$",
         "",
         title,
         flags=re.IGNORECASE,
     )
+    title = re.sub(r"[ ._-]+part\d+$", "", title, flags=re.IGNORECASE)
     title = clean(title)
 
-    code = f"S{int(match.group('season')):02d}E{int(match.group('episode')):02d}"
-    parts = [part for part in (series, code, title) if part]
-    return " — ".join(parts)
+    if not match:
+        if not title:
+            return None
+        context = f"UFC/MMA event — {title}" if re.match(r"^UFC\s*\d", title, re.IGNORECASE) else title
+    else:
+        code = f"S{int(match.group('season')):02d}E{int(match.group('episode')):02d}"
+        context = " — ".join(part for part in (series, code, title) if part)
+
+    ignored_folders = {"downloads", "movies", "srt", "subs", "tv", "videos"}
+    folder_labels = {"documentary": "Documentary", "youtube": "YouTube"}
+    context_key = re.sub(r"\W+", "", context, flags=re.UNICODE).casefold()
+    for parent in list(Path(srt_path).parents)[:3]:
+        folder = clean(parent.name)
+        folder_key = re.sub(r"\W+", "", folder, flags=re.UNICODE).casefold()
+        if not folder_key:
+            continue
+        if folder.casefold() in ignored_folders:
+            break
+        if folder_key in context_key:
+            continue
+        context = f"{folder_labels.get(folder.casefold(), folder)} — {context}"
+        break
+    return context
 
 
 def translation_prompt_for_srt(srt_path: str) -> str:
-    """Return the base prompt with concise inferred episode context when available."""
+    """Return the base prompt with concise inferred media context when available."""
     context = infer_media_context(srt_path)
     if not context:
         return PROMPT_TEXT
     return (
         PROMPT_TEXT
         + f"\n\nMEDIA CONTEXT (metadata only): {context}. "
-        "Use it for names, tone, and wordplay; never add content absent from the supplied lines."
+        "Use it for names, subject terminology, tone, and wordplay; never add content absent from the supplied lines."
     )
 
 
@@ -1109,7 +1129,7 @@ class SRTTranslatorGUI:
         self.tab_expected_ids: List[List[str]] = []
         # Store translations from tabs the user closes (so rebuild still works)
         self.saved_translations: Dict[str, str] = {}
-        # Preserve the content replaced through Erase/Paste so failed validation
+        # Preserve the content replaced through Copy/Paste so failed validation
         # can restore it as one logical undo operation.
         self.pre_replace_contents: Dict[tk.Text, str] = {}
         dir_frame = ttk.Frame(root)
@@ -1276,7 +1296,6 @@ class SRTTranslatorGUI:
                 text_widget.edit_reset()
 
                 ttk.Button(btn_frame, text="Copy", command=lambda tw=text_widget: self.copy_text(tw)).pack(side=tk.LEFT, padx=4)
-                ttk.Button(btn_frame, text="Erase", command=lambda tw=text_widget: self.erase_text(tw)).pack(side=tk.LEFT, padx=4)
                 ttk.Button(btn_frame, text="Paste", command=lambda tw=text_widget: self.paste_text(tw)).pack(side=tk.LEFT, padx=4)
 
                 expected_ids = [ln.split("|", 1)[0] for ln in chunk]
@@ -1315,10 +1334,13 @@ class SRTTranslatorGUI:
             self.status_var.set("Error during extraction.")
 
     def copy_text(self, text_widget: tk.Text):
-        content = text_widget.get("1.0", tk.END)
+        content = text_widget.get("1.0", "end-1c")
+        if text_widget not in self.pre_replace_contents:
+            self.pre_replace_contents[text_widget] = content
         self.root.clipboard_clear()
         self.root.clipboard_append(content)
-        self.status_var.set("Chunk copied to clipboard.")
+        text_widget.delete("1.0", tk.END)
+        self.status_var.set("Chunk copied to clipboard and cleared.")
 
     @staticmethod
     def scroll_to_bottom(text_widget: tk.Text) -> None:
@@ -1351,12 +1373,6 @@ class SRTTranslatorGUI:
         self.root.clipboard_clear()
         self.root.clipboard_append(prompt)
         self.status_var.set("Drift-check prompt copied. Attach both SRT files in ChatGPT and paste.")
-
-    def erase_text(self, text_widget: tk.Text):
-        if text_widget not in self.pre_replace_contents:
-            self.pre_replace_contents[text_widget] = text_widget.get("1.0", "end-1c")
-        text_widget.delete("1.0", tk.END)
-        self.status_var.set("Chunk erased.")
 
     def paste_text(self, text_widget: tk.Text):
         try:

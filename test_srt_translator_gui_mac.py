@@ -158,10 +158,42 @@ class TranslationPromptTests(unittest.TestCase):
         )
         self.assertIn("never add content absent from the supplied lines", prompt)
 
-    def test_non_episode_filename_keeps_base_prompt_unchanged(self) -> None:
+    def test_infers_ufc_context_and_removes_release_metadata(self) -> None:
+        filename = (
+            "/Users/omar/Downloads/UFC_330/"
+            "UFC.330.Makhachev.vs.Machado.Garry.Main.Card."
+            "1080p.WEB-DL.H264-nVa_part002.srt"
+        )
+
         self.assertEqual(
-            translation_prompt_for_srt("A standalone documentary.en.srt"),
-            PROMPT_TEXT,
+            infer_media_context(filename),
+            "UFC/MMA event — UFC 330 Makhachev vs Machado Garry Main Card",
+        )
+        self.assertIn(
+            "MEDIA CONTEXT (metadata only): UFC/MMA event — UFC 330 "
+            "Makhachev vs Machado Garry Main Card.",
+            translation_prompt_for_srt(filename),
+        )
+
+    def test_non_episode_filename_adds_generic_context(self) -> None:
+        prompt = translation_prompt_for_srt("A standalone documentary.en.srt")
+        self.assertIn("MEDIA CONTEXT (metadata only): A standalone documentary.", prompt)
+
+    def test_documentary_folder_and_archive_date_enrich_context(self) -> None:
+        path = (
+            "/Volumes/MP/pCloud/TV/documentary/"
+            "240815_Le_petit_dejeuner_un_repas_mondialise_Faire_l_histoire_ARTE.fr.srt"
+        )
+        self.assertEqual(
+            infer_media_context(path),
+            "Documentary — Le petit dejeuner un repas mondialise Faire l histoire ARTE",
+        )
+
+    def test_arbitrary_parent_folder_can_supply_youtube_channel_context(self) -> None:
+        path = "/Users/omar/Downloads/Useful Channel/Why_cities_keep_growing.en.srt"
+        self.assertEqual(
+            infer_media_context(path),
+            "Useful Channel — Why cities keep growing",
         )
 
 
@@ -192,6 +224,21 @@ class VlcTests(unittest.TestCase):
 
 
 class SrtTranslatorGuiTests(unittest.TestCase):
+    def test_copy_places_chunk_on_clipboard_and_clears_editor(self) -> None:
+        gui = SRTTranslatorGUI.__new__(SRTTranslatorGUI)
+        gui.root = Mock()
+        gui.status_var = Mock()
+        gui.pre_replace_contents = {}
+        text_widget = Mock()
+        text_widget.get.return_value = "prompt and subtitle lines"
+
+        gui.copy_text(text_widget)
+
+        gui.root.clipboard_append.assert_called_once_with("prompt and subtitle lines")
+        text_widget.delete.assert_called_once_with("1.0", "end")
+        self.assertEqual(gui.pre_replace_contents[text_widget], "prompt and subtitle lines")
+        gui.status_var.set.assert_called_once_with("Chunk copied to clipboard and cleared.")
+
     def test_scroll_to_bottom_moves_text_view_to_end(self) -> None:
         text_widget = Mock()
 
@@ -219,7 +266,7 @@ class SrtTranslatorGuiTests(unittest.TestCase):
             "Validation warnings in Chunk 1. Previous content restored."
         )
 
-    def test_failed_validation_restores_content_from_before_erase_and_paste(self) -> None:
+    def test_failed_validation_restores_content_from_before_copy_and_paste(self) -> None:
         gui = SRTTranslatorGUI.__new__(SRTTranslatorGUI)
         gui.root = Mock()
         gui.root.clipboard_get.return_value = "L000001|Incomplete translation"
@@ -231,7 +278,7 @@ class SrtTranslatorGuiTests(unittest.TestCase):
             "L000001|Incomplete translation\n",
         ]
 
-        gui.erase_text(text_widget)
+        gui.copy_text(text_widget)
         gui.paste_text(text_widget)
         with patch("srt_translator_gui_mac.messagebox.showwarning"):
             gui.validate_tab(
