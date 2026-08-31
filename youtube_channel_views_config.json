@@ -1,5 +1,5 @@
 {
-  "min_views": "15000",
+  "min_views": "50000",
   "max_videos_per_channel": null,
   "published_after": null,
   "published_before": null,
@@ -7,7 +7,7 @@
   "browser_profile": null,
   "cookies_file": null,
   "open_browser": true,
-  "active_theme": "books",
+  "active_theme": "Talk",
   "themes": [
     {
       "name": "books",
@@ -106,6 +106,18 @@
         {
           "enabled": true,
           "url": "https://www.youtube.com/@lethalcrysis/videos"
+        }
+      ]
+    },
+    {
+      "name": "Talk",
+      "min_views": 50000,
+      "report_file": "youtube_channel_views_talk_report.html",
+      "saved_videos_file": "youtube_channel_views_talk_saved_videos.json",
+      "channels": [
+        {
+          "enabled": true,
+          "url": "https://www.youtube.com/@AbderrazakYousfi/videos"
         }
       ]
     }
