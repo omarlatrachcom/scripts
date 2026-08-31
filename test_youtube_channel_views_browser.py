@@ -80,5 +80,63 @@ class YouTubeApiTests(unittest.TestCase):
         self.assertEqual(stats.included, 2)
 
 
+class ReportInteractionTests(unittest.TestCase):
+    def test_video_links_open_in_new_tab_and_are_wired_for_automatic_saving(self):
+        video = browser.Video(
+            video_id="aaaaaaaaaaa",
+            title="Example video",
+            url="https://www.youtube.com/watch?v=aaaaaaaaaaa",
+            view_count=123_456,
+            channel="Example",
+            channel_url="https://www.youtube.com/@example",
+            duration="12:34",
+            published="2026-01-02",
+            published_sort_value=20260102,
+            source_order=0,
+            thumbnail_url="https://i.ytimg.com/vi/aaaaaaaaaaa/hqdefault.jpg",
+        )
+
+        report = browser.render_html(
+            [video],
+            [],
+            test_config(),
+            save_endpoint="http://127.0.0.1:12345/save-video",
+        )
+
+        self.assertEqual(report.count('class="video-link"'), 1)
+        self.assertEqual(report.count('video-title video-link'), 1)
+        self.assertEqual(report.count('target="_blank"'), 3)
+        self.assertIn('data-save-endpoint="http://127.0.0.1:12345/save-video"', report)
+        self.assertIn('document.querySelectorAll(".video-link")', report)
+        self.assertIn("saveVideo(row, null, false);", report)
+        self.assertIn("saveVideo(row, button, true);", report)
+        self.assertIn("open it in a new tab and save it automatically", report)
+
+    def test_save_button_is_not_a_video_link(self):
+        video = browser.Video(
+            video_id="aaaaaaaaaaa",
+            title="Example video",
+            url="https://www.youtube.com/watch?v=aaaaaaaaaaa",
+            view_count=123_456,
+            channel="Example",
+            channel_url="",
+            duration="12:34",
+            published="2026-01-02",
+            published_sort_value=20260102,
+            source_order=0,
+            thumbnail_url="",
+        )
+
+        rows = browser.render_video_rows(
+            [video],
+            save_endpoint="http://127.0.0.1:12345/save-video",
+        )
+
+        self.assertIn('class="save-video"', rows)
+        self.assertIn('title="Save without opening the video"', rows)
+        self.assertNotIn('class="save-video video-link"', rows)
+        self.assertNotIn('<a class="save-video"', rows)
+
+
 if __name__ == "__main__":
     unittest.main()

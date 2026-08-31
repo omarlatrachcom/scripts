@@ -1764,19 +1764,26 @@ def render_video_rows(
         duration = escape(video.duration)
         if save_endpoint:
             endpoint = escape(save_endpoint)
-            action_html = f"<button type=\"button\" class=\"save-video\" data-save-endpoint=\"{endpoint}\">Save</button>"
+            action_html = (
+                f"<button type=\"button\" class=\"save-video\" data-save-endpoint=\"{endpoint}\" "
+                "title=\"Save without opening the video\">Save</button>"
+            )
+            row_save_attribute = f" data-save-endpoint=\"{endpoint}\""
         else:
             action_html = (
                 "<button type=\"button\" class=\"save-video\" disabled "
                 "title=\"Open this report from the GUI to enable saving\">Save</button>"
             )
+            row_save_attribute = ""
         thumbnail_html = (
-            f"<a href=\"{url}\" target=\"_blank\" rel=\"noopener\"><img src=\"{thumbnail}\" alt=\"\"></a>"
+            f"<a class=\"video-link\" href=\"{url}\" target=\"_blank\" rel=\"noopener\" "
+            f"title=\"Open in a new tab and save automatically\"><img src=\"{thumbnail}\" alt=\"\"></a>"
             if thumbnail and url
             else ""
         )
         title_html = (
-            f"<a class=\"video-title\" href=\"{url}\" target=\"_blank\" rel=\"noopener\" dir=\"auto\">{title}</a>"
+            f"<a class=\"video-title video-link\" href=\"{url}\" target=\"_blank\" rel=\"noopener\" "
+            f"title=\"Open in a new tab and save automatically\" dir=\"auto\">{title}</a>"
             if url
             else f"<span class=\"video-title\" dir=\"auto\">{title}</span>"
         )
@@ -1793,7 +1800,7 @@ def render_video_rows(
             f"data-video-channel=\"{channel}\" "
             f"data-video-view-count=\"{video.view_count}\" "
             f"data-video-published=\"{published}\" "
-            f"data-video-duration=\"{duration}\">"
+            f"data-video-duration=\"{duration}\"{row_save_attribute}>"
             f"<td class=\"rank\">{index}</td>"
             f"<td class=\"thumb\">{thumbnail_html}</td>"
             f"<td>{title_html}<div class=\"url\">{url}</div></td>"
@@ -2039,6 +2046,7 @@ def render_html(
     <section>
       <h2>Videos by Views</h2>
       <div class="report-controls">
+        <span>Click a thumbnail or title to open it in a new tab and save it automatically.</span>
         <span>Saved videos: <code>{saved_file_text}</code></span>
         {extra_saved_file_html}
         <span title="{filter_store_title}">Filtering saved stores: <code>{format_count(len(filter_store_files))}</code></span>
@@ -2095,48 +2103,70 @@ def render_html(
       }}
 
       if (!document.querySelector(".save-video:not([disabled])")) {{
-        setStatus("Open this report from the GUI to enable Save buttons.");
+        setStatus("Open this report from the GUI to enable automatic saving and Save buttons.");
       }}
+
+      function saveVideo(row, button, showUnavailableAlert) {{
+        var record = rowRecord(row);
+        var saveEndpoint = row.dataset.saveEndpoint || "";
+        if (!record.video_id || row.dataset.saveState === "saving" || row.dataset.saveState === "saved") {{
+          return;
+        }}
+        if (!saveEndpoint) {{
+          setStatus("Opened video, but automatic saving is unavailable. Open this report from the GUI to enable it.");
+          if (showUnavailableAlert) {{
+            alert("Open this report from the GUI to enable saving videos.");
+          }}
+          return;
+        }}
+        row.dataset.saveState = "saving";
+        if (button) {{
+          button.disabled = true;
+          button.textContent = "Saving...";
+        }}
+        fetch(saveEndpoint, {{
+          method: "POST",
+          headers: {{"Content-Type": "application/json"}},
+          body: JSON.stringify(record)
+        }})
+          .then(function (response) {{
+            return response.json().then(function (payload) {{
+              if (!response.ok || !payload.ok) {{
+                throw new Error(payload.error || "Could not save video.");
+              }}
+              return payload;
+            }});
+          }})
+          .then(function (payload) {{
+            row.dataset.saveState = "saved";
+            removeVideoRows(record.video_id);
+            setStatus("Saved video. Saved count: " + payload.count);
+          }})
+          .catch(function (error) {{
+            row.dataset.saveState = "";
+            if (button) {{
+              button.disabled = false;
+              button.textContent = "Save";
+            }}
+            alert("Could not save video: " + error.message);
+          }});
+      }}
+
+      document.querySelectorAll(".video-link").forEach(function (link) {{
+        link.addEventListener("click", function () {{
+          var row = link.closest("tr[data-video-id]");
+          if (row) {{
+            saveVideo(row, null, false);
+          }}
+        }});
+      }});
 
       document.querySelectorAll(".save-video").forEach(function (button) {{
         button.addEventListener("click", function () {{
-          var saveEndpoint = button.dataset.saveEndpoint || "";
           var row = button.closest("tr[data-video-id]");
-          if (!row) {{
-            return;
+          if (row) {{
+            saveVideo(row, button, true);
           }}
-          var record = rowRecord(row);
-          if (!record.video_id) {{
-            return;
-          }}
-          if (!saveEndpoint) {{
-            alert("Open this report from the GUI to enable saving videos.");
-            return;
-          }}
-          button.disabled = true;
-          button.textContent = "Saving...";
-          fetch(saveEndpoint, {{
-            method: "POST",
-            headers: {{"Content-Type": "application/json"}},
-            body: JSON.stringify(record)
-          }})
-            .then(function (response) {{
-              return response.json().then(function (payload) {{
-                if (!response.ok || !payload.ok) {{
-                  throw new Error(payload.error || "Could not save video.");
-                }}
-                return payload;
-              }});
-            }})
-            .then(function (payload) {{
-              removeVideoRows(record.video_id);
-              setStatus("Saved video. Saved count: " + payload.count);
-            }})
-            .catch(function (error) {{
-              button.disabled = false;
-              button.textContent = "Save";
-              alert("Could not save video: " + error.message);
-            }});
         }});
       }});
     }})();

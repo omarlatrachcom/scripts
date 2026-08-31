@@ -134,8 +134,9 @@ What it does:
 - Sorts matching videos by view count, highest first.
 - Writes the selected theme's report HTML and opens it in the browser.
 - Creates a timestamped key-events fetch log under `logs/` for each fetch.
-- Adds a `Hide` button beside each video in the report. Hidden-video records
-  are stored in the selected theme's hidden-video JSON file, and future reports
+- Clicking a video's thumbnail or title opens it in a new browser tab and saves
+  it automatically. The separate `Save` button saves without opening the video.
+  Saved-video records are stored in the selected theme's saved-video JSON file, and future reports
   filter against all `youtube_channel_views*saved_videos.json` stores beside the
   config file.
 - Auto-installs `yt-dlp` and `yt-dlp-ejs` on first run if they are missing.
