@@ -45,6 +45,87 @@ Segunda línea&nbsp;&nbsp;
 """
 
 
+class PlaylistRangeTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "win32", "Existing folder names use native Windows rules")
+    def test_download_preserves_existing_output_folder_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "series " / "season"
+            output.mkdir(parents=True)
+            gui = object.__new__(downloader.DownloaderGUI)
+            gui.queue = mock.Mock()
+            gui.queue_log = mock.Mock()
+            gui.queue_progress = mock.Mock()
+            gui.make_progress_hook = lambda: (lambda _data: None)
+            config = {
+                "mode": "playlist", "media_type": "video",
+                "url": "https://example.invalid/playlist", "output_dir": str(output),
+                "wrap_in_folder": False, "use_cookies": False,
+                "want_subs": False, "start_idx": "18", "end_idx": "",
+            }
+
+            def download(_urls, opts, **_kwargs):
+                self.assertFalse(opts["windowsfilenames"])
+                self.assertEqual(opts["paths"]["home"], str(output))
+                (output / "18 - episode.mp4").write_bytes(b"completed video")
+                return 0
+
+            with (
+                mock.patch.object(downloader, "maybe_get_playlist_length", return_value=18),
+                mock.patch.object(downloader, "get_playlist_indices", return_value={18}),
+                mock.patch.object(downloader, "run_download", side_effect=download) as run,
+            ):
+                success, _summary = gui.download_one(config)
+            self.assertTrue(success)
+            run.assert_called_once()
+            self.assertEqual(downloader.completed_playlist_indices(output, extensions={"mp4"}), {18})
+
+    def test_preserves_requested_bounds(self) -> None:
+        for start, end, expected in (
+            ("18", "", (18, None)),
+            ("", "", (None, None)),
+            ("", "6", (None, 6)),
+            ("18", "18", (18, 18)),
+            ("18", "24", (18, 24)),
+        ):
+            with self.subTest(start=start, end=end):
+                self.assertEqual(downloader.parse_playlist_range(start, end), expected)
+
+    def test_rejects_reversed_and_invalid_bounds(self) -> None:
+        for start, end in (("18", "6"), ("0", ""), ("", "-1"), ("abc", ""), ("", "1.5")):
+            with self.subTest(start=start, end=end):
+                with self.assertRaises(ValueError):
+                    downloader.parse_playlist_range(start, end)
+
+    def test_reversed_range_does_not_start_worker(self) -> None:
+        gui = object.__new__(downloader.DownloaderGUI)
+        gui.downloading = False
+        gui.planned_jobs = mock.Mock(return_value=[{"mode": "playlist"}])
+        gui.start_idx_var = mock.Mock(get=lambda: "18")
+        gui.end_idx_var = mock.Mock(get=lambda: "6")
+        with (
+            mock.patch.object(downloader.messagebox, "showwarning") as warning,
+            mock.patch.object(downloader.threading, "Thread") as worker,
+        ):
+            gui.start_download()
+        warning.assert_called_once()
+        self.assertIn("Leave To video # blank", warning.call_args.args[1])
+        worker.assert_not_called()
+
+    def test_worker_rejects_reversed_range_before_preparing_download(self) -> None:
+        gui = object.__new__(downloader.DownloaderGUI)
+        gui.queue_log = mock.Mock()
+        gui.queue = mock.Mock()
+        with (
+            mock.patch.object(downloader, "check_ffmpeg") as preparation,
+            mock.patch.object(downloader, "run_download") as download,
+        ):
+            success, summary = gui.download_one({"mode": "playlist", "start_idx": "18", "end_idx": "6"})
+        self.assertFalse(success)
+        self.assertIn("To video # (6)", summary)
+        preparation.assert_not_called()
+        download.assert_not_called()
+
+
 class SubtitleLanguageSelectionTests(unittest.TestCase):
     def test_original_is_available_as_a_subtitle_language_choice(self) -> None:
         self.assertIn("original", downloader.SUPPORTED_SUBTITLE_LANGUAGES)
@@ -81,10 +162,37 @@ class SubtitleLanguageSelectionTests(unittest.TestCase):
                 self.assertIsNone(re.fullmatch(original_pattern, language))
         self.assertIsNone(re.fullmatch(original_pattern, "de"))
 
-    def test_manual_subtitle_selection_remains_exact(self) -> None:
-        opts = downloader.build_subtitle_opts(langs=["es"], auto=False)
+    def test_each_language_uses_manual_then_same_language_generated_track(self) -> None:
+        for language in downloader.PREDEFINED_SUBTITLE_LANGUAGES:
+            with self.subTest(language=language):
+                manual_opts = downloader.build_subtitle_opts(
+                    langs=[language],
+                    auto=False,
+                )
+                generated_languages = downloader.matching_original_subtitle_languages(
+                    [language]
+                )
 
-        self.assertEqual(opts["subtitleslangs"], ["es"])
+                self.assertEqual(manual_opts["subtitleslangs"], [language])
+                self.assertTrue(manual_opts["writesubtitles"])
+                self.assertFalse(manual_opts["writeautomaticsub"])
+                self.assertEqual(generated_languages, [f"{language}-orig"])
+
+    def test_original_choice_does_not_become_a_specific_language(self) -> None:
+        self.assertEqual(
+            downloader.matching_original_subtitle_languages(
+                [downloader.ORIGINAL_SUBTITLE_PATTERN]
+            ),
+            [],
+        )
+
+    def test_original_auto_subtitles_do_not_wait_for_translation_rate_limit(self) -> None:
+        opts = downloader.build_subtitle_opts(
+            langs=[downloader.ORIGINAL_SUBTITLE_PATTERN],
+            auto=True,
+        )
+
+        self.assertNotIn("sleep_interval_subtitles", opts)
 
     def test_player_client_override_preserves_other_extractor_args(self) -> None:
         original = {"youtube": {"player_skip": ["configs"]}, "generic": {"foo": ["bar"]}}
@@ -98,6 +206,39 @@ class SubtitleLanguageSelectionTests(unittest.TestCase):
 
 
 class SubtitleFallbackTests(unittest.TestCase):
+    def test_matching_original_caption_skips_translation_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            calls: list[dict] = []
+
+            def fake_run_download(_urls, opts, **_kwargs) -> int:
+                calls.append(opts)
+                (output_dir / "video.fr-orig.srt").write_text(
+                    "1\n00:00:01,000 --> 00:00:02,000\nLégende\n",
+                    encoding="utf-8",
+                )
+                return 0
+
+            with mock.patch.object(
+                downloader,
+                "run_download",
+                side_effect=fake_run_download,
+            ):
+                downloader.run_optional_auto_sub_fallback(
+                    ["https://example.invalid/video"],
+                    {
+                        "paths": {"home": str(output_dir)},
+                        "subtitleslangs": ["fr"],
+                    },
+                    output_dir=output_dir,
+                    retry_without_cookies=False,
+                    logger=lambda _message: None,
+                )
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["subtitleslangs"], ["fr-orig"])
+            self.assertNotIn("sleep_interval_subtitles", calls[0])
+
     def test_single_srt_job_fails_when_no_valid_subtitle_was_created(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             gui = object.__new__(downloader.DownloaderGUI)
@@ -239,6 +380,15 @@ class SubtitleFallbackTests(unittest.TestCase):
             logger.info("[info] video.en.srt is already present")
 
             self.assertEqual(logger.valid_srt_destinations(), {valid_path.resolve()})
+
+    def test_gui_logger_tracks_subtitle_rate_limits(self) -> None:
+        logger = downloader.GuiLogger(lambda _message: None)
+
+        logger.warning(
+            "Unable to download video subtitles for 'fr': HTTP Error 429: Too Many Requests"
+        )
+
+        self.assertEqual(logger.subtitle_rate_limit_failures, 1)
 
     def test_single_video_resume_accepts_existing_valid_subtitle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

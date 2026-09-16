@@ -35,7 +35,7 @@ APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "SmartYTDown
 UPDATE_STATE_FILE = APP_SUPPORT_DIR / "last_update.json"
 APP_STATE_FILE = APP_SUPPORT_DIR / "gui_state.json"
 RESTARTED_AFTER_UPDATE_ENV = "SMART_YTDLP_RESTARTED_AFTER_UPDATE"
-UPDATER_PACKAGES = ["yt-dlp", "yt-dlp-ejs"]
+UPDATER_PACKAGES = ["yt-dlp[default,curl-cffi]", "yt-dlp-ejs"]
 SUPPORTED_BROWSERS = ("firefox", "chrome", "chromium", "brave", "edge", "safari")
 PREDEFINED_SUBTITLE_LANGUAGES = ("fr", "en", "es")
 ORIGINAL_SUBTITLE_LANGUAGE = "original"
@@ -203,7 +203,7 @@ def normalize_youtube_watch_url(url: str) -> str:
     return url
 
 
-def parse_positive_int(token: str, name_for_error: str, logger) -> int | None:
+def parse_positive_int(token: str, name_for_error: str) -> int | None:
     token = token.strip()
     if not token:
         return None
@@ -213,8 +213,18 @@ def parse_positive_int(token: str, name_for_error: str, logger) -> int | None:
             raise ValueError
         return value
     except ValueError:
-        logger(f"Invalid {name_for_error!r} '{token}'. Ignoring.")
-        return None
+        raise ValueError(f"{name_for_error} must be a positive whole number or blank.") from None
+
+
+def parse_playlist_range(start: str, end: str) -> tuple[int | None, int | None]:
+    start_idx = parse_positive_int(start, "From video #")
+    end_idx = parse_positive_int(end, "To video #")
+    if start_idx is not None and end_idx is not None and end_idx < start_idx:
+        raise ValueError(
+            f"To video # ({end_idx}) must be at least From video # ({start_idx}). "
+            "Leave To video # blank to download from the starting video to the end."
+        )
+    return start_idx, end_idx
 
 
 def format_bytes(num: float | int | None) -> str:
@@ -343,6 +353,12 @@ class GuiLogger:
         # language was unavailable. Keep the concrete destinations it says it
         # is writing so the GUI can verify a real SRT before reporting success.
         self.subtitle_destinations: set[Path] = set()
+        self.subtitle_rate_limit_failures = 0
+
+    def _capture_subtitle_rate_limit(self, msg: str) -> None:
+        lowered = msg.lower()
+        if "subtitle" in lowered and "http error 429" in lowered:
+            self.subtitle_rate_limit_failures += 1
 
     def _remember_subtitle_destination(self, raw_path: str) -> None:
         path = Path(raw_path).expanduser()
@@ -392,11 +408,13 @@ class GuiLogger:
     def warning(self, msg: str) -> None:
         cleaned = (msg or "").strip()
         if cleaned:
+            self._capture_subtitle_rate_limit(cleaned)
             self.sink(f"WARNING: {cleaned}")
 
     def error(self, msg: str) -> None:
         cleaned = (msg or "").strip()
         if cleaned:
+            self._capture_subtitle_rate_limit(cleaned)
             self.sink(f"ERROR: {cleaned}")
 
 
@@ -419,6 +437,25 @@ def auto_subtitle_languages(langs: list[str]) -> list[str]:
     if ORIGINAL_SUBTITLE_FALLBACK_PATTERN not in selected:
         selected.append(ORIGINAL_SUBTITLE_FALLBACK_PATTERN)
     return selected
+
+
+def matching_original_subtitle_languages(langs: list[str]) -> list[str]:
+    """Return exact original-caption tracks matching a selected GUI language."""
+    return [
+        f"{language}-orig"
+        for language in langs
+        if language in PREDEFINED_SUBTITLE_LANGUAGES
+    ]
+
+
+def youtube_caption_cookie_hint(browser: str, language: str) -> str:
+    action = "enable captions"
+    if language in PREDEFINED_SUBTITLE_LANGUAGES:
+        action = f"enable the {language} (auto-generated) captions"
+    return (
+        f"In {browser.title()}, open one affected video, {action}, then rerun "
+        "immediately with browser cookies enabled."
+    )
 
 
 def build_subtitle_opts(*, langs: list[str], auto: bool, skip_download: bool = False) -> dict:
@@ -1419,15 +1456,51 @@ def run_optional_auto_sub_fallback(
     retry_without_cookies: bool,
     logger,
 ) -> SubtitleCleanupStats:
+    before_files = snapshot_valid_srt_files(output_dir)
+    matching_original_langs = matching_original_subtitle_languages(
+        base_opts["subtitleslangs"]
+    )
+    if matching_original_langs:
+        logger(
+            "> Subtitle fallback pass: trying an original-language caption track "
+            "that exactly matches the selected language..."
+        )
+        matching_original_opts = {
+            **base_opts,
+            **build_subtitle_opts(
+                langs=matching_original_langs,
+                auto=True,
+                skip_download=True,
+            ),
+            "subtitleslangs": matching_original_langs,
+            "ignoreerrors": True,
+        }
+        run_download(
+            urls,
+            matching_original_opts,
+            retry_without_cookies=retry_without_cookies,
+            logger=logger,
+        )
+        after_matching_original = snapshot_valid_srt_files(output_dir)
+        new_matching_originals = sorted(after_matching_original - before_files)
+        if new_matching_originals:
+            logger(
+                "> Matching auto-generated source captions succeeded."
+            )
+        else:
+            logger(
+                "WARNING: No matching source-language auto-generated captions were downloaded."
+            )
+        return run_auto_subtitle_cleanup(new_matching_originals, logger)
+
     fallback_opts = {
         **base_opts,
         **build_subtitle_opts(langs=base_opts["subtitleslangs"], auto=True, skip_download=True),
         "ignoreerrors": True,
     }
-    before_files = snapshot_valid_srt_files(output_dir)
     logger(
-        "> Subtitle fallback pass: trying AUTO-generated subtitles in the selected language, "
-        "plus original-language captions when the source language is outside fr/en/es..."
+        "> Subtitle fallback pass: trying the video's original-language "
+        "AUTO-generated captions..."
     )
     result = run_download(urls, fallback_opts, retry_without_cookies=retry_without_cookies, logger=logger)
     after_files = snapshot_valid_srt_files(output_dir)
@@ -1897,7 +1970,7 @@ class DownloaderGUI:
         self.end_entry = ttk.Entry(playlist_frame, textvariable=self.end_idx_var, width=12)
         self.end_entry.grid(row=0, column=3, sticky="w", pady=4)
 
-        ttk.Label(playlist_frame, text="Leave both blank to download the full playlist.", style="Muted.Card.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(playlist_frame, text="Blank From = beginning. Blank To = end. Both blank = full playlist.", style="Muted.Card.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         actions = tk.Frame(body, bg=self.palette["window_bg"])
         actions.pack(fill="x", pady=(12, 0))
@@ -2374,6 +2447,14 @@ class DownloaderGUI:
         if not jobs:
             messagebox.showwarning("Empty download plan", "Add at least one video or playlist.")
             return
+        start_idx = self.start_idx_var.get().strip()
+        end_idx = self.end_idx_var.get().strip()
+        if any(job["mode"] == "playlist" for job in jobs):
+            try:
+                parse_playlist_range(start_idx, end_idx)
+            except ValueError as exc:
+                messagebox.showwarning("Invalid playlist range", str(exc))
+                return
         for position, job in enumerate(jobs, start=1):
             if not job["url"]:
                 messagebox.showwarning("Missing URL", f"Enter a YouTube URL for plan item {position}.")
@@ -2417,8 +2498,8 @@ class DownloaderGUI:
             "jobs": jobs,
             "use_cookies": self.use_cookies_var.get(),
             "browser": self.browser_var.get().strip() or "firefox",
-            "start_idx": self.start_idx_var.get().strip(),
-            "end_idx": self.end_idx_var.get().strip(),
+            "start_idx": start_idx,
+            "end_idx": end_idx,
         }
 
         self.worker = threading.Thread(target=self.download_plan_worker, args=(config,), daemon=True)
@@ -2483,6 +2564,8 @@ class DownloaderGUI:
         logger = self.queue_log
 
         try:
+            if config["mode"] == "playlist":
+                start_idx, end_idx = parse_playlist_range(config["start_idx"], config["end_idx"])
             logger("=" * 70)
             logger(" Smart YouTube Downloader GUI (macOS) ")
             logger("=" * 70)
@@ -2524,19 +2607,16 @@ class DownloaderGUI:
                     )
                 elif media_type == "srt":
                     logger(
-                        f"> Subtitle-only mode: preferred language '{subs_lang}', with an "
-                        "original-language fallback outside fr/en/es."
+                        f"> Subtitle-only mode: downloading '{subs_lang}' captions."
                     )
                     logger(
-                        f"> Subtitle strategy: try MANUAL '{subs_lang}' first, then AUTO-generated "
-                        f"'{subs_lang}'; also keep original captions when the video's source "
-                        "language is outside fr/en/es."
+                        f"> Subtitle strategy: try MANUAL '{subs_lang}' first, then the "
+                        f"'{subs_lang}-orig' AUTO-generated source track; do not auto-translate."
                     )
                 else:
                     logger(
-                        f"> Subtitle strategy: try MANUAL '{subs_lang}' first, then AUTO-generated "
-                        f"'{subs_lang}'; also keep original captions when the video's source "
-                        "language is outside fr/en/es."
+                        f"> Subtitle strategy: try MANUAL '{subs_lang}' first, then the "
+                        f"'{subs_lang}-orig' AUTO-generated source track; do not auto-translate."
                     )
 
             if media_type == "video":
@@ -2571,7 +2651,9 @@ class DownloaderGUI:
                 "fragment_retries": 10,
                 "concurrent_fragment_downloads": 4,
                 "progress_hooks": [self.make_progress_hook()],
-                "windowsfilenames": True,
+                # PortableSafeTitlePP sanitizes generated names. Forcing
+                # Windows paths also changes existing macOS folder names.
+                "windowsfilenames": sys.platform == "win32",
                 # PortableSafeTitlePP handles the title itself before filename
                 # creation while preserving readable non-Latin scripts.
                 "restrictfilenames": False,
@@ -2664,7 +2746,14 @@ class DownloaderGUI:
                     )
                     confirmed_srt_files = ytdlp_logger.valid_srt_destinations()
                     if not created_valid_srt_files and not confirmed_srt_files:
-                        if media_type == "srt":
+                        if ytdlp_logger.subtitle_rate_limit_failures:
+                            summary = (
+                                "YouTube rate-limited the subtitle files (HTTP 429). "
+                                + youtube_caption_cookie_hint(
+                                    config["browser"], subs_lang
+                                )
+                            )
+                        elif media_type == "srt":
                             summary = (
                                 "Subtitle download failed: YouTube exposed no downloadable captions "
                                 "through either the normal or embedded-client fallback."
@@ -2693,12 +2782,6 @@ class DownloaderGUI:
             reverse_playlist = bool(config.get("reverse_playlist", False))
             if reverse_playlist:
                 logger("> Playlist order: last-to-first (reverse playlist order).")
-            start_idx = parse_positive_int(config["start_idx"], "start index", logger)
-            end_idx = parse_positive_int(config["end_idx"], "end index", logger)
-            if start_idx and end_idx and end_idx < start_idx:
-                logger(f"End index {end_idx} is less than start index {start_idx}, swapping.")
-                start_idx, end_idx = end_idx, start_idx
-
             playlist_len = maybe_get_playlist_length(url, extractor_args, cookiesfrombrowser, logger)
             visible_indices = get_playlist_indices(url, extractor_args, cookiesfrombrowser, logger)
             if visible_indices is not None:
@@ -2865,17 +2948,45 @@ class DownloaderGUI:
                             [url], manual_opts, retry_without_cookies=True, logger=logger
                         ) or result
 
-                    # Run this pass for every selected item, including ones that
-                    # already received a manual subtitle in the preferred
-                    # language.  An unsupported source-language track has its
-                    # own *-orig filename, so nooverwrites keeps the manual file
-                    # while allowing the original captions to be added.
-                    auto_targets = expected_indices
+                    matching_original_langs = matching_original_subtitle_languages(
+                        subs_langs
+                    )
+                    matching_original_targets = missing_subtitle_indices()
+                    if matching_original_langs and matching_original_targets:
+                        logger(
+                            "> Matching-language subtitle pass: trying auto-generated source captions for "
+                            f"{len(matching_original_targets)} item(s): "
+                            f"{format_playlist_items(matching_original_targets)}"
+                        )
+                        matching_original_opts = {
+                            **ydl_opts,
+                            **build_subtitle_opts(
+                                langs=matching_original_langs,
+                                auto=True,
+                                skip_download=True,
+                            ),
+                            "subtitleslangs": matching_original_langs,
+                            "playlist_items": format_playlist_items(
+                                matching_original_targets
+                            ),
+                        }
+                        result = run_download(
+                            [url],
+                            matching_original_opts,
+                            retry_without_cookies=True,
+                            logger=logger,
+                        ) or result
+
+                    # A concrete language means source-language transcription,
+                    # not YouTube auto-translation. The general original mode
+                    # still uses its regex-based automatic-caption pass.
+                    auto_targets = (
+                        set() if matching_original_langs else missing_subtitle_indices()
+                    )
                     if auto_targets:
                         before_srt_files = snapshot_srt_files(config["output_dir"])
                         logger(
-                            f"> AUTO subtitle pass: trying the selected language where needed "
-                            f"and keeping unsupported original languages for "
+                            f"> AUTO subtitle pass: trying original-language captions for "
                             f"{len(auto_targets)} item(s): {format_playlist_items(auto_targets)}"
                         )
                         auto_opts = {
@@ -2976,6 +3087,11 @@ class DownloaderGUI:
                     f"Finished after automatic targeted repairs, but these are still missing: {detail}. "
                     "Run again later to retry only those parts."
                 )
+                if remaining_subtitles and ytdlp_logger.subtitle_rate_limit_failures:
+                    summary += (
+                        " YouTube rate-limited captions (HTTP 429). "
+                        + youtube_caption_cookie_hint(config["browser"], subs_lang)
+                    )
                 if residue_stats.removed_files:
                     summary += f" Residue cleanup removed {residue_stats.removed_files} file(s)."
                 logger(summary)

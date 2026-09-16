@@ -25,7 +25,7 @@ For the YouTube downloader, install or update the Python packages used by
 `yt-dlp`:
 
 ```bash
-python3 -m pip install -U pip yt-dlp yt-dlp-ejs
+python3 -m pip install -U pip 'yt-dlp[default,curl-cffi]' yt-dlp-ejs
 ```
 
 If you run these from Automator, remember that Automator does not always inherit
@@ -76,9 +76,9 @@ What it does:
 - Supports video downloads and audio-only MP3 downloads while preferring the
   video's original audio track over YouTube dubs.
 - Supports SRT-only subtitle downloads in French (`fr`), English (`en`), Spanish
-  (`es`), or the video's original language. When `fr`, `en`, or `es` is chosen,
-  the automatic-caption fallback also keeps YouTube's original source-caption
-  track if the source language is outside those three predefined languages.
+  (`es`), or the video's original language. A concrete language selects manual
+  subtitles first, then auto-generated source captions in that same language;
+  it does not silently substitute YouTube's auto-translated captions.
 - Creates media, subtitle, and resumable `.part` files with portable-safe names
   from the start, while preserving readable non-Latin scripts.
 - Supports playlist start/end ranges.
@@ -101,7 +101,7 @@ python3 smart_ytdlp_downloader_gui_mac_fixed.py
 Recommended setup:
 
 ```bash
-python3 -m pip install -U yt-dlp yt-dlp-ejs
+python3 -m pip install -U 'yt-dlp[default,curl-cffi]' yt-dlp-ejs
 brew install ffmpeg
 ```
 
