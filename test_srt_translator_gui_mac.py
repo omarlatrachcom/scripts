@@ -379,6 +379,25 @@ class SrtTranslatorGuiTests(unittest.TestCase):
             )
             archive.assert_called_once_with([source_path, arabic_path], tmp)
 
+    def test_arabic_srt_archives_original_after_rebuild(self) -> None:
+        source_path = "/subs/episode.en.srt"
+        arabic_path = "/subs/episode.ar.srt"
+        gui = SRTTranslatorGUI.__new__(SRTTranslatorGUI)
+        gui.current_srt_path = source_path
+        gui.current_dir = "/subs"
+        gui.original_base = "episode"
+        gui.rebuild_srt_only = Mock(return_value=arabic_path)
+        gui.status_var = Mock()
+
+        with patch("srt_translator_gui_mac.archive_srt_files") as archive:
+            gui.create_arabic_srt_file()
+
+        gui.rebuild_srt_only.assert_called_once_with()
+        archive.assert_called_once_with([source_path], "/subs")
+        gui.status_var.set.assert_called_with(
+            "Arabic SRT created; original SRT moved to srt/."
+        )
+
     def test_bilingual_ass_stops_when_automatic_rebuild_fails(self) -> None:
         gui = SRTTranslatorGUI.__new__(SRTTranslatorGUI)
         gui.current_srt_path = "/subs/episode.en.srt"

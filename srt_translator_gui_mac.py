@@ -1181,6 +1181,13 @@ class SRTTranslatorGUI:
         bottom_frame = ttk.Frame(root)
         bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
 
+        self.arabic_srt_button = ttk.Button(
+            bottom_frame,
+            text="Arabic SRT",
+            command=self.create_arabic_srt_file,
+        )
+        self.arabic_srt_button.pack(side=tk.LEFT, padx=5)
+
         self.bilingual_ass_button = ttk.Button(
             bottom_frame,
             text="Bilingual ASS",
@@ -1683,6 +1690,19 @@ class SRTTranslatorGUI:
             messagebox.showerror("Error during rebuild", str(e))
             self.status_var.set("Error during rebuild.")
             return None
+
+    def create_arabic_srt_file(self):
+        if not self.current_srt_path or not self.original_base:
+            messagebox.showerror("Error", "Load an SRT file first.")
+            return
+
+        source_srt_path = self.current_srt_path
+        arabic_srt_path = self.rebuild_srt_only()
+        if not arabic_srt_path:
+            return
+
+        archive_srt_files([source_srt_path], self.current_dir)
+        self.status_var.set("Arabic SRT created; original SRT moved to srt/.")
 
     def create_bilingual_ass_file(self):
         try:
