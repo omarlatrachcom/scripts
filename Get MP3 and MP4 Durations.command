@@ -7,7 +7,7 @@ if [[ -n "${1:-}" && -d "$1" ]]; then
 else
   CHOSEN_DIR=$(osascript <<'APPLESCRIPT'
 try
-  set chosenFolder to choose folder with prompt "Choose the folder containing the MP3 and MP4 files:"
+  set chosenFolder to choose folder with prompt "Choose the folder containing the MP3, MP4, and MKV files:"
   return POSIX path of chosenFolder
 on error number -128
   return ""
@@ -37,11 +37,11 @@ format_duration() {
   fi
 }
 
-echo "Scanning MP3 and MP4 files in:"
+echo "Scanning MP3, MP4, and MKV files in:"
 echo "$BASE_DIR"
 echo
 
-echo "MP3 and MP4 Duration Report" > "$REPORT"
+echo "MP3, MP4, and MKV Duration Report" > "$REPORT"
 echo "Folder: $BASE_DIR" >> "$REPORT"
 echo "Generated: $(date)" >> "$REPORT"
 echo "----------------------------------------" >> "$REPORT"
@@ -72,14 +72,14 @@ while IFS= read -r -d '' FILE; do
   echo "$DURATION_TEXT  |  $REL_PATH" >> "$REPORT"
 
   COUNT=$(( COUNT + 1 ))
-done < <(find "$BASE_DIR" -maxdepth 1 -type f \( -iname "*.mp3" -o -iname "*.mp4" \) -print0)
+done < <(find "$BASE_DIR" -maxdepth 1 -type f \( -iname "*.mp3" -o -iname "*.mp4" -o -iname "*.mkv" \) -print0)
 
 echo
 echo "----------------------------------------" >> "$REPORT"
-echo "Total MP3/MP4 files: $COUNT" >> "$REPORT"
+echo "Total MP3/MP4/MKV files: $COUNT" >> "$REPORT"
 echo "Total duration: $(format_duration "$TOTAL_SECONDS")" >> "$REPORT"
 
-echo "Total MP3/MP4 files: $COUNT"
+echo "Total MP3/MP4/MKV files: $COUNT"
 echo "Total duration: $(format_duration "$TOTAL_SECONDS")"
 echo
 echo "Report saved to:"
