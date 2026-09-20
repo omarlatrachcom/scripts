@@ -1,6 +1,6 @@
 #!/bin/zsh
 
-# Shared implementation for the "Move First MP3 and MP4" commands.
+# Shared implementation for the media-moving commands.
 
 MAX_SECONDS="${1:-}"
 MAX_DURATION_LABEL="${2:-}"
@@ -102,14 +102,14 @@ setopt NULL_GLOB
 setopt NUMERIC_GLOB_SORT
 
 # Use zsh's numeric glob sorting so 2 comes before 5, 9, and 10. All regular
-# files are inspected in that order; MP3/MP4 files determine the duration cap,
+# files are inspected in that order; MP3/MP4/MKV files determine the duration cap,
 # while numbered non-media files between them travel with the batch.
 ALL_FILES=( "$BASE_DIR"/*(N.) )
 MEDIA_FILE_COUNT=0
 for DISCOVERED_FILE in "${ALL_FILES[@]}"; do
   FILE_EXTENSION="${DISCOVERED_FILE##*.}"
   FILE_EXTENSION="${FILE_EXTENSION:l}"
-  if [[ "$FILE_EXTENSION" == "mp3" || "$FILE_EXTENSION" == "mp4" ]]; then
+  if [[ "$FILE_EXTENSION" == "mp3" || "$FILE_EXTENSION" == "mp4" || "$FILE_EXTENSION" == "mkv" ]]; then
     (( MEDIA_FILE_COUNT++ ))
   fi
 done
@@ -126,7 +126,7 @@ READ_ERROR_FILE=""
 EXTRA_ITEM_INCLUDED=""
 STOPPED_AFTER_EXTRA=0
 
-echo "Scanning MP3 and MP4 files in:"
+echo "Scanning MP3, MP4, and MKV files in:"
 echo "$BASE_DIR"
 echo
 
@@ -138,7 +138,7 @@ mkdir -p "$TARGET_DIR" || {
 }
 
 if (( MEDIA_FILE_COUNT == 0 )); then
-  echo "No MP3 or MP4 files found in the current folder."
+  echo "No MP3, MP4, or MKV files found in the current folder."
   echo
   echo "Created folder:"
   echo "$TARGET_DIR"
@@ -151,7 +151,7 @@ for FILE in "${ALL_FILES[@]}"; do
   FILE_EXTENSION="${FILE##*.}"
   FILE_EXTENSION="${FILE_EXTENSION:l}"
 
-  if [[ "$FILE_EXTENSION" != "mp3" && "$FILE_EXTENSION" != "mp4" ]]; then
+  if [[ "$FILE_EXTENSION" != "mp3" && "$FILE_EXTENSION" != "mp4" && "$FILE_EXTENSION" != "mkv" ]]; then
     # Numbered lesson resources are part of the ordered sequence. Unnumbered
     # utility files and generated reports are deliberately left in place.
     if [[ "${FILE:t}" =~ '^[0-9]+' ]]; then
@@ -273,7 +273,7 @@ if [[ -n "$READ_ERROR_FILE" ]]; then
 fi
 
 if (( ${#SELECTED_MEDIA_FILES[@]} == 0 )); then
-  echo "No MP3 or MP4 files can be moved without exceeding $MAX_DURATION_LABEL."
+  echo "No MP3, MP4, or MKV files can be moved without exceeding $MAX_DURATION_LABEL."
   echo
 
   if [[ -n "$STOPPED_AT" ]]; then
