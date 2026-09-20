@@ -106,7 +106,7 @@ Copy EVERYTHING before the first "|" exactly (same letters, same digits). Do NOT
 Replace ONLY the text after "|" with a Modern Standard Arabic (MSA) translation.
 Keep the same number of lines as the input lines between the markers.
 Do NOT add, remove, merge, split, reorder, renumber, or skip any lines.
-Do NOT add headers, explanations, comments, extra blank lines, or code blocks.
+Wrap all translated lines in one Markdown code block; add nothing outside it.
 
 FORMAT EXAMPLE (IDs here are examples only, do not copy them):
 Input: EX000001|Hello, how are you?
@@ -147,7 +147,7 @@ NUMBERS AND UNITS:
 Use Western Arabic numerals 0–9 inside Arabic text (e.g. 3، 25، 2049).
 MANDATORY: Convert every US measurement to metric units used in Morocco—in/ft/yd → cm/m, mi/mph → km/km/h, oz/lb → g/kg, cup/pint/quart/gallon → mL/L, acre → m²/ha, and °F → °C. Round naturally and NEVER retain the original US unit (e.g. 5 miles → 8 كم; 70°F → 21°م).
 
-Now translate the lines between the markers. Remember: output ONLY the translated L-lines, nothing else."""
+Now translate the lines between the markers. Remember: output ONLY one code block containing the translated L-lines."""
 
 
 PROMPT_TEXT = _PROMPT_RAW.strip()
