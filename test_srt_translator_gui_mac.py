@@ -13,6 +13,7 @@ from srt_translator_gui_mac import (
     find_video_for_base,
     infer_media_context,
     open_video_in_vlc,
+    restore_missing_translation_line_breaks,
     source_srt_name_parts,
     translation_prompt_for_srt,
 )
@@ -122,6 +123,10 @@ class SrtSourceNameTests(unittest.TestCase):
 
 
 class TranslationPromptTests(unittest.TestCase):
+    def test_prompt_requests_plain_text_without_markdown(self) -> None:
+        self.assertIn("only the translated lines as plain text, without Markdown", PROMPT_TEXT)
+        self.assertNotIn("Markdown code block", PROMPT_TEXT)
+
     def test_prompt_explicitly_requires_us_to_moroccan_metric_conversion(self) -> None:
         self.assertIn("MANDATORY: Convert every US measurement", PROMPT_TEXT)
         self.assertIn("NEVER retain the original US unit", PROMPT_TEXT)
@@ -224,12 +229,36 @@ class VlcTests(unittest.TestCase):
 
 
 class SrtTranslatorGuiTests(unittest.TestCase):
-    def test_scroll_to_bottom_moves_text_view_to_end(self) -> None:
+    def test_restores_only_missing_translation_line_breaks(self) -> None:
+        content = (
+            "L000001|oneL000002|two\n"
+            "L000003|three\r\n"
+            "L000004|fourL999999|unrelated"
+        )
+
+        self.assertEqual(
+            restore_missing_translation_line_breaks(
+                content,
+                ["L000001", "L000002", "L000003", "L000004"],
+            ),
+            "L000001|one\nL000002|two\n"
+            "L000003|three\r\n"
+            "L000004|fourL999999|unrelated",
+        )
+
+    def test_copy_text_copies_content_and_scrolls_to_bottom(self) -> None:
+        gui = SRTTranslatorGUI.__new__(SRTTranslatorGUI)
+        gui.root = Mock()
+        gui.status_var = Mock()
         text_widget = Mock()
+        text_widget.get.return_value = "chunk content\n"
 
-        SRTTranslatorGUI.scroll_to_bottom(text_widget)
+        gui.copy_text(text_widget)
 
+        gui.root.clipboard_clear.assert_called_once_with()
+        gui.root.clipboard_append.assert_called_once_with("chunk content\n")
         text_widget.yview_moveto.assert_called_once_with(1.0)
+        gui.status_var.set.assert_called_once_with("Chunk copied to clipboard.")
 
     def test_failed_validation_restores_previous_editor_content(self) -> None:
         gui = SRTTranslatorGUI.__new__(SRTTranslatorGUI)
@@ -251,7 +280,7 @@ class SrtTranslatorGuiTests(unittest.TestCase):
             "Validation warnings in Chunk 1. Previous content restored."
         )
 
-    def test_failed_validation_restores_content_from_before_erase_and_paste(self) -> None:
+    def test_failed_validation_restores_content_replaced_by_paste(self) -> None:
         gui = SRTTranslatorGUI.__new__(SRTTranslatorGUI)
         gui.root = Mock()
         gui.root.clipboard_get.return_value = "L000001|Incomplete translation"
@@ -263,10 +292,8 @@ class SrtTranslatorGuiTests(unittest.TestCase):
             "L000001|Incomplete translation\n",
         ]
 
-        gui.erase_text(text_widget)
-        gui.paste_text(text_widget)
         with patch("srt_translator_gui_mac.messagebox.showwarning"):
-            gui.validate_tab(
+            gui.paste_text(
                 text_widget,
                 ["L000001", "L000002"],
                 "Chunk 1",

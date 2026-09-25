@@ -6,7 +6,7 @@ macOS-adapted GUI tool for:
 - Extracting subtitle text lines from any SRT file
 - Chunking them into groups of 150 lines
 - Adding an embedded ChatGPT translation prompt at the top of each chunk
-- Letting the user Copy / Erase / Paste the content per chunk (for ChatGPT)
+- Letting the user Copy / Paste the content per chunk (for ChatGPT)
 - Rebuilding a perfectly synced Arabic SRT: <name>.ar.srt
 - Creating a bilingual ASS file that shows Arabic + original subtitles together
 - Opening the related video in VLC (separate button)
@@ -106,7 +106,7 @@ Copy EVERYTHING before the first "|" exactly (same letters, same digits). Do NOT
 Replace ONLY the text after "|" with a Modern Standard Arabic (MSA) translation.
 Keep the same number of lines as the input lines between the markers.
 Do NOT add, remove, merge, split, reorder, renumber, or skip any lines.
-Wrap all translated lines in one Markdown code block; add nothing outside it.
+Reply with only the translated lines as plain text, without Markdown.
 
 FORMAT EXAMPLE (IDs here are examples only, do not copy them):
 Input: EX000001|Hello, how are you?
@@ -147,11 +147,19 @@ NUMBERS AND UNITS:
 Use Western Arabic numerals 0–9 inside Arabic text (e.g. 3، 25، 2049).
 MANDATORY: Convert every US measurement to metric units used in Morocco—in/ft/yd → cm/m, mi/mph → km/km/h, oz/lb → g/kg, cup/pint/quart/gallon → mL/L, acre → m²/ha, and °F → °C. Round naturally and NEVER retain the original US unit (e.g. 5 miles → 8 كم; 70°F → 21°م).
 
-Now translate the lines between the markers. Remember: output ONLY one code block containing the translated L-lines."""
+Now translate the lines between the markers. Output only the translated L-lines."""
 
 
 PROMPT_TEXT = _PROMPT_RAW.strip()
 PROMPT_ONE_LINE = " ".join(_PROMPT_RAW.splitlines())
+
+
+def restore_missing_translation_line_breaks(text: str, expected_ids: List[str]) -> str:
+    """Put expected subtitle IDs at line starts without changing existing breaks."""
+    if not expected_ids:
+        return text
+    ids = "|".join(re.escape(line_id) for line_id in expected_ids)
+    return re.sub(rf"([^\r\n])(?=(?:{ids})\|)", r"\1\n", text)
 
 APP_CLASS_NAME = "SRTTranslator"
 
@@ -181,95 +189,6 @@ def apply_app_icon(root: tk.Tk, preferred_names: list[str]) -> None:
             continue
 
 
-# Drift-check prompt (QC) – copied via a button in each chunk tab
-_DRIFT_CHECK_PROMPT_RAW = """You are a professional subtitle QC (quality control) specialist and movie subtitler.
-
-INPUT (ATTACHED FILES)
-You will be given TWO ATTACHED SRT FILES in this chat message:
-1) Source subtitles (English): {original_srt}
-2) Arabic subtitles to verify/fix: {arabic_srt}
-
-GOAL
-Detect and correct ANY cue-level misalignment so the Arabic feels 100% in sync with the spoken words.
-This includes:
-A) Offset drift: Arabic cue i matches English cue i+1 / i+2 (or vice versa).
-B) Boundary-bleed drift (IMPORTANT): even if Arabic cue i mostly matches English cue i, it “finishes”
-   a sentence/clause that the English continues in cue i+1, making Arabic feel 1 sentence ahead.
-   Even if it happens in only 1–3 isolated cues, it is STILL drift and MUST be corrected.
-Do NOT dismiss boundary-bleed as “normal segmentation”.
-
-NON‑NEGOTIABLE RULES (VERY IMPORTANT)
-1) Treat both attached files as the single source of truth; do NOT invent or hallucinate lines.
-2) Preserve the OUTPUT SRT STRUCTURE 100% EXACTLY based on the ARABIC input file:
-   - same number of SRT blocks
-   - same index numbers
-   - same time ranges (timecodes) character‑for‑character
-   - same blank-line placement
-   - same number of text lines INSIDE EACH BLOCK (do NOT merge/split blocks)
-3) Text policy (MINIMAL CHANGE):
-   - Prefer the MINIMAL fix: move/shift existing Arabic text content between blocks.
-   - Fix BOTH kinds of drift:
-     • offset drift (whole-cue shift)
-     • boundary-bleed drift (part of a sentence belongs to the next cue)
-   - You may adjust Arabic punctuation/ellipsis ONLY if it helps keep the same “sentence continues” feel
-     as the English segmentation (e.g., add "…" to show continuation), but do NOT rewrite freely.
-   - If (and only if) shifting/re-segmenting cannot fully remove drift, you may re-translate ONLY the
-     drifted region, but keep the exact structure rules above.
-
-WHAT TO DO
-1) Parse both files as SRT blocks (index, time range, text lines).
-2) Structural integrity check:
-   - Same number of blocks? Any missing/extra blocks?
-   - Time ranges in the same order? Any abnormal jumps?
-3) Semantic alignment check (STRICT):
-   For each block i:
-   - Decide whether Arabic block i is the translation of English block i.
-   - Also test whether Arabic block i better matches English i+1 or i+2 (or i-1 / i-2).
-   - Additionally test boundary-bleed:
-     Does Arabic block i contain meaning that clearly belongs to English block i+1?
-     (Examples: Arabic completes a thought, adds the missing object/verb, or closes with a full stop
-      while English i is clearly incomplete and continues in i+1.)
-   Mark ANY mismatch or boundary-bleed as a FAIL condition.
-4) Find the FIRST problem point (earliest in the file):
-   - Arabic block index number and start timestamp
-   - Type: OFFSET or BOUNDARY-BLEED (or both)
-   - Estimated shift amount (for OFFSET): +1, +2, -1, etc.
-5) Evidence (VERY IMPORTANT):
-   Show 6–10 consecutive blocks around the first problem point in a compact table:
-   idx | EN text | AR text (current) | best-matching EN idx | problem type | why (1 sentence)
-6) Verdict:
-   - PASS only if there is ZERO drift of BOTH types (no offset drift AND no boundary-bleed drift).
-   - Otherwise FAIL.
-
-IF FAIL (drift detected — including isolated boundary-bleed)
-Produce a FIXED Arabic SRT:
-- Keep every SRT block's index numbers and timecodes EXACTLY the same as in the Arabic file.
-- Do NOT rewrite timings.
-- Fix by moving Arabic text content to the correct block(s):
-  • For OFFSET drift: shift whole Arabic block texts starting from the drift point to match best EN indices.
-  • For BOUNDARY-BLEED drift: move ONLY the “extra” clause/phrase that belongs to EN i+1 into Arabic block i+1.
-    Keep the same number of lines inside each block (redistribute line breaks if needed, but do not add/remove lines).
-- Preserve line breaks and any formatting/tags (e.g., <i>…</i>) as they appear in the Arabic file.
-- Keep any existing BiDi control characters (RLM/RLE/PDF) untouched; do not add new ones.
-
-SELF‑VERIFY (MANDATORY)
-1) Re-run the SAME drift detection on your FIXED Arabic result.
-2) The final result must be PASS with ZERO drift (including boundary-bleed). If not, do ONE more correction pass.
-
-OUTPUT REQUIREMENTS (STRICT)
-1) A short summary: PASS/FAIL + first problem point (index, timestamp) + type + shift amount (if any).
-2) Evidence table.
-3) Always provide a corrected Arabic SRT output (even if it ends up identical):
-   - Preferred: provide a downloadable file.
-   - Filename rule: insert “.fixed” before the final “.srt”
-     Example: “Movie.ar.srt” → “Movie.ar.fixed.srt”.
-   - If you can attach files, attach the file.
-   - Otherwise, paste the corrected SRT as plain text between EXACT markers (NO Markdown fences, no ```):
-     BEGIN_SRT
-     ...full file...
-     END_SRT
-"""
-DRIFT_CHECK_PROMPT_TEXT = _DRIFT_CHECK_PROMPT_RAW.strip()
 # ------------- CORE HELPERS (encoding, parsing, chunking) -------------
 
 
@@ -1129,7 +1048,7 @@ class SRTTranslatorGUI:
         self.tab_expected_ids: List[List[str]] = []
         # Store translations from tabs the user closes (so rebuild still works)
         self.saved_translations: Dict[str, str] = {}
-        # Preserve the content replaced through Erase/Paste so failed validation
+        # Preserve the content replaced through Paste so failed validation
         # can restore it as one logical undo operation.
         self.pre_replace_contents: Dict[tk.Text, str] = {}
         dir_frame = ttk.Frame(root)
@@ -1302,31 +1221,16 @@ class SRTTranslatorGUI:
                 text_widget.insert("1.0", initial_text)
                 text_widget.edit_reset()
 
-                ttk.Button(btn_frame, text="Copy", command=lambda tw=text_widget: self.copy_text(tw)).pack(side=tk.LEFT, padx=4)
-                ttk.Button(btn_frame, text="Erase", command=lambda tw=text_widget: self.erase_text(tw)).pack(side=tk.LEFT, padx=4)
-                ttk.Button(btn_frame, text="Paste", command=lambda tw=text_widget: self.paste_text(tw)).pack(side=tk.LEFT, padx=4)
-
                 expected_ids = [ln.split("|", 1)[0] for ln in chunk]
                 source_text_by_id = dict(ln.split("|", 1) for ln in chunk)
+                ttk.Button(btn_frame, text="Copy", command=lambda tw=text_widget: self.copy_text(tw)).pack(side=tk.LEFT, padx=4)
                 ttk.Button(
                     btn_frame,
-                    text="Validate",
-                    command=lambda tw=text_widget, ids=expected_ids, title=tab_title, source=source_text_by_id: self.validate_tab(
+                    text="Paste",
+                    command=lambda tw=text_widget, ids=expected_ids, title=tab_title, source=source_text_by_id: self.paste_text(
                         tw, ids, title, source
                     ),
                 ).pack(side=tk.LEFT, padx=4)
-
-                ttk.Button(
-                    btn_frame,
-                    text="Copy Drift-Check Prompt",
-                    command=self.copy_drift_check_prompt,
-                ).pack(side=tk.LEFT, padx=4)
-
-                ttk.Button(
-                    btn_frame,
-                    text="Scroll to Bottom",
-                    command=lambda tw=text_widget: self.scroll_to_bottom(tw),
-                ).pack(side=tk.RIGHT, padx=4)
 
                 self.tab_text_widgets.append(text_widget)
                 self.tab_expected_ids.append(expected_ids)
@@ -1345,57 +1249,28 @@ class SRTTranslatorGUI:
         content = text_widget.get("1.0", tk.END)
         self.root.clipboard_clear()
         self.root.clipboard_append(content)
+        text_widget.yview_moveto(1.0)
         self.status_var.set("Chunk copied to clipboard.")
 
-    @staticmethod
-    def scroll_to_bottom(text_widget: tk.Text) -> None:
-        """Scroll a chunk editor to its lowest possible vertical position."""
-        text_widget.yview_moveto(1.0)
-
-
-    def copy_drift_check_prompt(self):
-        """
-        Copy a ChatGPT prompt that checks for semantic drift between the source SRT
-        and the generated Arabic SRT.
-
-        The user should attach BOTH files to the ChatGPT message along with the prompt.
-        """
-        # Best-effort filenames (the user will attach the actual files in ChatGPT).
-        if self.current_srt_path:
-            original_name = os.path.basename(self.current_srt_path)
-            arabic_name = os.path.basename(
-                arabic_srt_output_path(self.current_dir, self.original_base, self.current_srt_path)
-            )
-        else:
-            original_name = "<source>.srt"
-            arabic_name = "<original_name>.ar.srt"
-
-        prompt = DRIFT_CHECK_PROMPT_TEXT.format(
-            original_srt=original_name,
-            arabic_srt=arabic_name,
-        )
-
-        self.root.clipboard_clear()
-        self.root.clipboard_append(prompt)
-        self.status_var.set("Drift-check prompt copied. Attach both SRT files in ChatGPT and paste.")
-
-    def erase_text(self, text_widget: tk.Text):
-        if text_widget not in self.pre_replace_contents:
-            self.pre_replace_contents[text_widget] = text_widget.get("1.0", "end-1c")
-        text_widget.delete("1.0", tk.END)
-        self.status_var.set("Chunk erased.")
-
-    def paste_text(self, text_widget: tk.Text):
+    def paste_text(
+        self,
+        text_widget: tk.Text,
+        expected_ids: List[str],
+        title: str = "",
+        source_text_by_id: Optional[Dict[str, str]] = None,
+    ):
         try:
             content = self.root.clipboard_get()
         except tk.TclError:
             messagebox.showerror("Clipboard error", "Clipboard is empty or not accessible.")
             return
+        content = restore_missing_translation_line_breaks(content, expected_ids)
         if text_widget not in self.pre_replace_contents:
             self.pre_replace_contents[text_widget] = text_widget.get("1.0", "end-1c")
         text_widget.delete("1.0", tk.END)
         text_widget.insert("1.0", content)
         self.status_var.set("Pasted clipboard content into chunk.")
+        self.validate_tab(text_widget, expected_ids, title, source_text_by_id)
 
     def restore_previous_content(self, text_widget: tk.Text) -> bool:
         """Restore a button-replaced snapshot, or fall back to one editor undo."""
