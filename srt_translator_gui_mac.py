@@ -21,6 +21,7 @@ Usage:
 """
 
 import os
+import json
 import re
 import subprocess
 import shutil
@@ -38,6 +39,7 @@ MAX_LINES_PER_CHUNK = 150  # subtitle text lines per tab/chunk
 DEFAULT_MODEL_NAME = "GPT-5.6 Sol High"
 
 VIDEO_EXTENSIONS = [".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".mpeg", ".mpg"]
+SETTINGS_PATH = Path.home() / "Library" / "Application Support" / "SRTTranslator" / "settings.json"
 
 TIMECODE_RE = re.compile(
     r"^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}$"
@@ -830,6 +832,37 @@ def default_working_directory() -> str:
     return downloads_dir if os.path.isdir(downloads_dir) else home_dir
 
 
+def load_working_directory(settings_path: Path = SETTINGS_PATH) -> str:
+    """Return the last selected folder when it still exists."""
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+        saved_dir = data.get("working_directory")
+        if isinstance(saved_dir, str) and os.path.isdir(saved_dir):
+            return saved_dir
+    except (OSError, ValueError, TypeError):
+        pass
+    return default_working_directory()
+
+
+def save_working_directory(directory: str, settings_path: Path = SETTINGS_PATH) -> bool:
+    """Persist the selected folder without making folder changes fail on I/O errors."""
+    temporary_path = settings_path.with_suffix(settings_path.suffix + ".tmp")
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path.write_text(
+            json.dumps({"working_directory": directory}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, settings_path)
+        return True
+    except OSError:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
 def source_srt_name_parts(filename: str) -> Tuple[str, Optional[str]]:
     """
     Return the output base name and optional language label for any SRT name.
@@ -1015,7 +1048,7 @@ class SRTTranslatorGUI:
         self.root.title("SRT Translator GUI for macOS (→ ar)")
         self.root.geometry("1250x780")
 
-        self.current_dir = default_working_directory()
+        self.current_dir = load_working_directory()
 
         base_font = ("Arial", 12)
         big_font = ("Arial", 13)
@@ -1146,13 +1179,17 @@ class SRTTranslatorGUI:
             return
 
         self.current_dir = new_dir
-        self.dir_var.set(self.current_dir)
+        save_working_directory(self.current_dir)
+        self.refresh_current_folder()
+        self.status_var.set("Folder changed. Please select a subtitle file.")
 
+    def refresh_current_folder(self):
+        """Reload the SRT list without changing the selected working folder."""
+        self.dir_var.set(self.current_dir)
         self.current_srt_path = None
         self.original_base = None
         self.source_lang_code = None
         self.clear_tabs()
-        self.status_var.set("Folder changed. Please select a subtitle file.")
 
         self.src_srt_files = find_source_srt_files(self.current_dir)
         self.srt_combo["values"] = self.src_srt_files
@@ -1577,6 +1614,7 @@ class SRTTranslatorGUI:
             return
 
         archive_srt_files([source_srt_path], self.current_dir)
+        self.refresh_current_folder()
         self.status_var.set("Arabic SRT created; original SRT moved to srt/.")
 
     def create_bilingual_ass_file(self):
@@ -1618,6 +1656,7 @@ class SRTTranslatorGUI:
                 [source_srt_path, arabic_srt_path],
                 self.current_dir,
             )
+            self.refresh_current_folder()
             self.status_var.set("Bilingual ASS created; SRT files moved to srt/.")
 
         except Exception as e:
@@ -1662,6 +1701,7 @@ class SRTTranslatorGUI:
                 [source_srt_path, arabic_srt_path],
                 self.current_dir,
             )
+            self.refresh_current_folder()
             self.status_var.set("Arabic-only ASS created; SRT files moved to srt/.")
 
         except Exception as e:

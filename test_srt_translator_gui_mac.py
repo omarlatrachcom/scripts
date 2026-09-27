@@ -12,9 +12,11 @@ from srt_translator_gui_mac import (
     find_source_srt_files,
     find_video_for_base,
     infer_media_context,
+    load_working_directory,
     open_video_in_vlc,
     restore_missing_translation_line_breaks,
     source_srt_name_parts,
+    save_working_directory,
     translation_prompt_for_srt,
 )
 
@@ -32,6 +34,29 @@ class SrtFileDiscoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch("srt_translator_gui_mac.os.path.expanduser", return_value=tmp):
                 self.assertEqual(default_working_directory(), tmp)
+
+    def test_last_selected_folder_survives_a_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp, "subtitles")
+            folder.mkdir()
+            settings_path = Path(tmp, "settings.json")
+
+            self.assertTrue(save_working_directory(str(folder), settings_path))
+            self.assertEqual(load_working_directory(settings_path), str(folder))
+
+    def test_missing_saved_folder_falls_back_to_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp, "settings.json")
+            settings_path.write_text(
+                '{"working_directory": "/folder/that/no/longer/exists"}',
+                encoding="utf-8",
+            )
+
+            with patch(
+                "srt_translator_gui_mac.default_working_directory",
+                return_value="/fallback",
+            ):
+                self.assertEqual(load_working_directory(settings_path), "/fallback")
 
     def test_finds_every_regular_srt_file_regardless_of_name_or_case(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -388,6 +413,7 @@ class SrtTranslatorGuiTests(unittest.TestCase):
             gui.current_dir = tmp
             gui.original_base = "episode"
             gui.rebuild_srt_only = Mock(return_value=arabic_path)
+            gui.refresh_current_folder = Mock()
             gui.status_var = Mock()
             gui.root = Mock()
 
@@ -405,6 +431,7 @@ class SrtTranslatorGuiTests(unittest.TestCase):
                 model_text="model",
             )
             archive.assert_called_once_with([source_path, arabic_path], tmp)
+            gui.refresh_current_folder.assert_called_once_with()
 
     def test_arabic_srt_archives_original_after_rebuild(self) -> None:
         source_path = "/subs/episode.en.srt"
@@ -414,6 +441,7 @@ class SrtTranslatorGuiTests(unittest.TestCase):
         gui.current_dir = "/subs"
         gui.original_base = "episode"
         gui.rebuild_srt_only = Mock(return_value=arabic_path)
+        gui.refresh_current_folder = Mock()
         gui.status_var = Mock()
 
         with patch("srt_translator_gui_mac.archive_srt_files") as archive:
@@ -421,6 +449,7 @@ class SrtTranslatorGuiTests(unittest.TestCase):
 
         gui.rebuild_srt_only.assert_called_once_with()
         archive.assert_called_once_with([source_path], "/subs")
+        gui.refresh_current_folder.assert_called_once_with()
         gui.status_var.set.assert_called_with(
             "Arabic SRT created; original SRT moved to srt/."
         )
