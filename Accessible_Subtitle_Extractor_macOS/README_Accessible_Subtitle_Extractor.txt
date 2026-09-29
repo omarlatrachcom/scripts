@@ -33,7 +33,8 @@ confirm. Alternatively, open Terminal in this folder and run:
 
 Using the app
 -------------
-1. Choose Add files. The chooser starts in your Downloads folder.
+1. Choose Add files. The chooser remembers the last used folder. If that folder
+   is missing, it starts in Downloads (or your home folder if Downloads is missing).
 2. Select one or several video/audio files.
 3. Choose the mode, recognition model, and spoken language.
 4. Activate Start SRT extraction.

@@ -183,10 +183,20 @@ class StoreRepository:
         shutil.copy2(self.active_store_path, backup_path)
         return backup_path
 
-    def save(self, store: AppStore) -> None:
+    def backup_updated_store(self) -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup_path = self.active_store_path.with_name(
+            f"{self.active_store_path.stem}.backup-{timestamp}{self.active_store_path.suffix}"
+        )
+        shutil.copy2(self.active_store_path, backup_path)
+        return backup_path
+
+    def save(self, store: AppStore, create_backup: bool = False) -> None:
         self.ensure_data_dir()
         with self.active_store_path.open("w", encoding="utf-8") as handle:
             json.dump(store.to_dict(), handle, ensure_ascii=False, indent=2)
+        if create_backup:
+            self.backup_updated_store()
 
     def replace_from(self, source_path: Path) -> AppStore:
         store = self.load_json_file(source_path)
@@ -282,8 +292,8 @@ class PromptManagerService:
         self.store, self.load_warning = self.repository.safe_load()
         return self.load_warning
 
-    def save(self) -> None:
-        self.repository.save(self.store)
+    def save(self, create_backup: bool = False) -> None:
+        self.repository.save(self.store, create_backup=create_backup)
 
     def list_projects(self) -> list[str]:
         return sorted(self.store.projects.keys(), key=project_name_sort_key)
@@ -344,7 +354,7 @@ class PromptManagerService:
                     prompt.title = title
                     prompt.content = content
                     prompt.updated_at = now
-                    self.save()
+                    self.save(create_backup=True)
                     return prompt.id
 
         new_prompt = PromptRecord(
@@ -355,7 +365,7 @@ class PromptManagerService:
             updated_at=now,
         )
         prompts.append(new_prompt)
-        self.save()
+        self.save(create_backup=True)
         return new_prompt.id
 
     def move_prompt(
@@ -389,7 +399,7 @@ class PromptManagerService:
             existing for existing in self.store.projects[dst_project] if existing.id != prompt_id
         ]
         self.store.projects[dst_project].append(moved)
-        self.save()
+        self.save(create_backup=True)
 
     def delete_prompt(self, project: str, prompt_id: str, save: bool = True) -> None:
         if project not in self.store.projects:
@@ -398,7 +408,7 @@ class PromptManagerService:
             prompt for prompt in self.store.projects[project] if prompt.id != prompt_id
         ]
         if save:
-            self.save()
+            self.save(create_backup=True)
 
     def import_store_from_path(self, source_path: Path) -> AppStore:
         store = self.repository.replace_from(source_path)

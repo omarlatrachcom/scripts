@@ -4,7 +4,7 @@ Accessible Subtitle Extractor for macOS
 
 Features
 --------
-- Select one or many video/audio files, starting in ~/Downloads.
+- Select one or many video/audio files, reopening the last available folder.
 - Prefer an embedded text subtitle track, or transcribe speech to SRT.
 - Uses a keyboard-accessible PySide6 interface with explicit accessible names.
 - Optional spoken status announcements through macOS `say`.
@@ -746,7 +746,8 @@ class MainWindow(QMainWindow):
         file_buttons = QHBoxLayout()
         self.add_button = QPushButton("&Add files…")
         self.add_button.setAccessibleDescription(
-            "Choose one or more video or audio files. The chooser opens in Downloads."
+            "Choose one or more video or audio files. The chooser reopens the last "
+            "available folder."
         )
         self.add_button.clicked.connect(self.select_files)
         file_buttons.addWidget(self.add_button)
@@ -1007,13 +1008,25 @@ class MainWindow(QMainWindow):
     @Slot()
     def select_files(self) -> None:
         downloads = Path.home() / "Downloads"
-        start_directory = downloads if downloads.exists() else Path.home()
+        default_directory = downloads if downloads.is_dir() else Path.home()
+        saved_directory = self.settings.value("last_source_directory", "", type=str)
+        saved_path = Path(saved_directory).expanduser() if saved_directory else None
+        start_directory = (
+            saved_path
+            if saved_path is not None and saved_path.is_dir()
+            else default_directory
+        )
         selected, _ = QFileDialog.getOpenFileNames(
             self,
             "Select video or audio files",
             str(start_directory),
             FILE_FILTER,
         )
+        if selected:
+            self.settings.setValue(
+                "last_source_directory",
+                str(Path(selected[0]).expanduser().parent.resolve()),
+            )
         self.add_paths(Path(path) for path in selected)
 
     def add_paths(self, paths: Iterable[Path]) -> None:
