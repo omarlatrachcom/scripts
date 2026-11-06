@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
 
 
 USER_HOME = Path(os.environ.get("HOME") or Path.home())
@@ -173,25 +173,74 @@ class VideoTimerApp:
         root.title("VLC Video Timer")
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.quit_all)
+        root.configure(background="#F5F5F7")
+        root.bind("<Return>", lambda _event: self.play())
 
-        frame = ttk.Frame(root, padding=18)
+        frame = tk.Frame(root, background="#F5F5F7", padx=52, pady=48)
         frame.grid(sticky="nsew")
-        ttk.Label(frame, text="MP4 video").grid(row=0, column=0, sticky="w")
+        frame.grid_columnconfigure(0, weight=1)
+        tk.Label(
+            frame,
+            text="MP4 video",
+            font=("Helvetica", 25, "bold"),
+            background="#F5F5F7",
+            foreground="#242424",
+        ).grid(row=0, column=0, sticky="w")
         self.video_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.video_var, width=54).grid(
-            row=1, column=0, padx=(0, 8), pady=(5, 14)
+        tk.Entry(
+            frame,
+            textvariable=self.video_var,
+            width=1,
+            font=("Helvetica", 18),
+            relief="flat",
+            highlightthickness=2,
+            highlightbackground="#C8C8CC",
+            highlightcolor="#1473E6",
+        ).grid(
+            row=1, column=0, sticky="ew", ipady=5, padx=(0, 22), pady=(12, 38)
         )
-        ttk.Button(frame, text="Choose…", command=self.choose_video).grid(
-            row=1, column=1, pady=(5, 14)
+        RoundedButton(
+            frame,
+            text="Choose…",
+            command=self.choose_video,
+            color="#1473E6",
+            hover_color="#0D5FC3",
+            width=220,
+            height=70,
+        ).grid(
+            row=1, column=1, pady=(12, 38)
         )
 
-        ttk.Label(frame, text="Playback speed").grid(row=2, column=0, sticky="w")
+        tk.Label(
+            frame,
+            text="Playback speed",
+            font=("Helvetica", 25, "bold"),
+            background="#F5F5F7",
+            foreground="#242424",
+        ).grid(row=2, column=0, sticky="w")
         self.speed_var = tk.StringVar(value="2")
-        ttk.Entry(frame, textvariable=self.speed_var, width=10).grid(
-            row=3, column=0, sticky="w", pady=(5, 16)
+        tk.Entry(
+            frame,
+            textvariable=self.speed_var,
+            width=8,
+            font=("Helvetica", 22),
+            relief="flat",
+            highlightthickness=2,
+            highlightbackground="#C8C8CC",
+            highlightcolor="#1473E6",
+        ).grid(
+            row=3, column=0, sticky="w", ipady=13, pady=(12, 42)
         )
-        ttk.Button(frame, text="Play", command=self.play).grid(
-            row=4, column=0, columnspan=2, sticky="ew"
+        RoundedButton(
+            frame,
+            text="▶  Play",
+            command=self.play,
+            color="#238636",
+            hover_color="#1A6B2B",
+            width=1090,
+            height=88,
+        ).grid(
+            row=4, column=0, columnspan=2
         )
 
     def choose_video(self) -> None:
