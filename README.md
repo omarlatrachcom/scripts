@@ -275,6 +275,7 @@ optionally, their matching subtitles.
 What it does:
 
 - Lets you pick a folder and select a supported video or MP3 file.
+- Saves split outputs in that same folder.
 - Supports a two-part cut at a chosen timestamp.
 - Supports window splitting with overlap, useful for breaking long videos into
   reviewable chunks.

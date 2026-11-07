@@ -910,10 +910,7 @@ class VideoSplitGUI:
         initial_dir = Path(state.get("directory", str(Path.home()))).expanduser()
         if not initial_dir.is_dir():
             initial_dir = Path.home()
-        initial_output = Path(state.get("output_dir", str(initial_dir / "split_output"))).expanduser()
-
         self.directory_var = tk.StringVar(value=str(initial_dir))
-        self.output_dir_var = tk.StringVar(value=str(initial_output))
         self.mode_var = tk.StringVar(value=state.get("mode", "cut"))
         self.cut_value_var = tk.StringVar(value=state.get("cut_value", "27"))
         self.window_duration_var = tk.StringVar(value=state.get("window_duration", "10m"))
@@ -954,7 +951,7 @@ class VideoSplitGUI:
         body.columnconfigure(1, weight=1)
         body.rowconfigure(2, weight=1)
 
-        folder_card = ttk.LabelFrame(body, text="Folder and output", padding=14, style="Card.TLabelframe")
+        folder_card = ttk.LabelFrame(body, text="Source and destination", padding=14, style="Card.TLabelframe")
         folder_card.grid(row=0, column=0, columnspan=2, sticky="nsew")
         folder_card.columnconfigure(1, weight=1)
 
@@ -962,11 +959,12 @@ class VideoSplitGUI:
         ttk.Entry(folder_card, textvariable=self.directory_var).grid(row=0, column=1, sticky="ew", pady=6)
         ttk.Button(folder_card, text="Browse…", command=self.choose_directory).grid(row=0, column=2, padx=(8, 0), pady=6)
         ttk.Button(folder_card, text="Refresh", command=self.refresh_directory).grid(row=0, column=3, padx=(8, 0), pady=6)
-
-        ttk.Label(folder_card, text="Output folder:", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(folder_card, textvariable=self.output_dir_var).grid(row=1, column=1, sticky="ew", pady=6)
-        ttk.Button(folder_card, text="Browse…", command=self.choose_output_dir).grid(row=1, column=2, padx=(8, 0), pady=6)
-        ttk.Button(folder_card, text="Open output", command=self.open_output_dir).grid(row=1, column=3, padx=(8, 0), pady=6)
+        ttk.Button(folder_card, text="Open folder", command=self.open_directory).grid(row=1, column=3, padx=(8, 0), pady=6)
+        ttk.Label(
+            folder_card,
+            text="Split files are saved in the same folder as the source media.",
+            style="Muted.Card.TLabel",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=6)
 
         left_card = ttk.LabelFrame(body, text="Pick a media file", padding=14, style="Card.TLabelframe")
         left_card.grid(row=1, column=0, rowspan=2, sticky="nsew", padx=(0, 6), pady=(12, 0))
@@ -1186,7 +1184,6 @@ class VideoSplitGUI:
     def save_state(self) -> None:
         save_gui_state({
             "directory": self.directory_var.get().strip(),
-            "output_dir": self.output_dir_var.get().strip(),
             "mode": self.mode_var.get(),
             "cut_value": self.cut_value_var.get().strip(),
             "window_duration": self.window_duration_var.get().strip(),
@@ -1203,17 +1200,10 @@ class VideoSplitGUI:
         folder = filedialog.askdirectory(initialdir=self.directory_var.get() or str(Path.home()))
         if folder:
             self.directory_var.set(folder)
-            if not self.output_dir_var.get().strip():
-                self.output_dir_var.set(str(Path(folder) / "split_output"))
             self.refresh_directory()
 
-    def choose_output_dir(self) -> None:
-        folder = filedialog.askdirectory(initialdir=self.output_dir_var.get() or self.directory_var.get() or str(Path.home()))
-        if folder:
-            self.output_dir_var.set(folder)
-
-    def open_output_dir(self) -> None:
-        path = Path(self.output_dir_var.get().strip()).expanduser()
+    def open_directory(self) -> None:
+        path = Path(self.directory_var.get().strip()).expanduser()
         if not path.exists():
             messagebox.showwarning("Folder not found", f"This folder does not exist:\n{path}")
             return
@@ -1225,10 +1215,6 @@ class VideoSplitGUI:
             if not initial_load:
                 messagebox.showerror("Invalid folder", f"This folder does not exist:\n{directory}")
             return
-        if initial_load and not self.output_dir_var.get().strip():
-            self.output_dir_var.set(str(directory / "split_output"))
-        elif not initial_load and Path(self.output_dir_var.get().strip()).expanduser() == Path(self.directory_var.get().strip()).expanduser() / "split_output":
-            self.output_dir_var.set(str(directory / "split_output"))
         media_files = list_media_files(directory)
         self.video_paths = media_files
         self.video_listbox.delete(0, "end")
@@ -1279,7 +1265,6 @@ class VideoSplitGUI:
             return
 
         directory = Path(self.directory_var.get().strip()).expanduser()
-        output_dir = Path(self.output_dir_var.get().strip()).expanduser()
         video_name = self.selected_video_name()
 
         if not directory.is_dir():
@@ -1288,15 +1273,6 @@ class VideoSplitGUI:
         if not video_name:
             messagebox.showwarning("No media selected", "Choose a video or MP3 file from the list first.")
             return
-        if not output_dir:
-            messagebox.showwarning("Missing output folder", "Choose an output folder first.")
-            return
-        try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            messagebox.showerror("Output folder error", str(exc))
-            return
-
         subtitle_a = self.subtitle_a_var.get().strip()
         subtitle_b = self.subtitle_b_var.get().strip()
         if self.split_subs_var.get() and subtitle_a and subtitle_b and subtitle_a == subtitle_b:
@@ -1311,7 +1287,6 @@ class VideoSplitGUI:
 
         config = {
             "directory": str(directory),
-            "output_dir": str(output_dir),
             "video_name": video_name,
             "mode": self.mode_var.get(),
             "cut_value": self.cut_value_var.get().strip(),
@@ -1339,12 +1314,12 @@ class VideoSplitGUI:
             logger("=" * 70)
             logger(f"Folder: {config['directory']}")
             logger(f"Media:  {config['video_name']}")
-            logger(f"Output: {config['output_dir']}")
+            logger("Output: same folder as source media")
             logger("")
             ensure_ffmpeg(logger)
 
             directory = Path(config["directory"])
-            output_dir = Path(config["output_dir"])
+            output_dir = directory
             input_video = directory / config["video_name"]
             if not input_video.is_file():
                 raise RuntimeError(f"Selected media file not found: {input_video}")
