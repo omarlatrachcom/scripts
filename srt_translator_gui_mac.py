@@ -1172,6 +1172,7 @@ class SRTTranslatorGUI:
         self.status_var.set("Ready.")
         self.status_label = ttk.Label(bottom_frame, textvariable=self.status_var)
         self.status_label.pack(side=tk.LEFT, padx=10)
+        self.load_first_available_srt()
 
     def change_folder(self):
         new_dir = filedialog.askdirectory(initialdir=self.current_dir)
@@ -1181,7 +1182,6 @@ class SRTTranslatorGUI:
         self.current_dir = new_dir
         save_working_directory(self.current_dir)
         self.refresh_current_folder()
-        self.status_var.set("Folder changed. Please select a subtitle file.")
 
     def refresh_current_folder(self):
         """Reload the SRT list without changing the selected working folder."""
@@ -1194,9 +1194,17 @@ class SRTTranslatorGUI:
         self.src_srt_files = find_source_srt_files(self.current_dir)
         self.srt_combo["values"] = self.src_srt_files
         if self.src_srt_files:
-            self.srt_combo.current(0)
+            self.load_first_available_srt()
         else:
             self.srt_combo.set("No SRT files found")
+
+    def load_first_available_srt(self):
+        """Load the first available SRT whenever no source is loaded."""
+        if self.current_srt_path or not self.src_srt_files:
+            return
+        self.srt_var.set(self.src_srt_files[0])
+        self.srt_combo.current(0)
+        self.load_and_extract()
 
     def clear_tabs(self):
         for tab_id in self.notebook.tabs():

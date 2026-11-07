@@ -81,6 +81,32 @@ class SrtFileDiscoveryTests(unittest.TestCase):
     def test_missing_directory_has_no_results(self) -> None:
         self.assertEqual(find_source_srt_files("/path/that/does/not/exist"), [])
 
+    def test_first_available_srt_is_loaded_automatically(self) -> None:
+        gui = SRTTranslatorGUI.__new__(SRTTranslatorGUI)
+        gui.current_srt_path = None
+        gui.src_srt_files = ["first.srt", "second.srt"]
+        gui.srt_var = Mock()
+        gui.srt_combo = Mock()
+        gui.load_and_extract = Mock()
+
+        gui.load_first_available_srt()
+
+        gui.srt_var.set.assert_called_once_with("first.srt")
+        gui.srt_combo.current.assert_called_once_with(0)
+        gui.load_and_extract.assert_called_once_with()
+
+    def test_auto_load_does_nothing_when_an_srt_is_already_loaded(self) -> None:
+        gui = SRTTranslatorGUI.__new__(SRTTranslatorGUI)
+        gui.current_srt_path = "/subs/loaded.srt"
+        gui.src_srt_files = ["first.srt"]
+        gui.srt_var = Mock()
+        gui.srt_combo = Mock()
+        gui.load_and_extract = Mock()
+
+        gui.load_first_available_srt()
+
+        gui.load_and_extract.assert_not_called()
+
     def test_archives_srt_files_and_creates_archive_folder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp, "movie.en.srt")
