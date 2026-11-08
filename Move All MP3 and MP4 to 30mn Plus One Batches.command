@@ -279,6 +279,38 @@ if (( ${#SELECTED_MEDIA_FILES[@]} == 0 )); then
   exit 0
 fi
 
+# Include SRT/ASS sidecars whose names begin with the full video stem.
+for SELECTED_MEDIA_FILE in "${SELECTED_MEDIA_FILES[@]}"; do
+  SELECTED_MEDIA_EXTENSION="${SELECTED_MEDIA_FILE##*.}"
+  SELECTED_MEDIA_EXTENSION="${SELECTED_MEDIA_EXTENSION:l}"
+  [[ "$SELECTED_MEDIA_EXTENSION" == "mp4" || "$SELECTED_MEDIA_EXTENSION" == "mkv" ]] || continue
+
+  VIDEO_STEM="${SELECTED_MEDIA_FILE:t:r}"
+  VIDEO_STEM_LOWER="${VIDEO_STEM:l}"
+  for SUBTITLE_FILE in "${ALL_FILES[@]}"; do
+    SUBTITLE_EXTENSION="${SUBTITLE_FILE##*.}"
+    SUBTITLE_EXTENSION="${SUBTITLE_EXTENSION:l}"
+    [[ "$SUBTITLE_EXTENSION" == "srt" || "$SUBTITLE_EXTENSION" == "ass" ]] || continue
+
+    SUBTITLE_STEM="${SUBTITLE_FILE:t:r}"
+    SUBTITLE_STEM_LOWER="${SUBTITLE_STEM:l}"
+    (( ${#SUBTITLE_STEM_LOWER} >= ${#VIDEO_STEM_LOWER} )) || continue
+    [[ "${SUBTITLE_STEM_LOWER[1,${#VIDEO_STEM_LOWER}]}" == "$VIDEO_STEM_LOWER" ]] || continue
+
+    SUBTITLE_ALREADY_INCLUDED=0
+    for INCLUDED_FILE in "${FILES_TO_MOVE[@]}"; do
+      if [[ "$INCLUDED_FILE" == "$SUBTITLE_FILE" ]]; then
+        SUBTITLE_ALREADY_INCLUDED=1
+        break
+      fi
+    done
+    if (( SUBTITLE_ALREADY_INCLUDED == 0 )); then
+      FILES_TO_MOVE+=( "$SUBTITLE_FILE" )
+      ADDITIONAL_FILES+=( "$SUBTITLE_FILE" )
+    fi
+  done
+done
+
 echo "Media selected to move into:"
 echo "$TARGET_DIR"
 echo
