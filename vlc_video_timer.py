@@ -13,10 +13,11 @@ import time
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import messagebox, ttk
 
 
 USER_HOME = Path(os.environ.get("HOME") or Path.home())
+DEFAULT_VIDEO_DIR = USER_HOME / "Downloads" / "vids"
 VLC_LOCATIONS = (
     Path("/Applications/VLC.app/Contents/MacOS/VLC"),
     USER_HOME / "Applications/VLC.app/Contents/MacOS/VLC",
@@ -108,6 +109,95 @@ def format_remaining(seconds: float) -> str:
     if hours:
         return f"{hours} hr {minutes:02d} min {secs:02d} sec"
     return f"{minutes} min {secs:02d} sec"
+
+
+def sorted_video_entries(directory: Path) -> list[Path]:
+    """Return MP4 files recursively, oldest to newest."""
+    entries = (path for path in directory.rglob("*") if path.suffix.lower() == ".mp4")
+    return sorted(entries, key=lambda path: (path.stat().st_mtime, path.name.casefold()))
+
+
+class VideoPicker:
+    def __init__(self, parent: tk.Misc, initial_dir: Path) -> None:
+        self.result: str | None = None
+        self.current_dir = initial_dir if initial_dir.is_dir() else USER_HOME
+
+        self.window = tk.Toplevel(parent)
+        self.window.title("Choose an MP4 video")
+        self.window.geometry("1200x700")
+        self.window.minsize(900, 500)
+        self.window.transient(parent)
+        self.window.grab_set()
+        self.window.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        frame = ttk.Frame(self.window, padding=18)
+        frame.pack(fill="both", expand=True)
+
+        top = ttk.Frame(frame)
+        top.pack(fill="x", pady=(0, 12))
+        self.path_var = tk.StringVar()
+        ttk.Label(top, textvariable=self.path_var, font=("Helvetica", 18)).pack(
+            side="left"
+        )
+
+        style = ttk.Style(self.window)
+        style.configure("VideoPicker.Treeview", font=("Helvetica", 20), rowheight=42)
+        style.configure("VideoPicker.Treeview.Heading", font=("Helvetica", 16, "bold"))
+        self.tree = ttk.Treeview(
+            frame,
+            columns=("name", "modified"),
+            show="headings",
+            style="VideoPicker.Treeview",
+        )
+        self.tree.heading("name", text="Name")
+        self.tree.heading("modified", text="Date Modified — oldest first")
+        self.tree.column("name", width=850, anchor="w")
+        self.tree.column("modified", width=280, anchor="w")
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<Double-1>", lambda _event: self.open_selected())
+        self.tree.bind("<Return>", lambda _event: self.open_selected())
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side="right")
+        ttk.Button(buttons, text="Open", command=self.open_selected).pack(
+            side="right", padx=(0, 10)
+        )
+
+        self.refresh()
+        self.tree.focus_set()
+        self.window.wait_window()
+
+    def refresh(self) -> None:
+        self.path_var.set(str(self.current_dir))
+        self.tree.delete(*self.tree.get_children())
+        try:
+            entries = sorted_video_entries(self.current_dir)
+        except OSError as error:
+            messagebox.showerror("Folder unavailable", str(error), parent=self.window)
+            return
+        for path in entries:
+            try:
+                modified = time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime)
+                )
+            except OSError:
+                continue
+            self.tree.insert("", "end", iid=str(path), values=(path.name, modified))
+
+    def selected_path(self) -> Path | None:
+        selection = self.tree.selection()
+        return Path(selection[0]) if selection else None
+
+    def open_selected(self) -> None:
+        path = self.selected_path()
+        if path is None:
+            return
+        self.result = str(path)
+        self.window.destroy()
+
+    def cancel(self) -> None:
+        self.window.destroy()
 
 
 class RoundedButton(tk.Canvas):
@@ -244,11 +334,7 @@ class VideoTimerApp:
         )
 
     def choose_video(self) -> None:
-        selected = filedialog.askopenfilename(
-            title="Choose an MP4 video",
-            initialdir=str(USER_HOME / "Downloads"),
-            filetypes=(("MP4 videos", "*.mp4"),),
-        )
+        selected = VideoPicker(self.root, DEFAULT_VIDEO_DIR).result
         if selected:
             self.video_var.set(selected)
 
