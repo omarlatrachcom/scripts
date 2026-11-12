@@ -76,9 +76,9 @@ What it does:
 - Supports video downloads and audio-only MP3 downloads while preferring the
   video's original audio track over YouTube dubs.
 - Supports SRT-only subtitle downloads in French (`fr`), English (`en`), Spanish
-  (`es`), or the video's original language. A concrete language selects manual
-  subtitles first, then auto-generated source captions in that same language;
-  it does not silently substitute YouTube's auto-translated captions.
+  (`es`), Arabic (`ar`), or the video's original language. Arabic falls back to
+  the video's original captions when no Arabic SRT is available. Other concrete
+  languages use manual subtitles first, then matching source captions.
 - Creates media, subtitle, and resumable `.part` files with portable-safe names
   from the start, while preserving readable non-Latin scripts.
 - Supports playlist start/end ranges.

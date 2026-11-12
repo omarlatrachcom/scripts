@@ -127,6 +127,10 @@ class PlaylistRangeTests(unittest.TestCase):
 
 
 class SubtitleLanguageSelectionTests(unittest.TestCase):
+    def test_arabic_is_available_as_a_subtitle_language_choice(self) -> None:
+        self.assertIn("ar", downloader.SUPPORTED_SUBTITLE_LANGUAGES)
+        self.assertEqual(downloader.subtitle_languages_for_choice("ar"), ["ar"])
+
     def test_original_is_available_as_a_subtitle_language_choice(self) -> None:
         self.assertIn("original", downloader.SUPPORTED_SUBTITLE_LANGUAGES)
         self.assertEqual(
@@ -150,14 +154,14 @@ class SubtitleLanguageSelectionTests(unittest.TestCase):
 
         self.assertEqual(opts["subtitleslangs"][0], "en")
         original_pattern = opts["subtitleslangs"][1]
-        self.assertIsNotNone(re.fullmatch(original_pattern, "ar-orig"))
         self.assertIsNotNone(re.fullmatch(original_pattern, "de-orig"))
         self.assertIsNotNone(re.fullmatch(original_pattern, "ja-orig"))
+        self.assertIsNone(re.fullmatch(original_pattern, "ar-orig"))
 
     def test_auto_subtitle_original_fallback_excludes_predefined_languages(self) -> None:
         original_pattern = downloader.ORIGINAL_SUBTITLE_FALLBACK_PATTERN
 
-        for language in ("fr-orig", "en-orig", "es-orig", "fr-CA-orig", "es-419-orig"):
+        for language in ("fr-orig", "en-orig", "es-orig", "ar-orig", "fr-CA-orig", "es-419-orig"):
             with self.subTest(language=language):
                 self.assertIsNone(re.fullmatch(original_pattern, language))
         self.assertIsNone(re.fullmatch(original_pattern, "de"))
@@ -206,6 +210,39 @@ class SubtitleLanguageSelectionTests(unittest.TestCase):
 
 
 class SubtitleFallbackTests(unittest.TestCase):
+    def test_arabic_falls_back_to_original_captions_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            calls: list[dict] = []
+
+            def fake_run_download(_urls, opts, **_kwargs) -> int:
+                calls.append(opts)
+                if len(calls) == 2:
+                    (output_dir / "video.ja-orig.srt").write_text(
+                        "1\n00:00:01,000 --> 00:00:02,000\nCaption\n",
+                        encoding="utf-8",
+                    )
+                return 0
+
+            with mock.patch.object(downloader, "run_download", side_effect=fake_run_download):
+                downloader.run_optional_auto_sub_fallback(
+                    ["https://example.invalid/video"],
+                    {
+                        "paths": {"home": str(output_dir)},
+                        "subtitleslangs": ["ar"],
+                    },
+                    output_dir=output_dir,
+                    retry_without_cookies=False,
+                    logger=lambda _message: None,
+                )
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0]["subtitleslangs"], ["ar-orig"])
+            self.assertEqual(
+                calls[1]["subtitleslangs"],
+                [downloader.ORIGINAL_SUBTITLE_PATTERN],
+            )
+
     def test_matching_original_caption_skips_translation_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)

@@ -37,7 +37,8 @@ APP_STATE_FILE = APP_SUPPORT_DIR / "gui_state.json"
 RESTARTED_AFTER_UPDATE_ENV = "SMART_YTDLP_RESTARTED_AFTER_UPDATE"
 UPDATER_PACKAGES = ["yt-dlp[default,curl-cffi]", "yt-dlp-ejs"]
 SUPPORTED_BROWSERS = ("firefox", "chrome", "chromium", "brave", "edge", "safari")
-PREDEFINED_SUBTITLE_LANGUAGES = ("fr", "en", "es")
+ARABIC_SUBTITLE_LANGUAGE = "ar"
+PREDEFINED_SUBTITLE_LANGUAGES = ("fr", "en", "es", ARABIC_SUBTITLE_LANGUAGE)
 ORIGINAL_SUBTITLE_LANGUAGE = "original"
 SUPPORTED_SUBTITLE_LANGUAGES = (*PREDEFINED_SUBTITLE_LANGUAGES, ORIGINAL_SUBTITLE_LANGUAGE)
 ORIGINAL_SUBTITLE_PATTERN = r".+-orig"
@@ -429,7 +430,7 @@ def auto_subtitle_languages(langs: list[str]) -> list[str]:
 
     yt-dlp exposes an original automatic-caption track with a language tag that
     ends in ``-orig``.  The negative lookahead prevents an extra duplicate from
-    being downloaded when that source language is already fr, en, or es.
+    being downloaded when that source language is already fr, en, es, or ar.
     """
     selected = list(dict.fromkeys(langs))
     if ORIGINAL_SUBTITLE_PATTERN in selected:
@@ -446,6 +447,17 @@ def matching_original_subtitle_languages(langs: list[str]) -> list[str]:
         for language in langs
         if language in PREDEFINED_SUBTITLE_LANGUAGES
     ]
+
+
+def falls_back_to_original_language(langs: list[str]) -> bool:
+    """Return whether a concrete subtitle choice may use the video's original captions."""
+    return ARABIC_SUBTITLE_LANGUAGE in langs
+
+
+def subtitle_file_matches_language(path: str | Path, language: str) -> bool:
+    name = Path(path).name.casefold()
+    language = language.casefold()
+    return name.endswith((f".{language}.srt", f".{language}-orig.srt"))
 
 
 def youtube_caption_cookie_hint(browser: str, language: str) -> str:
@@ -1491,11 +1503,28 @@ def run_optional_auto_sub_fallback(
             logger(
                 "WARNING: No matching source-language auto-generated captions were downloaded."
             )
-        return run_auto_subtitle_cleanup(new_matching_originals, logger)
+        matching_cleanup = run_auto_subtitle_cleanup(new_matching_originals, logger)
+        if new_matching_originals or not falls_back_to_original_language(
+            base_opts["subtitleslangs"]
+        ):
+            return matching_cleanup
+
+        logger(
+            "> No Arabic subtitle was available. Falling back to the video's "
+            "original-language captions..."
+        )
+    else:
+        matching_cleanup = SubtitleCleanupStats()
+
+    fallback_langs = (
+        [ORIGINAL_SUBTITLE_PATTERN]
+        if falls_back_to_original_language(base_opts["subtitleslangs"])
+        else base_opts["subtitleslangs"]
+    )
 
     fallback_opts = {
         **base_opts,
-        **build_subtitle_opts(langs=base_opts["subtitleslangs"], auto=True, skip_download=True),
+        **build_subtitle_opts(langs=fallback_langs, auto=True, skip_download=True),
         "ignoreerrors": True,
     }
     logger(
@@ -1530,6 +1559,10 @@ def run_optional_auto_sub_fallback(
 
     new_auto_srt_files = sorted(after_files - before_files)
     cleanup_stats = run_auto_subtitle_cleanup(new_auto_srt_files, logger)
+    cleanup_stats.scanned_files += matching_cleanup.scanned_files
+    cleanup_stats.adjusted_files += matching_cleanup.adjusted_files
+    cleanup_stats.changed_cues += matching_cleanup.changed_cues
+    cleanup_stats.failed_files += matching_cleanup.failed_files
     if not new_auto_srt_files:
         logger(
             "WARNING: No valid .srt subtitle file was created by either subtitle fallback."
@@ -2484,7 +2517,7 @@ class DownloaderGUI:
             if job["want_subs"] and job["subs_lang"] not in SUPPORTED_SUBTITLE_LANGUAGES:
                 messagebox.showwarning(
                     "Missing subtitle language",
-                    f"Choose French (fr), English (en), Spanish (es), or original for plan item {position}.",
+                    f"Choose French (fr), English (en), Spanish (es), Arabic (ar), or original for plan item {position}.",
                 )
                 return
 
@@ -2609,15 +2642,27 @@ class DownloaderGUI:
                     logger(
                         f"> Subtitle-only mode: downloading '{subs_lang}' captions."
                     )
-                    logger(
-                        f"> Subtitle strategy: try MANUAL '{subs_lang}' first, then the "
-                        f"'{subs_lang}-orig' AUTO-generated source track; do not auto-translate."
-                    )
+                    if subs_lang == ARABIC_SUBTITLE_LANGUAGE:
+                        logger(
+                            "> Subtitle strategy: try Arabic captions first; if unavailable, "
+                            "fall back to the video's original captions."
+                        )
+                    else:
+                        logger(
+                            f"> Subtitle strategy: try MANUAL '{subs_lang}' first, then the "
+                            f"'{subs_lang}-orig' AUTO-generated source track; do not auto-translate."
+                        )
                 else:
-                    logger(
-                        f"> Subtitle strategy: try MANUAL '{subs_lang}' first, then the "
-                        f"'{subs_lang}-orig' AUTO-generated source track; do not auto-translate."
-                    )
+                    if subs_lang == ARABIC_SUBTITLE_LANGUAGE:
+                        logger(
+                            "> Subtitle strategy: try Arabic captions first; if unavailable, "
+                            "fall back to the video's original captions."
+                        )
+                    else:
+                        logger(
+                            f"> Subtitle strategy: try MANUAL '{subs_lang}' first, then the "
+                            f"'{subs_lang}-orig' AUTO-generated source track; do not auto-translate."
+                        )
 
             if media_type == "video":
                 format_str = "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"
@@ -2732,13 +2777,27 @@ class DownloaderGUI:
                     return False, summary
 
                 if want_subs and subs_langs:
-                    cleanup_stats = run_optional_auto_sub_fallback(
-                        [url],
-                        ydl_opts,
-                        output_dir=config["output_dir"],
-                        retry_without_cookies=True,
-                        logger=logger,
+                    initial_srt_files = (
+                        snapshot_valid_srt_files(config["output_dir"])
+                        - before_valid_srt_files
+                    ) | ytdlp_logger.valid_srt_destinations()
+                    arabic_srt_available = (
+                        subs_lang == ARABIC_SUBTITLE_LANGUAGE
+                        and any(
+                            subtitle_file_matches_language(path, ARABIC_SUBTITLE_LANGUAGE)
+                            for path in initial_srt_files
+                        )
                     )
+                    if arabic_srt_available:
+                        logger("> Arabic subtitles found; original-language fallback is not needed.")
+                    else:
+                        cleanup_stats = run_optional_auto_sub_fallback(
+                            [url],
+                            ydl_opts,
+                            output_dir=config["output_dir"],
+                            retry_without_cookies=True,
+                            logger=logger,
+                        )
 
                     created_valid_srt_files = (
                         snapshot_valid_srt_files(config["output_dir"])
@@ -2977,11 +3036,16 @@ class DownloaderGUI:
                             logger=logger,
                         ) or result
 
-                    # A concrete language means source-language transcription,
-                    # not YouTube auto-translation. The general original mode
-                    # still uses its regex-based automatic-caption pass.
+                    # Arabic may fall back to the video's original captions.
+                    # Other concrete languages stop after their matching source
+                    # track; general original mode uses its regex-based pass.
                     auto_targets = (
-                        set() if matching_original_langs else missing_subtitle_indices()
+                        missing_subtitle_indices()
+                        if (
+                            not matching_original_langs
+                            or falls_back_to_original_language(subs_langs)
+                        )
+                        else set()
                     )
                     if auto_targets:
                         before_srt_files = snapshot_srt_files(config["output_dir"])
@@ -2991,7 +3055,15 @@ class DownloaderGUI:
                         )
                         auto_opts = {
                             **ydl_opts,
-                            **build_subtitle_opts(langs=subs_langs, auto=True, skip_download=True),
+                            **build_subtitle_opts(
+                                langs=(
+                                    [ORIGINAL_SUBTITLE_PATTERN]
+                                    if falls_back_to_original_language(subs_langs)
+                                    else subs_langs
+                                ),
+                                auto=True,
+                                skip_download=True,
+                            ),
                             "playlist_items": format_playlist_items(auto_targets),
                         }
                         result = run_download(
