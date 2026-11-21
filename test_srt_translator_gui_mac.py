@@ -14,6 +14,7 @@ from srt_translator_gui_mac import (
     infer_media_context,
     load_working_directory,
     open_video_in_vlc,
+    parse_translation_output,
     restore_missing_translation_line_breaks,
     source_srt_name_parts,
     save_working_directory,
@@ -280,6 +281,38 @@ class VlcTests(unittest.TestCase):
 
 
 class SrtTranslatorGuiTests(unittest.TestCase):
+    def test_parses_copied_table_rows_with_separators(self) -> None:
+        content = (
+            "L000121\tأجل، بلغتنا قليلًا.\n"
+            "--------------------\n"
+            "L000122\tلكن زوجتي ليست لها شوارب\n"
+            "--------------------\n"
+            "L000123\tماذا يقول؟\n"
+        )
+
+        self.assertEqual(
+            parse_translation_output(content),
+            [
+                ("L000121", "أجل، بلغتنا قليلًا."),
+                ("L000122", "لكن زوجتي ليست لها شوارب"),
+                ("L000123", "ماذا يقول؟"),
+            ],
+        )
+
+    def test_parses_markdown_table_and_split_id_rows(self) -> None:
+        content = (
+            "| L000001 | مرحبًا |\n"
+            "| --- | --- |\n"
+            "L000002\n"
+            "────────────\n"
+            "كيف حالك؟\n"
+        )
+
+        self.assertEqual(
+            parse_translation_output(content),
+            [("L000001", "مرحبًا"), ("L000002", "كيف حالك؟")],
+        )
+
     def test_restores_only_missing_translation_line_breaks(self) -> None:
         content = (
             "L000001|oneL000002|two\n"

@@ -46,6 +46,10 @@ TIMECODE_RE = re.compile(
 )
 
 LINE_ID_RE = re.compile(r"^L\d{6}$")
+TRANSLATION_ROW_RE = re.compile(
+    r"^\s*\|?\s*(L\d{6})(?:\s*\|\s*|\t+| {2,})(.*?)\s*$"
+)
+SEPARATOR_ROW_RE = re.compile(r"^[\s|+_\-=\u2013\u2014\u2500-\u257f]+$")
 LANGUAGE_LABEL_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?$")
 EPISODE_CODE_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9])S(?P<season>\d{1,2})[ ._-]*E(?P<episode>\d{1,3})(?!\d)"
@@ -162,6 +166,47 @@ def restore_missing_translation_line_breaks(text: str, expected_ids: List[str]) 
         return text
     ids = "|".join(re.escape(line_id) for line_id in expected_ids)
     return re.sub(rf"([^\r\n])(?=(?:{ids})\|)", r"\1\n", text)
+
+
+def parse_translation_output(text: str) -> List[Tuple[str, str]]:
+    """Extract translations from plain lines, copied tables, or separated rows."""
+    lines = text.splitlines()
+    entries: List[Tuple[str, str]] = []
+    index = 0
+
+    while index < len(lines):
+        line = lines[index].strip()
+        row_match = TRANSLATION_ROW_RE.match(line)
+        if row_match:
+            translation = row_match.group(2).strip()
+            if line.startswith("|") and translation.endswith("|"):
+                translation = translation[:-1].rstrip()
+            entries.append((row_match.group(1), translation))
+            index += 1
+            continue
+
+        bare_id = line.strip("| ")
+        if LINE_ID_RE.fullmatch(bare_id):
+            next_index = index + 1
+            while next_index < len(lines):
+                candidate = lines[next_index].strip()
+                if not candidate or SEPARATOR_ROW_RE.fullmatch(candidate):
+                    next_index += 1
+                    continue
+                if not LINE_ID_RE.fullmatch(candidate.strip("| ")):
+                    entries.append((bare_id, candidate.strip("| ").strip()))
+                    index = next_index + 1
+                    break
+                index += 1
+                break
+            else:
+                entries.append((bare_id, ""))
+                index = next_index
+            continue
+
+        index += 1
+
+    return entries
 
 APP_CLASS_NAME = "SRTTranslator"
 
@@ -1340,25 +1385,13 @@ class SRTTranslatorGUI:
     ):
         """
         Validate that the pasted model output contains exactly one translated line per expected ID.
-        Only lines of the form: L000001|... are considered.
+        Plain L000001|... lines and copied table/separator layouts are accepted.
         """
-        raw_lines = text_widget.get("1.0", tk.END).splitlines()
-
         seen_order: List[str] = []
         id_to_text: Dict[str, str] = {}
         duplicates: List[str] = []
 
-        for raw in raw_lines:
-            line = raw.strip()
-            if not line or "|" not in line:
-                continue
-
-            id_part, text_part = line.split("|", 1)
-            line_id = id_part.strip()
-
-            if not LINE_ID_RE.fullmatch(line_id):
-                continue
-
+        for line_id, text_part in parse_translation_output(text_widget.get("1.0", tk.END)):
             if line_id in id_to_text:
                 duplicates.append(line_id)
                 continue
@@ -1431,22 +1464,10 @@ class SRTTranslatorGUI:
             text_widget = self.tab_text_widgets[idx]
             expected_ids = self.tab_expected_ids[idx] if idx < len(self.tab_expected_ids) else []
 
-            raw_lines = text_widget.get("1.0", tk.END).splitlines()
-
             id_to_text: Dict[str, str] = {}
             duplicates: List[str] = []
 
-            for raw in raw_lines:
-                line = raw.strip()
-                if not line or "|" not in line:
-                    continue
-
-                id_part, text_part = line.split("|", 1)
-                line_id = id_part.strip()
-
-                if not LINE_ID_RE.fullmatch(line_id):
-                    continue
-
+            for line_id, text_part in parse_translation_output(text_widget.get("1.0", tk.END)):
                 if line_id in id_to_text:
                     duplicates.append(line_id)
                     continue
@@ -1511,7 +1532,7 @@ class SRTTranslatorGUI:
         - self.saved_translations (tabs the user already closed)
         - all currently open tabs
 
-        Only lines that match ^L\\d{6}$ before the pipe are accepted.
+        Only IDs that match ^L\\d{6}$ are accepted.
 
         Duplicate IDs inside the OPEN tabs are treated as an error (because it usually
         indicates the model echoed / duplicated output lines). Duplicate IDs between
@@ -1522,17 +1543,7 @@ class SRTTranslatorGUI:
         seen_open: set[str] = set()
 
         for text_widget in self.tab_text_widgets:
-            for raw in text_widget.get("1.0", tk.END).splitlines():
-                line = raw.strip()
-                if not line or "|" not in line:
-                    continue
-
-                id_part, text_part = line.split("|", 1)
-                line_id = id_part.strip()
-
-                if not LINE_ID_RE.fullmatch(line_id):
-                    continue
-
+            for line_id, text_part in parse_translation_output(text_widget.get("1.0", tk.END)):
                 if line_id in seen_open:
                     duplicates_open.append(line_id)
                     continue
