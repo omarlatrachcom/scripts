@@ -16,6 +16,7 @@ from srt_translator_gui_mac import (
     open_video_in_vlc,
     parse_translation_output,
     restore_missing_translation_line_breaks,
+    strip_unwanted_line_break_backslashes,
     source_srt_name_parts,
     save_working_directory,
     translation_prompt_for_srt,
@@ -281,6 +282,18 @@ class VlcTests(unittest.TestCase):
 
 
 class SrtTranslatorGuiTests(unittest.TestCase):
+    def test_strips_markdown_line_break_backslashes_from_translations(self) -> None:
+        self.assertEqual(
+            parse_translation_output("L000001|مرحبًا\\\\\nL000002|أهلًا\\\n"),
+            [("L000001", "مرحبًا"), ("L000002", "أهلًا")],
+        )
+
+    def test_strips_backslash_before_trailing_bidi_marks(self) -> None:
+        self.assertEqual(
+            strip_unwanted_line_break_backslashes("\u200f\u202bمرحبًا\\\u202c"),
+            "\u200f\u202bمرحبًا\u202c",
+        )
+
     def test_parses_copied_table_rows_with_separators(self) -> None:
         content = (
             "L000121\tأجل، بلغتنا قليلًا.\n"

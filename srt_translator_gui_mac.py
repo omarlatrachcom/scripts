@@ -168,6 +168,21 @@ def restore_missing_translation_line_breaks(text: str, expected_ids: List[str]) 
     return re.sub(rf"([^\r\n])(?=(?:{ids})\|)", r"\1\n", text)
 
 
+def strip_unwanted_line_break_backslashes(text: str) -> str:
+    """Remove Markdown line-break escapes, including before trailing BiDi marks."""
+    core_end = len(text)
+    while core_end and (
+        text[core_end - 1].isspace() or text[core_end - 1] in BIDI_CONTROL_CHARS
+    ):
+        core_end -= 1
+
+    core = text[:core_end].rstrip()
+    suffix = text[core_end:]
+    if not core.endswith("\\"):
+        return text
+    return core.rstrip("\\").rstrip() + suffix
+
+
 def parse_translation_output(text: str) -> List[Tuple[str, str]]:
     """Extract translations from plain lines, copied tables, or separated rows."""
     lines = text.splitlines()
@@ -181,6 +196,7 @@ def parse_translation_output(text: str) -> List[Tuple[str, str]]:
             translation = row_match.group(2).strip()
             if line.startswith("|") and translation.endswith("|"):
                 translation = translation[:-1].rstrip()
+            translation = strip_unwanted_line_break_backslashes(translation)
             entries.append((row_match.group(1), translation))
             index += 1
             continue
@@ -194,7 +210,10 @@ def parse_translation_output(text: str) -> List[Tuple[str, str]]:
                     next_index += 1
                     continue
                 if not LINE_ID_RE.fullmatch(candidate.strip("| ")):
-                    entries.append((bare_id, candidate.strip("| ").strip()))
+                    translation = candidate.strip("| ").strip()
+                    entries.append(
+                        (bare_id, strip_unwanted_line_break_backslashes(translation))
+                    )
                     index = next_index + 1
                     break
                 index += 1
@@ -413,7 +432,11 @@ def parse_srt_blocks_from_file(path: str) -> List[SrtBlock]:
 
 
 def _normalize_lines(lines: List[str]) -> List[str]:
-    return [line.strip() for line in lines if line.strip()]
+    return [
+        strip_unwanted_line_break_backslashes(line.strip())
+        for line in lines
+        if line.strip()
+    ]
 
 
 def _flatten_text(lines: List[str]) -> str:
@@ -826,7 +849,7 @@ def rebuild_srt_sequential(srt_path: str, arabic_lines: List[str], target_path: 
             while i < total_lines and lines[i].strip() != "":
                 if idx_ar >= total_ar:
                     raise RuntimeError("Ran out of Arabic lines before finishing the SRT.")
-                arabic_text = arabic_lines[idx_ar]
+                arabic_text = strip_unwanted_line_break_backslashes(arabic_lines[idx_ar])
                 idx_ar += 1
 
                 # ---- RTL forcing happens HERE ----
