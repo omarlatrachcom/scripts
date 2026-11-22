@@ -276,6 +276,55 @@ class SubtitleFallbackTests(unittest.TestCase):
             self.assertEqual(calls[0]["subtitleslangs"], ["fr-orig"])
             self.assertNotIn("sleep_interval_subtitles", calls[0])
 
+    def test_playlist_matching_original_captions_remove_overlaps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            gui = object.__new__(downloader.DownloaderGUI)
+            gui.queue = mock.Mock()
+            gui.queue_log = lambda _message: None
+            gui.queue_progress = lambda *_args, **_kwargs: None
+            gui.make_progress_hook = lambda: (lambda _data: None)
+            config = {
+                "mode": "playlist",
+                "media_type": "srt",
+                "url": "https://example.invalid/playlist",
+                "output_dir": tmp,
+                "wrap_in_folder": False,
+                "use_cookies": False,
+                "browser": "chrome",
+                "want_subs": True,
+                "subs_lang": "fr",
+                "start_idx": "",
+                "end_idx": "",
+                "reverse_playlist": False,
+            }
+
+            def fake_run_download(_urls, opts, **_kwargs) -> int:
+                if opts.get("subtitleslangs") == ["fr-orig"]:
+                    (output_dir / "01 - episode.fr-orig.srt").write_text(
+                        "1\n00:00:01,000 --> 00:00:03,000\nPremiere\n\n"
+                        "2\n00:00:02,000 --> 00:00:04,000\nDeuxieme\n",
+                        encoding="utf-8",
+                    )
+                return 0
+
+            with (
+                mock.patch.object(downloader, "check_ffmpeg"),
+                mock.patch.object(downloader, "check_js_runtime"),
+                mock.patch.object(downloader, "check_yt_dlp_version"),
+                mock.patch.object(downloader, "build_youtube_extractor_args", return_value={}),
+                mock.patch.object(downloader, "maybe_get_playlist_length", return_value=1),
+                mock.patch.object(downloader, "get_playlist_indices", return_value={1}),
+                mock.patch.object(downloader, "run_download", side_effect=fake_run_download),
+            ):
+                success, _summary = gui.download_one(config)
+
+            self.assertTrue(success)
+            cues = downloader.parse_srt_content(
+                (output_dir / "01 - episode.fr-orig.srt").read_text(encoding="utf-8")
+            )
+            self.assertEqual(cues[0].end_ms, cues[1].start_ms - 1)
+
     def test_single_srt_job_fails_when_no_valid_subtitle_was_created(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             gui = object.__new__(downloader.DownloaderGUI)

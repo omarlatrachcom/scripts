@@ -3012,6 +3012,9 @@ class DownloaderGUI:
                     )
                     matching_original_targets = missing_subtitle_indices()
                     if matching_original_langs and matching_original_targets:
+                        before_matching_originals = snapshot_valid_srt_files(
+                            config["output_dir"]
+                        )
                         logger(
                             "> Matching-language subtitle pass: trying auto-generated source captions for "
                             f"{len(matching_original_targets)} item(s): "
@@ -3035,6 +3038,17 @@ class DownloaderGUI:
                             retry_without_cookies=True,
                             logger=logger,
                         ) or result
+                        matching_cleanup = run_auto_subtitle_cleanup(
+                            sorted(
+                                snapshot_valid_srt_files(config["output_dir"])
+                                - before_matching_originals
+                            ),
+                            logger,
+                        )
+                        cleanup_stats.scanned_files += matching_cleanup.scanned_files
+                        cleanup_stats.adjusted_files += matching_cleanup.adjusted_files
+                        cleanup_stats.changed_cues += matching_cleanup.changed_cues
+                        cleanup_stats.failed_files += matching_cleanup.failed_files
 
                     # Arabic may fall back to the video's original captions.
                     # Other concrete languages stop after their matching source
